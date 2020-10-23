@@ -18,44 +18,39 @@
 
 //#define LOG_NDEBUG 0
 
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 
 #include <inttypes.h>
 
 #include <android_runtime/AndroidRuntime.h>
+#include <gui/DisplayEventDispatcher.h>
 #include <utils/Log.h>
 #include <utils/Looper.h>
 #include <utils/threads.h>
-#include <gui/DisplayEventReceiver.h>
 #include "android_os_MessageQueue.h"
 
-#include <ScopedLocalRef.h>
+#include <nativehelper/ScopedLocalRef.h>
 
 #include "core_jni_helpers.h"
 
 namespace android {
-
-// Number of events to read at a time from the DisplayEventReceiver pipe.
-// The value should be large enough that we can quickly drain the pipe
-// using just a few large reads.
-static const size_t EVENT_BUFFER_SIZE = 100;
 
 static struct {
     jclass clazz;
 
     jmethodID dispatchVsync;
     jmethodID dispatchHotplug;
+    jmethodID dispatchConfigChanged;
 } gDisplayEventReceiverClassInfo;
 
 
-class NativeDisplayEventReceiver : public LooperCallback {
+class NativeDisplayEventReceiver : public DisplayEventDispatcher {
 public:
     NativeDisplayEventReceiver(JNIEnv* env,
-            jobject receiverWeak, const sp<MessageQueue>& messageQueue);
+            jobject receiverWeak, const sp<MessageQueue>& messageQueue, jint vsyncSource,
+            jint configChanged);
 
-    status_t initialize();
     void dispose();
-    status_t scheduleVsync();
 
 protected:
     virtual ~NativeDisplayEventReceiver();
@@ -63,163 +58,86 @@ protected:
 private:
     jobject mReceiverWeakGlobal;
     sp<MessageQueue> mMessageQueue;
-    DisplayEventReceiver mReceiver;
-    bool mWaitingForVsync;
 
-    virtual int handleEvent(int receiveFd, int events, void* data);
-    bool processPendingEvents(nsecs_t* outTimestamp, int32_t* id, uint32_t* outCount);
-    void dispatchVsync(nsecs_t timestamp, int32_t id, uint32_t count);
-    void dispatchHotplug(nsecs_t timestamp, int32_t id, bool connected);
+    void dispatchVsync(nsecs_t timestamp, PhysicalDisplayId displayId, uint32_t count) override;
+    void dispatchHotplug(nsecs_t timestamp, PhysicalDisplayId displayId, bool connected) override;
+    void dispatchConfigChanged(nsecs_t timestamp, PhysicalDisplayId displayId,
+                               int32_t configId, nsecs_t vsyncPeriod) override;
+    void dispatchNullEvent(nsecs_t timestamp, PhysicalDisplayId displayId) override {}
 };
 
 
 NativeDisplayEventReceiver::NativeDisplayEventReceiver(JNIEnv* env,
-        jobject receiverWeak, const sp<MessageQueue>& messageQueue) :
+        jobject receiverWeak, const sp<MessageQueue>& messageQueue, jint vsyncSource,
+        jint configChanged) :
+        DisplayEventDispatcher(messageQueue->getLooper(),
+                static_cast<ISurfaceComposer::VsyncSource>(vsyncSource),
+                static_cast<ISurfaceComposer::ConfigChanged>(configChanged)),
         mReceiverWeakGlobal(env->NewGlobalRef(receiverWeak)),
-        mMessageQueue(messageQueue), mWaitingForVsync(false) {
+        mMessageQueue(messageQueue) {
     ALOGV("receiver %p ~ Initializing display event receiver.", this);
 }
 
 NativeDisplayEventReceiver::~NativeDisplayEventReceiver() {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     env->DeleteGlobalRef(mReceiverWeakGlobal);
-}
-
-status_t NativeDisplayEventReceiver::initialize() {
-    status_t result = mReceiver.initCheck();
-    if (result) {
-        ALOGW("Failed to initialize display event receiver, status=%d", result);
-        return result;
-    }
-
-    int rc = mMessageQueue->getLooper()->addFd(mReceiver.getFd(), 0, Looper::EVENT_INPUT,
-            this, NULL);
-    if (rc < 0) {
-        return UNKNOWN_ERROR;
-    }
-    return OK;
+    ALOGV("receiver %p ~ dtor display event receiver.", this);
 }
 
 void NativeDisplayEventReceiver::dispose() {
     ALOGV("receiver %p ~ Disposing display event receiver.", this);
-
-    if (!mReceiver.initCheck()) {
-        mMessageQueue->getLooper()->removeFd(mReceiver.getFd());
-    }
+    DisplayEventDispatcher::dispose();
 }
 
-status_t NativeDisplayEventReceiver::scheduleVsync() {
-    if (!mWaitingForVsync) {
-        ALOGV("receiver %p ~ Scheduling vsync.", this);
-
-        // Drain all pending events.
-        nsecs_t vsyncTimestamp;
-        int32_t vsyncDisplayId;
-        uint32_t vsyncCount;
-        processPendingEvents(&vsyncTimestamp, &vsyncDisplayId, &vsyncCount);
-
-        status_t status = mReceiver.requestNextVsync();
-        if (status) {
-            ALOGW("Failed to request next vsync, status=%d", status);
-            return status;
-        }
-
-        mWaitingForVsync = true;
-    }
-    return OK;
-}
-
-int NativeDisplayEventReceiver::handleEvent(int receiveFd, int events, void* data) {
-    if (events & (Looper::EVENT_ERROR | Looper::EVENT_HANGUP)) {
-        ALOGE("Display event receiver pipe was closed or an error occurred.  "
-                "events=0x%x", events);
-        return 0; // remove the callback
-    }
-
-    if (!(events & Looper::EVENT_INPUT)) {
-        ALOGW("Received spurious callback for unhandled poll event.  "
-                "events=0x%x", events);
-        return 1; // keep the callback
-    }
-
-    // Drain all pending events, keep the last vsync.
-    nsecs_t vsyncTimestamp;
-    int32_t vsyncDisplayId;
-    uint32_t vsyncCount;
-    if (processPendingEvents(&vsyncTimestamp, &vsyncDisplayId, &vsyncCount)) {
-        ALOGV("receiver %p ~ Vsync pulse: timestamp=%" PRId64 ", id=%d, count=%d",
-                this, vsyncTimestamp, vsyncDisplayId, vsyncCount);
-        mWaitingForVsync = false;
-        dispatchVsync(vsyncTimestamp, vsyncDisplayId, vsyncCount);
-    }
-
-    return 1; // keep the callback
-}
-
-bool NativeDisplayEventReceiver::processPendingEvents(
-        nsecs_t* outTimestamp, int32_t* outId, uint32_t* outCount) {
-    bool gotVsync = false;
-    DisplayEventReceiver::Event buf[EVENT_BUFFER_SIZE];
-    ssize_t n;
-    while ((n = mReceiver.getEvents(buf, EVENT_BUFFER_SIZE)) > 0) {
-        ALOGV("receiver %p ~ Read %d events.", this, int(n));
-        for (ssize_t i = 0; i < n; i++) {
-            const DisplayEventReceiver::Event& ev = buf[i];
-            switch (ev.header.type) {
-            case DisplayEventReceiver::DISPLAY_EVENT_VSYNC:
-                // Later vsync events will just overwrite the info from earlier
-                // ones. That's fine, we only care about the most recent.
-                gotVsync = true;
-                *outTimestamp = ev.header.timestamp;
-                *outId = ev.header.id;
-                *outCount = ev.vsync.count;
-                break;
-            case DisplayEventReceiver::DISPLAY_EVENT_HOTPLUG:
-                dispatchHotplug(ev.header.timestamp, ev.header.id, ev.hotplug.connected);
-                break;
-            default:
-                ALOGW("receiver %p ~ ignoring unknown event type %#x", this, ev.header.type);
-                break;
-            }
-        }
-    }
-    if (n < 0) {
-        ALOGW("Failed to get events from display event receiver, status=%d", status_t(n));
-    }
-    return gotVsync;
-}
-
-void NativeDisplayEventReceiver::dispatchVsync(nsecs_t timestamp, int32_t id, uint32_t count) {
+void NativeDisplayEventReceiver::dispatchVsync(nsecs_t timestamp, PhysicalDisplayId displayId,
+                                               uint32_t count) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
 
     ScopedLocalRef<jobject> receiverObj(env, jniGetReferent(env, mReceiverWeakGlobal));
     if (receiverObj.get()) {
         ALOGV("receiver %p ~ Invoking vsync handler.", this);
         env->CallVoidMethod(receiverObj.get(),
-                gDisplayEventReceiverClassInfo.dispatchVsync, timestamp, id, count);
+                gDisplayEventReceiverClassInfo.dispatchVsync, timestamp, displayId, count);
         ALOGV("receiver %p ~ Returned from vsync handler.", this);
     }
 
     mMessageQueue->raiseAndClearException(env, "dispatchVsync");
 }
 
-void NativeDisplayEventReceiver::dispatchHotplug(nsecs_t timestamp, int32_t id, bool connected) {
+void NativeDisplayEventReceiver::dispatchHotplug(nsecs_t timestamp, PhysicalDisplayId displayId,
+                                                 bool connected) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
 
     ScopedLocalRef<jobject> receiverObj(env, jniGetReferent(env, mReceiverWeakGlobal));
     if (receiverObj.get()) {
         ALOGV("receiver %p ~ Invoking hotplug handler.", this);
         env->CallVoidMethod(receiverObj.get(),
-                gDisplayEventReceiverClassInfo.dispatchHotplug, timestamp, id, connected);
+                gDisplayEventReceiverClassInfo.dispatchHotplug, timestamp, displayId, connected);
         ALOGV("receiver %p ~ Returned from hotplug handler.", this);
     }
 
     mMessageQueue->raiseAndClearException(env, "dispatchHotplug");
 }
 
+void NativeDisplayEventReceiver::dispatchConfigChanged(
+    nsecs_t timestamp, PhysicalDisplayId displayId, int32_t configId, nsecs_t) {
+  JNIEnv* env = AndroidRuntime::getJNIEnv();
+
+  ScopedLocalRef<jobject> receiverObj(env,
+                                      jniGetReferent(env, mReceiverWeakGlobal));
+  if (receiverObj.get()) {
+    ALOGV("receiver %p ~ Invoking config changed handler.", this);
+    env->CallVoidMethod(receiverObj.get(),
+                        gDisplayEventReceiverClassInfo.dispatchConfigChanged,
+                        timestamp, displayId, configId);
+    ALOGV("receiver %p ~ Returned from config changed handler.", this);
+  }
+
+  mMessageQueue->raiseAndClearException(env, "dispatchConfigChanged");
+}
 
 static jlong nativeInit(JNIEnv* env, jclass clazz, jobject receiverWeak,
-        jobject messageQueueObj) {
+        jobject messageQueueObj, jint vsyncSource, jint configChanged) {
     sp<MessageQueue> messageQueue = android_os_MessageQueue_getMessageQueue(env, messageQueueObj);
     if (messageQueue == NULL) {
         jniThrowRuntimeException(env, "MessageQueue is not initialized.");
@@ -227,7 +145,7 @@ static jlong nativeInit(JNIEnv* env, jclass clazz, jobject receiverWeak,
     }
 
     sp<NativeDisplayEventReceiver> receiver = new NativeDisplayEventReceiver(env,
-            receiverWeak, messageQueue);
+            receiverWeak, messageQueue, vsyncSource, configChanged);
     status_t status = receiver->initialize();
     if (status) {
         String8 message;
@@ -241,7 +159,7 @@ static jlong nativeInit(JNIEnv* env, jclass clazz, jobject receiverWeak,
 }
 
 static void nativeDispose(JNIEnv* env, jclass clazz, jlong receiverPtr) {
-    sp<NativeDisplayEventReceiver> receiver =
+    NativeDisplayEventReceiver* receiver =
             reinterpret_cast<NativeDisplayEventReceiver*>(receiverPtr);
     receiver->dispose();
     receiver->decStrong(gDisplayEventReceiverClassInfo.clazz); // drop reference held by the object
@@ -262,11 +180,12 @@ static void nativeScheduleVsync(JNIEnv* env, jclass clazz, jlong receiverPtr) {
 static const JNINativeMethod gMethods[] = {
     /* name, signature, funcPtr */
     { "nativeInit",
-            "(Ljava/lang/ref/WeakReference;Landroid/os/MessageQueue;)J",
+            "(Ljava/lang/ref/WeakReference;Landroid/os/MessageQueue;II)J",
             (void*)nativeInit },
     { "nativeDispose",
             "(J)V",
             (void*)nativeDispose },
+    // @FastNative
     { "nativeScheduleVsync", "(J)V",
             (void*)nativeScheduleVsync }
 };
@@ -279,9 +198,11 @@ int register_android_view_DisplayEventReceiver(JNIEnv* env) {
     gDisplayEventReceiverClassInfo.clazz = MakeGlobalRefOrDie(env, clazz);
 
     gDisplayEventReceiverClassInfo.dispatchVsync = GetMethodIDOrDie(env,
-            gDisplayEventReceiverClassInfo.clazz, "dispatchVsync", "(JII)V");
+            gDisplayEventReceiverClassInfo.clazz, "dispatchVsync", "(JJI)V");
     gDisplayEventReceiverClassInfo.dispatchHotplug = GetMethodIDOrDie(env,
-            gDisplayEventReceiverClassInfo.clazz, "dispatchHotplug", "(JIZ)V");
+            gDisplayEventReceiverClassInfo.clazz, "dispatchHotplug", "(JJZ)V");
+    gDisplayEventReceiverClassInfo.dispatchConfigChanged = GetMethodIDOrDie(env,
+           gDisplayEventReceiverClassInfo.clazz, "dispatchConfigChanged", "(JJI)V");
 
     return res;
 }

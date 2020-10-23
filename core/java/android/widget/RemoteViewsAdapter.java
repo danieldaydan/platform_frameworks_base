@@ -16,16 +16,21 @@
 
 package android.widget;
 
-import java.lang.ref.WeakReference;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
+import static android.widget.RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID;
+import static android.widget.RemoteViews.EXTRA_REMOTEADAPTER_ON_LIGHT_BACKGROUND;
 
-import android.Manifest;
+import android.annotation.WorkerThread;
+import android.app.IServiceConnection;
+import android.appwidget.AppWidgetHostView;
 import android.appwidget.AppWidgetManager;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.pm.ActivityInfo;
+import android.content.pm.ApplicationInfo;
+import android.content.res.Configuration;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -33,72 +38,58 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.RemoteException;
 import android.util.Log;
-import android.util.Slog;
+import android.util.SparseArray;
+import android.util.SparseBooleanArray;
+import android.util.SparseIntArray;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.View.MeasureSpec;
 import android.view.ViewGroup;
 import android.widget.RemoteViews.OnClickHandler;
 
-import com.android.internal.widget.IRemoteViewsAdapterConnection;
 import com.android.internal.widget.IRemoteViewsFactory;
 
+import java.lang.ref.WeakReference;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.concurrent.Executor;
+
 /**
- * An adapter to a RemoteViewsService which fetches and caches RemoteViews
- * to be later inflated as child views.
+ * An adapter to a RemoteViewsService which fetches and caches RemoteViews to be later inflated as
+ * child views.
+ *
+ * The adapter runs in the host process, typically a Launcher app.
+ *
+ * It makes a service connection to the {@link RemoteViewsService} running in the
+ * AppWidgetsProvider's process. This connection is made on a background thread (and proxied via
+ * the platform to get the bind permissions) and all interaction with the service is done on the
+ * background thread.
+ *
+ * On first bind, the adapter will load can cache the RemoteViews locally. Afterwards the
+ * connection is only made when new RemoteViews are required.
+ * @hide
  */
-/** @hide */
 public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback {
-    private static final String MULTI_USER_PERM = Manifest.permission.INTERACT_ACROSS_USERS_FULL;
 
     private static final String TAG = "RemoteViewsAdapter";
 
     // The max number of items in the cache
-    private static final int sDefaultCacheSize = 40;
+    private static final int DEFAULT_CACHE_SIZE = 40;
     // The delay (in millis) to wait until attempting to unbind from a service after a request.
     // This ensures that we don't stay continually bound to the service and that it can be destroyed
     // if we need the memory elsewhere in the system.
-    private static final int sUnbindServiceDelay = 5000;
+    private static final int UNBIND_SERVICE_DELAY = 5000;
 
     // Default height for the default loading view, in case we cannot get inflate the first view
-    private static final int sDefaultLoadingViewHeight = 50;
-
-    // Type defs for controlling different messages across the main and worker message queues
-    private static final int sDefaultMessageType = 0;
-    private static final int sUnbindServiceMessageType = 1;
-
-    private final Context mContext;
-    private final Intent mIntent;
-    private final int mAppWidgetId;
-    private LayoutInflater mLayoutInflater;
-    private RemoteViewsAdapterServiceConnection mServiceConnection;
-    private WeakReference<RemoteAdapterConnectionCallback> mCallback;
-    private OnClickHandler mRemoteViewsOnClickHandler;
-    private FixedSizeRemoteViewsCache mCache;
-    private int mVisibleWindowLowerBound;
-    private int mVisibleWindowUpperBound;
-
-    // A flag to determine whether we should notify data set changed after we connect
-    private boolean mNotifyDataSetChangedAfterOnServiceConnected = false;
-
-    // The set of requested views that are to be notified when the associated RemoteViews are
-    // loaded.
-    private RemoteViewsFrameLayoutRefSet mRequestedViews;
-
-    private HandlerThread mWorkerThread;
-    // items may be interrupted within the normally processed queues
-    private Handler mWorkerQueue;
-    private Handler mMainQueue;
+    private static final int DEFAULT_LOADING_VIEW_HEIGHT = 50;
 
     // We cache the FixedSizeRemoteViewsCaches across orientation. These are the related data
     // structures;
-    private static final HashMap<RemoteViewsCacheKey,
-            FixedSizeRemoteViewsCache> sCachedRemoteViewsCaches
-            = new HashMap<RemoteViewsCacheKey,
-                    FixedSizeRemoteViewsCache>();
+    private static final HashMap<RemoteViewsCacheKey, FixedSizeRemoteViewsCache>
+            sCachedRemoteViewsCaches = new HashMap<>();
     private static final HashMap<RemoteViewsCacheKey, Runnable>
-            sRemoteViewsCacheRemoveRunnables
-            = new HashMap<RemoteViewsCacheKey, Runnable>();
+            sRemoteViewsCacheRemoveRunnables = new HashMap<>();
 
     private static HandlerThread sCacheRemovalThread;
     private static Handler sCacheRemovalQueue;
@@ -108,9 +99,38 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     // duration, the cache is dropped.
     private static final int REMOTE_VIEWS_CACHE_DURATION = 5000;
 
+    private final Context mContext;
+    private final Intent mIntent;
+    private final int mAppWidgetId;
+    private final boolean mOnLightBackground;
+    private final Executor mAsyncViewLoadExecutor;
+
+    private OnClickHandler mRemoteViewsOnClickHandler;
+    @UnsupportedAppUsage
+    private final FixedSizeRemoteViewsCache mCache;
+    private int mVisibleWindowLowerBound;
+    private int mVisibleWindowUpperBound;
+
+    // The set of requested views that are to be notified when the associated RemoteViews are
+    // loaded.
+    private RemoteViewsFrameLayoutRefSet mRequestedViews;
+
+    @UnsupportedAppUsage
+    private final HandlerThread mWorkerThread;
+    // items may be interrupted within the normally processed queues
+    private final Handler mMainHandler;
+    private final RemoteServiceHandler mServiceHandler;
+    private final RemoteAdapterConnectionCallback mCallback;
+
     // Used to indicate to the AdapterView that it can use this Adapter immediately after
     // construction (happens when we have a cached FixedSizeRemoteViewsCache).
     private boolean mDataReady = false;
+
+    /**
+     * USed to dedupe {@link RemoteViews#mApplication} so that we do not hold on to
+     * multiple copies of the same ApplicationInfo object.
+     */
+    private ApplicationInfo mLastRemoteViewAppInfo;
 
     /**
      * An interface for the RemoteAdapter to notify other classes when adapters
@@ -120,165 +140,225 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         /**
          * @return whether the adapter was set or not.
          */
-        public boolean onRemoteAdapterConnected();
+        boolean onRemoteAdapterConnected();
 
-        public void onRemoteAdapterDisconnected();
+        void onRemoteAdapterDisconnected();
 
         /**
          * This defers a notifyDataSetChanged on the pending RemoteViewsAdapter if it has not
          * connected yet.
          */
-        public void deferNotifyDataSetChanged();
+        void deferNotifyDataSetChanged();
+
+        void setRemoteViewsAdapter(Intent intent, boolean isAsync);
     }
 
+    public static class AsyncRemoteAdapterAction implements Runnable {
+
+        private final RemoteAdapterConnectionCallback mCallback;
+        private final Intent mIntent;
+
+        public AsyncRemoteAdapterAction(RemoteAdapterConnectionCallback callback, Intent intent) {
+            mCallback = callback;
+            mIntent = intent;
+        }
+
+        @Override
+        public void run() {
+            mCallback.setRemoteViewsAdapter(mIntent, true);
+        }
+    }
+
+    static final int MSG_REQUEST_BIND = 1;
+    static final int MSG_NOTIFY_DATA_SET_CHANGED = 2;
+    static final int MSG_LOAD_NEXT_ITEM = 3;
+    static final int MSG_UNBIND_SERVICE = 4;
+
+    private static final int MSG_MAIN_HANDLER_COMMIT_METADATA = 1;
+    private static final int MSG_MAIN_HANDLER_SUPER_NOTIFY_DATA_SET_CHANGED = 2;
+    private static final int MSG_MAIN_HANDLER_REMOTE_ADAPTER_CONNECTED = 3;
+    private static final int MSG_MAIN_HANDLER_REMOTE_ADAPTER_DISCONNECTED = 4;
+    private static final int MSG_MAIN_HANDLER_REMOTE_VIEWS_LOADED = 5;
+
     /**
-     * The service connection that gets populated when the RemoteViewsService is
-     * bound.  This must be a static inner class to ensure that no references to the outer
-     * RemoteViewsAdapter instance is retained (this would prevent the RemoteViewsAdapter from being
-     * garbage collected, and would cause us to leak activities due to the caching mechanism for
-     * FrameLayouts in the adapter).
+     * Handler for various interactions with the {@link RemoteViewsService}.
      */
-    private static class RemoteViewsAdapterServiceConnection extends
-            IRemoteViewsAdapterConnection.Stub {
-        private boolean mIsConnected;
-        private boolean mIsConnecting;
-        private WeakReference<RemoteViewsAdapter> mAdapter;
+    private static class RemoteServiceHandler extends Handler implements ServiceConnection {
+
+        private final WeakReference<RemoteViewsAdapter> mAdapter;
+        private final Context mContext;
+
         private IRemoteViewsFactory mRemoteViewsFactory;
 
-        public RemoteViewsAdapterServiceConnection(RemoteViewsAdapter adapter) {
-            mAdapter = new WeakReference<RemoteViewsAdapter>(adapter);
+        // The last call to notifyDataSetChanged didn't succeed, try again on next service bind.
+        private boolean mNotifyDataSetChangedPending = false;
+        private boolean mBindRequested = false;
+
+        RemoteServiceHandler(Looper workerLooper, RemoteViewsAdapter adapter, Context context) {
+            super(workerLooper);
+            mAdapter = new WeakReference<>(adapter);
+            mContext = context;
         }
 
-        public synchronized void bind(Context context, int appWidgetId, Intent intent) {
-            if (!mIsConnecting) {
-                try {
-                    RemoteViewsAdapter adapter;
-                    final AppWidgetManager mgr = AppWidgetManager.getInstance(context);
-                    if ((adapter = mAdapter.get()) != null) {
-                        mgr.bindRemoteViewsService(context.getOpPackageName(), appWidgetId,
-                                intent, asBinder());
-                    } else {
-                        Slog.w(TAG, "bind: adapter was null");
-                    }
-                    mIsConnecting = true;
-                } catch (Exception e) {
-                    Log.e("RemoteViewsAdapterServiceConnection", "bind(): " + e.getMessage());
-                    mIsConnecting = false;
-                    mIsConnected = false;
-                }
-            }
-        }
-
-        public synchronized void unbind(Context context, int appWidgetId, Intent intent) {
-            try {
-                RemoteViewsAdapter adapter;
-                final AppWidgetManager mgr = AppWidgetManager.getInstance(context);
-                if ((adapter = mAdapter.get()) != null) {
-                    mgr.unbindRemoteViewsService(context.getOpPackageName(), appWidgetId, intent);
-                } else {
-                    Slog.w(TAG, "unbind: adapter was null");
-                }
-                mIsConnecting = false;
-            } catch (Exception e) {
-                Log.e("RemoteViewsAdapterServiceConnection", "unbind(): " + e.getMessage());
-                mIsConnecting = false;
-                mIsConnected = false;
-            }
-        }
-
-        public synchronized void onServiceConnected(IBinder service) {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            // This is called on the same thread.
             mRemoteViewsFactory = IRemoteViewsFactory.Stub.asInterface(service);
+            enqueueDeferredUnbindServiceMessage();
 
-            // Remove any deferred unbind messages
-            final RemoteViewsAdapter adapter = mAdapter.get();
-            if (adapter == null) return;
+            RemoteViewsAdapter adapter = mAdapter.get();
+            if (adapter == null) {
+                return;
+            }
 
-            // Queue up work that we need to do for the callback to run
-            adapter.mWorkerQueue.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (adapter.mNotifyDataSetChangedAfterOnServiceConnected) {
-                        // Handle queued notifyDataSetChanged() if necessary
-                        adapter.onNotifyDataSetChanged();
-                    } else {
-                        IRemoteViewsFactory factory =
-                            adapter.mServiceConnection.getRemoteViewsFactory();
-                        try {
-                            if (!factory.isCreated()) {
-                                // We only call onDataSetChanged() if this is the factory was just
-                                // create in response to this bind
-                                factory.onDataSetChanged();
-                            }
-                        } catch (RemoteException e) {
-                            Log.e(TAG, "Error notifying factory of data set changed in " +
-                                        "onServiceConnected(): " + e.getMessage());
-
-                            // Return early to prevent anything further from being notified
-                            // (effectively nothing has changed)
-                            return;
-                        } catch (RuntimeException e) {
-                            Log.e(TAG, "Error notifying factory of data set changed in " +
-                                    "onServiceConnected(): " + e.getMessage());
-                        }
-
-                        // Request meta data so that we have up to date data when calling back to
-                        // the remote adapter callback
-                        adapter.updateTemporaryMetaData();
-
-                        // Notify the host that we've connected
-                        adapter.mMainQueue.post(new Runnable() {
-                            @Override
-                            public void run() {
-                                synchronized (adapter.mCache) {
-                                    adapter.mCache.commitTemporaryMetaData();
-                                }
-
-                                final RemoteAdapterConnectionCallback callback =
-                                    adapter.mCallback.get();
-                                if (callback != null) {
-                                    callback.onRemoteAdapterConnected();
-                                }
-                            }
-                        });
-                    }
-
-                    // Enqueue unbind message
-                    adapter.enqueueDeferredUnbindServiceMessage();
-                    mIsConnected = true;
-                    mIsConnecting = false;
+            if (mNotifyDataSetChangedPending) {
+                mNotifyDataSetChangedPending = false;
+                Message msg = Message.obtain(this, MSG_NOTIFY_DATA_SET_CHANGED);
+                handleMessage(msg);
+                msg.recycle();
+            } else {
+                if (!sendNotifyDataSetChange(false)) {
+                    return;
                 }
-            });
+
+                // Request meta data so that we have up to date data when calling back to
+                // the remote adapter callback
+                adapter.updateTemporaryMetaData(mRemoteViewsFactory);
+                adapter.mMainHandler.sendEmptyMessage(MSG_MAIN_HANDLER_COMMIT_METADATA);
+                adapter.mMainHandler.sendEmptyMessage(MSG_MAIN_HANDLER_REMOTE_ADAPTER_CONNECTED);
+            }
         }
 
-        public synchronized void onServiceDisconnected() {
-            mIsConnected = false;
-            mIsConnecting = false;
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
             mRemoteViewsFactory = null;
+            RemoteViewsAdapter adapter = mAdapter.get();
+            if (adapter != null) {
+                adapter.mMainHandler.sendEmptyMessage(MSG_MAIN_HANDLER_REMOTE_ADAPTER_DISCONNECTED);
+            }
+        }
 
-            // Clear the main/worker queues
-            final RemoteViewsAdapter adapter = mAdapter.get();
-            if (adapter == null) return;
+        @Override
+        public void handleMessage(Message msg) {
+            RemoteViewsAdapter adapter = mAdapter.get();
 
-            adapter.mMainQueue.post(new Runnable() {
-                @Override
-                public void run() {
-                    // Dequeue any unbind messages
-                    adapter.mMainQueue.removeMessages(sUnbindServiceMessageType);
-
-                    final RemoteAdapterConnectionCallback callback = adapter.mCallback.get();
-                    if (callback != null) {
-                        callback.onRemoteAdapterDisconnected();
+            switch (msg.what) {
+                case MSG_REQUEST_BIND: {
+                    if (adapter == null || mRemoteViewsFactory != null) {
+                        enqueueDeferredUnbindServiceMessage();
                     }
+                    if (mBindRequested) {
+                        return;
+                    }
+                    int flags = Context.BIND_AUTO_CREATE
+                            | Context.BIND_FOREGROUND_SERVICE_WHILE_AWAKE;
+                    final IServiceConnection sd = mContext.getServiceDispatcher(this, this, flags);
+                    Intent intent = (Intent) msg.obj;
+                    int appWidgetId = msg.arg1;
+                    try {
+                        mBindRequested = AppWidgetManager.getInstance(mContext)
+                                .bindRemoteViewsService(mContext, appWidgetId, intent, sd, flags);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to bind remoteViewsService: " + e.getMessage());
+                    }
+                    return;
                 }
-            });
+                case MSG_NOTIFY_DATA_SET_CHANGED: {
+                    enqueueDeferredUnbindServiceMessage();
+                    if (adapter == null) {
+                        return;
+                    }
+                    if (mRemoteViewsFactory == null) {
+                        mNotifyDataSetChangedPending = true;
+                        adapter.requestBindService();
+                        return;
+                    }
+                    if (!sendNotifyDataSetChange(true)) {
+                        return;
+                    }
+
+                    // Flush the cache so that we can reload new items from the service
+                    synchronized (adapter.mCache) {
+                        adapter.mCache.reset();
+                    }
+
+                    // Re-request the new metadata (only after the notification to the factory)
+                    adapter.updateTemporaryMetaData(mRemoteViewsFactory);
+                    int newCount;
+                    int[] visibleWindow;
+                    synchronized (adapter.mCache.getTemporaryMetaData()) {
+                        newCount = adapter.mCache.getTemporaryMetaData().count;
+                        visibleWindow = adapter.getVisibleWindow(newCount);
+                    }
+
+                    // Pre-load (our best guess of) the views which are currently visible in the
+                    // AdapterView. This mitigates flashing and flickering of loading views when a
+                    // widget notifies that its data has changed.
+                    for (int position : visibleWindow) {
+                        // Because temporary meta data is only ever modified from this thread
+                        // (ie. mWorkerThread), it is safe to assume that count is a valid
+                        // representation.
+                        if (position < newCount) {
+                            adapter.updateRemoteViews(mRemoteViewsFactory, position, false);
+                        }
+                    }
+
+                    // Propagate the notification back to the base adapter
+                    adapter.mMainHandler.sendEmptyMessage(MSG_MAIN_HANDLER_COMMIT_METADATA);
+                    adapter.mMainHandler.sendEmptyMessage(
+                            MSG_MAIN_HANDLER_SUPER_NOTIFY_DATA_SET_CHANGED);
+                    return;
+                }
+
+                case MSG_LOAD_NEXT_ITEM: {
+                    if (adapter == null || mRemoteViewsFactory == null) {
+                        return;
+                    }
+                    removeMessages(MSG_UNBIND_SERVICE);
+                    // Get the next index to load
+                    final int position = adapter.mCache.getNextIndexToLoad();
+                    if (position > -1) {
+                        // Load the item, and notify any existing RemoteViewsFrameLayouts
+                        adapter.updateRemoteViews(mRemoteViewsFactory, position, true);
+
+                        // Queue up for the next one to load
+                        sendEmptyMessage(MSG_LOAD_NEXT_ITEM);
+                    } else {
+                        // No more items to load, so queue unbind
+                        enqueueDeferredUnbindServiceMessage();
+                    }
+                    return;
+                }
+                case MSG_UNBIND_SERVICE: {
+                    unbindNow();
+                    return;
+                }
+            }
         }
 
-        public synchronized IRemoteViewsFactory getRemoteViewsFactory() {
-            return mRemoteViewsFactory;
+        protected void unbindNow() {
+            if (mBindRequested) {
+                mBindRequested = false;
+                mContext.unbindService(this);
+            }
+            mRemoteViewsFactory = null;
         }
 
-        public synchronized boolean isConnected() {
-            return mIsConnected;
+        private boolean sendNotifyDataSetChange(boolean always) {
+            try {
+                if (always || !mRemoteViewsFactory.isCreated()) {
+                    mRemoteViewsFactory.onDataSetChanged();
+                }
+                return true;
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(TAG, "Error in updateNotifyDataSetChanged(): " + e.getMessage());
+                return false;
+            }
+        }
+
+        private void enqueueDeferredUnbindServiceMessage() {
+            removeMessages(MSG_UNBIND_SERVICE);
+            sendEmptyMessageDelayed(MSG_UNBIND_SERVICE, UNBIND_SERVICE_DELAY);
         }
     }
 
@@ -286,24 +366,54 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
      * A FrameLayout which contains a loading view, and manages the re/applying of RemoteViews when
      * they are loaded.
      */
-    private static class RemoteViewsFrameLayout extends FrameLayout {
-        public RemoteViewsFrameLayout(Context context) {
+    static class RemoteViewsFrameLayout extends AppWidgetHostView {
+        private final FixedSizeRemoteViewsCache mCache;
+
+        public int cacheIndex = -1;
+
+        public RemoteViewsFrameLayout(Context context, FixedSizeRemoteViewsCache cache) {
             super(context);
+            mCache = cache;
         }
 
         /**
          * Updates this RemoteViewsFrameLayout depending on the view that was loaded.
          * @param view the RemoteViews that was loaded. If null, the RemoteViews was not loaded
          *             successfully.
+         * @param forceApplyAsync when true, the host will always try to inflate the view
+         *                        asynchronously (for eg, when we are already showing the loading
+         *                        view)
          */
-        public void onRemoteViewsLoaded(RemoteViews view, OnClickHandler handler) {
-            try {
-                // Remove all the children of this layout first
-                removeAllViews();
-                addView(view.apply(getContext(), this, handler));
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to apply RemoteViews.");
-            }
+        public void onRemoteViewsLoaded(RemoteViews view, OnClickHandler handler,
+                boolean forceApplyAsync) {
+            setOnClickHandler(handler);
+            applyRemoteViews(view, forceApplyAsync || ((view != null) && view.prefersAsyncApply()));
+        }
+
+        /**
+         * Creates a default loading view. Uses the size of the first row as a guide for the
+         * size of the loading view.
+         */
+        @Override
+        protected View getDefaultView() {
+            int viewHeight = mCache.getMetaData().getLoadingTemplate(getContext()).defaultHeight;
+            // Compose the loading view text
+            TextView loadingTextView = (TextView) LayoutInflater.from(getContext()).inflate(
+                    com.android.internal.R.layout.remote_views_adapter_default_loading_view,
+                    this, false);
+            loadingTextView.setHeight(viewHeight);
+            return loadingTextView;
+        }
+
+        @Override
+        protected Context getRemoteContext() {
+            return null;
+        }
+
+        @Override
+        protected View getErrorView() {
+            // Use the default loading view as the error view.
+            return getDefaultView();
         }
     }
 
@@ -311,34 +421,23 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
      * Stores the references of all the RemoteViewsFrameLayouts that have been returned by the
      * adapter that have not yet had their RemoteViews loaded.
      */
-    private class RemoteViewsFrameLayoutRefSet {
-        private HashMap<Integer, LinkedList<RemoteViewsFrameLayout>> mReferences;
-        private HashMap<RemoteViewsFrameLayout, LinkedList<RemoteViewsFrameLayout>>
-                mViewToLinkedList;
-
-        public RemoteViewsFrameLayoutRefSet() {
-            mReferences = new HashMap<Integer, LinkedList<RemoteViewsFrameLayout>>();
-            mViewToLinkedList =
-                    new HashMap<RemoteViewsFrameLayout, LinkedList<RemoteViewsFrameLayout>>();
-        }
+    private class RemoteViewsFrameLayoutRefSet
+            extends SparseArray<LinkedList<RemoteViewsFrameLayout>> {
 
         /**
          * Adds a new reference to a RemoteViewsFrameLayout returned by the adapter.
          */
         public void add(int position, RemoteViewsFrameLayout layout) {
-            final Integer pos = position;
-            LinkedList<RemoteViewsFrameLayout> refs;
+            LinkedList<RemoteViewsFrameLayout> refs = get(position);
 
             // Create the list if necessary
-            if (mReferences.containsKey(pos)) {
-                refs = mReferences.get(pos);
-            } else {
-                refs = new LinkedList<RemoteViewsFrameLayout>();
-                mReferences.put(pos, refs);
+            if (refs == null) {
+                refs = new LinkedList<>();
+                put(position, refs);
             }
-            mViewToLinkedList.put(layout, refs);
 
             // Add the references to the list
+            layout.cacheIndex = position;
             refs.add(layout);
         }
 
@@ -349,19 +448,13 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         public void notifyOnRemoteViewsLoaded(int position, RemoteViews view) {
             if (view == null) return;
 
-            final Integer pos = position;
-            if (mReferences.containsKey(pos)) {
+            // Remove this set from the original mapping
+            final LinkedList<RemoteViewsFrameLayout> refs = removeReturnOld(position);
+            if (refs != null) {
                 // Notify all the references for that position of the newly loaded RemoteViews
-                final LinkedList<RemoteViewsFrameLayout> refs = mReferences.get(pos);
                 for (final RemoteViewsFrameLayout ref : refs) {
-                    ref.onRemoteViewsLoaded(view, mRemoteViewsOnClickHandler);
-                    if (mViewToLinkedList.containsKey(ref)) {
-                        mViewToLinkedList.remove(ref);
-                    }
+                    ref.onRemoteViewsLoaded(view, mRemoteViewsOnClickHandler, true);
                 }
-                refs.clear();
-                // Remove this set from the original mapping
-                mReferences.remove(pos);
             }
         }
 
@@ -369,20 +462,14 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
          * We need to remove views from this set if they have been recycled by the AdapterView.
          */
         public void removeView(RemoteViewsFrameLayout rvfl) {
-            if (mViewToLinkedList.containsKey(rvfl)) {
-                mViewToLinkedList.get(rvfl).remove(rvfl);
-                mViewToLinkedList.remove(rvfl);
+            if (rvfl.cacheIndex < 0) {
+                return;
             }
-        }
-
-        /**
-         * Removes all references to all RemoteViewsFrameLayouts returned by the adapter.
-         */
-        public void clear() {
-            // We currently just clear the references, and leave all the previous layouts returned
-            // in their default state of the loading view.
-            mReferences.clear();
-            mViewToLinkedList.clear();
+            final LinkedList<RemoteViewsFrameLayout> refs = get(rvfl.cacheIndex);
+            if (refs != null) {
+                refs.remove(rvfl);
+            }
+            rvfl.cacheIndex = -1;
         }
     }
 
@@ -397,12 +484,10 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         // Used to determine how to construct loading views.  If a loading view is not specified
         // by the user, then we try and load the first view, and use its height as the height for
         // the default loading view.
-        RemoteViews mUserLoadingView;
-        RemoteViews mFirstView;
-        int mFirstViewHeight;
+        LoadingViewTemplate loadingTemplate;
 
         // A mapping from type id to a set of unique type ids
-        private final HashMap<Integer, Integer> mTypeIdIndexMap = new HashMap<Integer, Integer>();
+        private final SparseIntArray mTypeIdIndexMap = new SparseIntArray();
 
         public RemoteViewsMetaData() {
             reset();
@@ -413,7 +498,7 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 count = d.count;
                 viewTypeCount = d.viewTypeCount;
                 hasStableIds = d.hasStableIds;
-                setLoadingViewTemplates(d.mUserLoadingView, d.mFirstView);
+                loadingTemplate = d.loadingTemplate;
             }
         }
 
@@ -423,97 +508,30 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             // by default there is at least one dummy view type
             viewTypeCount = 1;
             hasStableIds = true;
-            mUserLoadingView = null;
-            mFirstView = null;
-            mFirstViewHeight = 0;
+            loadingTemplate = null;
             mTypeIdIndexMap.clear();
         }
 
-        public void setLoadingViewTemplates(RemoteViews loadingView, RemoteViews firstView) {
-            mUserLoadingView = loadingView;
-            if (firstView != null) {
-                mFirstView = firstView;
-                mFirstViewHeight = -1;
-            }
-        }
-
         public int getMappedViewType(int typeId) {
-            if (mTypeIdIndexMap.containsKey(typeId)) {
-                return mTypeIdIndexMap.get(typeId);
-            } else {
+            int mappedTypeId = mTypeIdIndexMap.get(typeId, -1);
+            if (mappedTypeId == -1) {
                 // We +1 because the loading view always has view type id of 0
-                int incrementalTypeId = mTypeIdIndexMap.size() + 1;
-                mTypeIdIndexMap.put(typeId, incrementalTypeId);
-                return incrementalTypeId;
+                mappedTypeId = mTypeIdIndexMap.size() + 1;
+                mTypeIdIndexMap.put(typeId, mappedTypeId);
             }
+            return mappedTypeId;
         }
 
         public boolean isViewTypeInRange(int typeId) {
             int mappedType = getMappedViewType(typeId);
-            if (mappedType >= viewTypeCount) {
-                return false;
-            } else {
-                return true;
-            }
+            return (mappedType < viewTypeCount);
         }
 
-        private RemoteViewsFrameLayout createLoadingView(int position, View convertView,
-                ViewGroup parent, Object lock, LayoutInflater layoutInflater, OnClickHandler
-                handler) {
-            // Create and return a new FrameLayout, and setup the references for this position
-            final Context context = parent.getContext();
-            RemoteViewsFrameLayout layout = new RemoteViewsFrameLayout(context);
-
-            // Create a new loading view
-            synchronized (lock) {
-                boolean customLoadingViewAvailable = false;
-
-                if (mUserLoadingView != null) {
-                    // Try to inflate user-specified loading view
-                    try {
-                        View loadingView = mUserLoadingView.apply(parent.getContext(), parent,
-                                handler);
-                        loadingView.setTagInternal(com.android.internal.R.id.rowTypeId,
-                                new Integer(0));
-                        layout.addView(loadingView);
-                        customLoadingViewAvailable = true;
-                    } catch (Exception e) {
-                        Log.w(TAG, "Error inflating custom loading view, using default loading" +
-                                "view instead", e);
-                    }
-                }
-                if (!customLoadingViewAvailable) {
-                    // A default loading view
-                    // Use the size of the first row as a guide for the size of the loading view
-                    if (mFirstViewHeight < 0) {
-                        try {
-                            View firstView = mFirstView.apply(parent.getContext(), parent, handler);
-                            firstView.measure(
-                                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED),
-                                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
-                            mFirstViewHeight = firstView.getMeasuredHeight();
-                            mFirstView = null;
-                        } catch (Exception e) {
-                            float density = context.getResources().getDisplayMetrics().density;
-                            mFirstViewHeight = (int)
-                                    Math.round(sDefaultLoadingViewHeight * density);
-                            mFirstView = null;
-                            Log.w(TAG, "Error inflating first RemoteViews" + e);
-                        }
-                    }
-
-                    // Compose the loading view text
-                    TextView loadingTextView = (TextView) layoutInflater.inflate(
-                            com.android.internal.R.layout.remote_views_adapter_default_loading_view,
-                            layout, false);
-                    loadingTextView.setHeight(mFirstViewHeight);
-                    loadingTextView.setTag(new Integer(0));
-
-                    layout.addView(loadingTextView);
-                }
+        public synchronized LoadingViewTemplate getLoadingTemplate(Context context) {
+            if (loadingTemplate == null) {
+                loadingTemplate = new LoadingViewTemplate(null, context);
             }
-
-            return layout;
+            return loadingTemplate;
         }
     }
 
@@ -539,17 +557,22 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     }
 
     /**
+     * Config diff flags for which the cache should be reset
+     */
+    private static final int CACHE_RESET_CONFIG_FLAGS = ActivityInfo.CONFIG_FONT_SCALE
+            | ActivityInfo.CONFIG_UI_MODE | ActivityInfo.CONFIG_DENSITY
+            | ActivityInfo.CONFIG_ASSETS_PATHS;
+    /**
      *
      */
     private static class FixedSizeRemoteViewsCache {
-        private static final String TAG = "FixedSizeRemoteViewsCache";
 
         // The meta data related to all the RemoteViews, ie. count, is stable, etc.
         // The meta data objects are made final so that they can be locked on independently
         // of the FixedSizeRemoteViewsCache. If we ever lock on both meta data objects, it is in
         // the order mTemporaryMetaData followed by mMetaData.
-        private final RemoteViewsMetaData mMetaData;
-        private final RemoteViewsMetaData mTemporaryMetaData;
+        private final RemoteViewsMetaData mMetaData = new RemoteViewsMetaData();
+        private final RemoteViewsMetaData mTemporaryMetaData = new RemoteViewsMetaData();
 
         // The cache/mapping of position to RemoteViewsMetaData.  This set is guaranteed to be
         // greater than or equal to the set of RemoteViews.
@@ -558,22 +581,19 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         // the heavy RemoteViews around.  The RemoteViews cache is trimmed to fixed constraints wrt.
         // memory and size, but this metadata cache will retain information until the data at the
         // position is guaranteed as not being necessary any more (usually on notifyDataSetChanged).
-        private HashMap<Integer, RemoteViewsIndexMetaData> mIndexMetaData;
+        private final SparseArray<RemoteViewsIndexMetaData> mIndexMetaData = new SparseArray<>();
 
         // The cache of actual RemoteViews, which may be pruned if the cache gets too large, or uses
         // too much memory.
-        private HashMap<Integer, RemoteViews> mIndexRemoteViews;
+        private final SparseArray<RemoteViews> mIndexRemoteViews = new SparseArray<>();
 
-        // The set of indices that have been explicitly requested by the collection view
-        private HashSet<Integer> mRequestedIndices;
+        // An array of indices to load, Indices which are explicitly requested are set to true,
+        // and those determined by the preloading algorithm to prefetch are set to false.
+        private final SparseBooleanArray mIndicesToLoad = new SparseBooleanArray();
 
         // We keep a reference of the last requested index to determine which item to prune the
         // farthest items from when we hit the memory limit
         private int mLastRequestedIndex;
-
-        // The set of indices to load, including those explicitly requested, as well as those
-        // determined by the preloading algorithm to be prefetched
-        private HashSet<Integer> mLoadIndices;
 
         // The lower and upper bounds of the preloaded range
         private int mPreloadLowerBound;
@@ -584,27 +604,25 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         // The maxCountSlack is used to determine if a new position in the cache to be loaded is
         // sufficiently ouside the old set, prompting a shifting of the "window" of items to be
         // preloaded.
-        private int mMaxCount;
-        private int mMaxCountSlack;
+        private final int mMaxCount;
+        private final int mMaxCountSlack;
         private static final float sMaxCountSlackPercent = 0.75f;
         private static final int sMaxMemoryLimitInBytes = 2 * 1024 * 1024;
 
-        public FixedSizeRemoteViewsCache(int maxCacheSize) {
+        // Configuration for which the cache was created
+        private final Configuration mConfiguration;
+
+        FixedSizeRemoteViewsCache(int maxCacheSize, Configuration configuration) {
             mMaxCount = maxCacheSize;
             mMaxCountSlack = Math.round(sMaxCountSlackPercent * (mMaxCount / 2));
             mPreloadLowerBound = 0;
             mPreloadUpperBound = -1;
-            mMetaData = new RemoteViewsMetaData();
-            mTemporaryMetaData = new RemoteViewsMetaData();
-            mIndexMetaData = new HashMap<Integer, RemoteViewsIndexMetaData>();
-            mIndexRemoteViews = new HashMap<Integer, RemoteViews>();
-            mRequestedIndices = new HashSet<Integer>();
             mLastRequestedIndex = -1;
-            mLoadIndices = new HashSet<Integer>();
+
+            mConfiguration = new Configuration(configuration);
         }
 
-        public void insert(int position, RemoteViews v, long itemId,
-                ArrayList<Integer> visibleWindow) {
+        public void insert(int position, RemoteViews v, long itemId, int[] visibleWindow) {
             // Trim the cache if we go beyond the count
             if (mIndexRemoteViews.size() >= mMaxCount) {
                 mIndexRemoteViews.remove(getFarthestPositionFrom(position, visibleWindow));
@@ -630,8 +648,8 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             }
 
             // Update the metadata cache
-            if (mIndexMetaData.containsKey(position)) {
-                final RemoteViewsIndexMetaData metaData = mIndexMetaData.get(position);
+            final RemoteViewsIndexMetaData metaData = mIndexMetaData.get(position);
+            if (metaData != null) {
                 metaData.set(v, itemId);
             } else {
                 mIndexMetaData.put(position, new RemoteViewsIndexMetaData(v, itemId));
@@ -646,16 +664,10 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             return mTemporaryMetaData;
         }
         public RemoteViews getRemoteViewsAt(int position) {
-            if (mIndexRemoteViews.containsKey(position)) {
-                return mIndexRemoteViews.get(position);
-            }
-            return null;
+            return mIndexRemoteViews.get(position);
         }
         public RemoteViewsIndexMetaData getMetaDataAt(int position) {
-            if (mIndexMetaData.containsKey(position)) {
-                return mIndexMetaData.get(position);
-            }
-            return null;
+            return mIndexMetaData.get(position);
         }
 
         public void commitTemporaryMetaData() {
@@ -669,8 +681,8 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         private int getRemoteViewsBitmapMemoryUsage() {
             // Calculate the memory usage of all the RemoteViews bitmaps being cached
             int mem = 0;
-            for (Integer i : mIndexRemoteViews.keySet()) {
-                final RemoteViews v = mIndexRemoteViews.get(i);
+            for (int i = mIndexRemoteViews.size() - 1; i >= 0; i--) {
+                final RemoteViews v = mIndexRemoteViews.valueAt(i);
                 if (v != null) {
                     mem += v.estimateMemoryUsage();
                 }
@@ -678,24 +690,25 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             return mem;
         }
 
-        private int getFarthestPositionFrom(int pos, ArrayList<Integer> visibleWindow) {
+        private int getFarthestPositionFrom(int pos, int[] visibleWindow) {
             // Find the index farthest away and remove that
             int maxDist = 0;
             int maxDistIndex = -1;
             int maxDistNotVisible = 0;
             int maxDistIndexNotVisible = -1;
-            for (int i : mIndexRemoteViews.keySet()) {
-                int dist = Math.abs(i-pos);
-                if (dist > maxDistNotVisible && !visibleWindow.contains(i)) {
+            for (int i = mIndexRemoteViews.size() - 1; i >= 0; i--) {
+                int index = mIndexRemoteViews.keyAt(i);
+                int dist = Math.abs(index-pos);
+                if (dist > maxDistNotVisible && Arrays.binarySearch(visibleWindow, index) < 0) {
                     // maxDistNotVisible/maxDistIndexNotVisible will store the index of the
                     // farthest non-visible position
-                    maxDistIndexNotVisible = i;
+                    maxDistIndexNotVisible = index;
                     maxDistNotVisible = dist;
                 }
                 if (dist >= maxDist) {
                     // maxDist/maxDistIndex will store the index of the farthest position
                     // regardless of whether it is visible or not
-                    maxDistIndex = i;
+                    maxDistIndex = index;
                     maxDist = dist;
                 }
             }
@@ -707,9 +720,8 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
 
         public void queueRequestedPositionToLoad(int position) {
             mLastRequestedIndex = position;
-            synchronized (mLoadIndices) {
-                mRequestedIndices.add(position);
-                mLoadIndices.add(position);
+            synchronized (mIndicesToLoad) {
+                mIndicesToLoad.put(position, true);
             }
         }
         public boolean queuePositionsToBePreloadedFromRequestedPosition(int position) {
@@ -721,15 +733,17 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 }
             }
 
-            int count = 0;
+            int count;
             synchronized (mMetaData) {
                 count = mMetaData.count;
             }
-            synchronized (mLoadIndices) {
-                mLoadIndices.clear();
-
-                // Add all the requested indices
-                mLoadIndices.addAll(mRequestedIndices);
+            synchronized (mIndicesToLoad) {
+                // Remove all indices which have not been previously requested.
+                for (int i = mIndicesToLoad.size() - 1; i >= 0; i--) {
+                    if (!mIndicesToLoad.valueAt(i)) {
+                        mIndicesToLoad.removeAt(i);
+                    }
+                }
 
                 // Add all the preload indices
                 int halfMaxCount = mMaxCount / 2;
@@ -738,43 +752,40 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 int effectiveLowerBound = Math.max(0, mPreloadLowerBound);
                 int effectiveUpperBound = Math.min(mPreloadUpperBound, count - 1);
                 for (int i = effectiveLowerBound; i <= effectiveUpperBound; ++i) {
-                    mLoadIndices.add(i);
+                    if (mIndexRemoteViews.indexOfKey(i) < 0 && !mIndicesToLoad.get(i)) {
+                        // If the index has not been requested, and has not been loaded.
+                        mIndicesToLoad.put(i, false);
+                    }
                 }
-
-                // But remove all the indices that have already been loaded and are cached
-                mLoadIndices.removeAll(mIndexRemoteViews.keySet());
             }
             return true;
         }
-        /** Returns the next index to load, and whether that index was directly requested or not */
-        public int[] getNextIndexToLoad() {
+        /** Returns the next index to load */
+        public int getNextIndexToLoad() {
             // We try and prioritize items that have been requested directly, instead
             // of items that are loaded as a result of the caching mechanism
-            synchronized (mLoadIndices) {
+            synchronized (mIndicesToLoad) {
                 // Prioritize requested indices to be loaded first
-                if (!mRequestedIndices.isEmpty()) {
-                    Integer i = mRequestedIndices.iterator().next();
-                    mRequestedIndices.remove(i);
-                    mLoadIndices.remove(i);
-                    return new int[]{i.intValue(), 1};
+                int index = mIndicesToLoad.indexOfValue(true);
+                if (index < 0) {
+                    // Otherwise, preload other indices as necessary
+                    index = mIndicesToLoad.indexOfValue(false);
                 }
-
-                // Otherwise, preload other indices as necessary
-                if (!mLoadIndices.isEmpty()) {
-                    Integer i = mLoadIndices.iterator().next();
-                    mLoadIndices.remove(i);
-                    return new int[]{i.intValue(), 0};
+                if (index < 0) {
+                    return -1;
+                } else {
+                    int key = mIndicesToLoad.keyAt(index);
+                    mIndicesToLoad.removeAt(index);
+                    return key;
                 }
-
-                return new int[]{-1, 0};
             }
         }
 
         public boolean containsRemoteViewAt(int position) {
-            return mIndexRemoteViews.containsKey(position);
+            return mIndexRemoteViews.indexOfKey(position) >= 0;
         }
         public boolean containsMetaDataAt(int position) {
-            return mIndexMetaData.containsKey(position);
+            return mIndexMetaData.indexOfKey(position) >= 0;
         }
 
         public void reset() {
@@ -787,9 +798,8 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             mLastRequestedIndex = -1;
             mIndexRemoteViews.clear();
             mIndexMetaData.clear();
-            synchronized (mLoadIndices) {
-                mRequestedIndices.clear();
-                mLoadIndices.clear();
+            synchronized (mIndicesToLoad) {
+                mIndicesToLoad.clear();
             }
         }
     }
@@ -819,7 +829,7 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     }
 
     public RemoteViewsAdapter(Context context, Intent intent,
-            RemoteAdapterConnectionCallback callback) {
+            RemoteAdapterConnectionCallback callback, boolean useAsyncLoader) {
         mContext = context;
         mIntent = intent;
 
@@ -827,20 +837,22 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             throw new IllegalArgumentException("Non-null Intent must be specified.");
         }
 
-        mAppWidgetId = intent.getIntExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID, -1);
-        mLayoutInflater = LayoutInflater.from(context);
+        mAppWidgetId = intent.getIntExtra(EXTRA_REMOTEADAPTER_APPWIDGET_ID, -1);
         mRequestedViews = new RemoteViewsFrameLayoutRefSet();
+        mOnLightBackground = intent.getBooleanExtra(EXTRA_REMOTEADAPTER_ON_LIGHT_BACKGROUND, false);
 
         // Strip the previously injected app widget id from service intent
-        if (intent.hasExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID)) {
-            intent.removeExtra(RemoteViews.EXTRA_REMOTEADAPTER_APPWIDGET_ID);
-        }
+        intent.removeExtra(EXTRA_REMOTEADAPTER_APPWIDGET_ID);
+        intent.removeExtra(EXTRA_REMOTEADAPTER_ON_LIGHT_BACKGROUND);
 
         // Initialize the worker thread
         mWorkerThread = new HandlerThread("RemoteViewsCache-loader");
         mWorkerThread.start();
-        mWorkerQueue = new Handler(mWorkerThread.getLooper());
-        mMainQueue = new Handler(Looper.myLooper(), this);
+        mMainHandler = new Handler(Looper.myLooper(), this);
+        mServiceHandler = new RemoteServiceHandler(mWorkerThread.getLooper(), this,
+                context.getApplicationContext());
+        mAsyncViewLoadExecutor = useAsyncLoader ? new HandlerThreadExecutor(mWorkerThread) : null;
+        mCallback = callback;
 
         if (sCacheRemovalThread == null) {
             sCacheRemovalThread = new HandlerThread("RemoteViewsAdapter-cachePruner");
@@ -848,15 +860,16 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
             sCacheRemovalQueue = new Handler(sCacheRemovalThread.getLooper());
         }
 
-        // Initialize the cache and the service connection on startup
-        mCallback = new WeakReference<RemoteAdapterConnectionCallback>(callback);
-        mServiceConnection = new RemoteViewsAdapterServiceConnection(this);
-
         RemoteViewsCacheKey key = new RemoteViewsCacheKey(new Intent.FilterComparison(mIntent),
                 mAppWidgetId);
 
         synchronized(sCachedRemoteViewsCaches) {
-            if (sCachedRemoteViewsCaches.containsKey(key)) {
+            FixedSizeRemoteViewsCache cache = sCachedRemoteViewsCaches.get(key);
+            Configuration config = context.getResources().getConfiguration();
+            if (cache == null
+                    || (cache.mConfiguration.diff(config) & CACHE_RESET_CONFIG_FLAGS) != 0) {
+                mCache = new FixedSizeRemoteViewsCache(DEFAULT_CACHE_SIZE, config);
+            } else {
                 mCache = sCachedRemoteViewsCaches.get(key);
                 synchronized (mCache.mMetaData) {
                     if (mCache.mMetaData.count > 0) {
@@ -865,8 +878,6 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                         mDataReady = true;
                     }
                 }
-            } else {
-                mCache = new FixedSizeRemoteViewsCache(sDefaultCacheSize);
             }
             if (!mDataReady) {
                 requestBindService();
@@ -877,22 +888,24 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     @Override
     protected void finalize() throws Throwable {
         try {
-            if (mWorkerThread != null) {
-                mWorkerThread.quit();
-            }
+            mServiceHandler.unbindNow();
+            mWorkerThread.quit();
         } finally {
             super.finalize();
         }
     }
 
+    @UnsupportedAppUsage
     public boolean isDataReady() {
         return mDataReady;
     }
 
+    @UnsupportedAppUsage
     public void setRemoteViewsOnClickHandler(OnClickHandler handler) {
         mRemoteViewsOnClickHandler = handler;
     }
 
+    @UnsupportedAppUsage
     public void saveRemoteViewsCache() {
         final RemoteViewsCacheKey key = new RemoteViewsCacheKey(
                 new Intent.FilterComparison(mIntent), mAppWidgetId);
@@ -916,16 +929,13 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 sCachedRemoteViewsCaches.put(key, mCache);
             }
 
-            Runnable r = new Runnable() {
-                @Override
-                public void run() {
-                    synchronized (sCachedRemoteViewsCaches) {
-                        if (sCachedRemoteViewsCaches.containsKey(key)) {
-                            sCachedRemoteViewsCaches.remove(key);
-                        }
-                        if (sRemoteViewsCacheRemoveRunnables.containsKey(key)) {
-                            sRemoteViewsCacheRemoveRunnables.remove(key);
-                        }
+            Runnable r = () -> {
+                synchronized (sCachedRemoteViewsCaches) {
+                    if (sCachedRemoteViewsCaches.containsKey(key)) {
+                        sCachedRemoteViewsCaches.remove(key);
+                    }
+                    if (sRemoteViewsCacheRemoveRunnables.containsKey(key)) {
+                        sRemoteViewsCacheRemoveRunnables.remove(key);
                     }
                 }
             };
@@ -934,65 +944,22 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         }
     }
 
-    private void loadNextIndexInBackground() {
-        mWorkerQueue.post(new Runnable() {
-            @Override
-            public void run() {
-                if (mServiceConnection.isConnected()) {
-                    // Get the next index to load
-                    int position = -1;
-                    synchronized (mCache) {
-                        int[] res = mCache.getNextIndexToLoad();
-                        position = res[0];
-                    }
-                    if (position > -1) {
-                        // Load the item, and notify any existing RemoteViewsFrameLayouts
-                        updateRemoteViews(position, true);
-
-                        // Queue up for the next one to load
-                        loadNextIndexInBackground();
-                    } else {
-                        // No more items to load, so queue unbind
-                        enqueueDeferredUnbindServiceMessage();
-                    }
-                }
-            }
-        });
-    }
-
-    private void processException(String method, Exception e) {
-        Log.e("RemoteViewsAdapter", "Error in " + method + ": " + e.getMessage());
-
-        // If we encounter a crash when updating, we should reset the metadata & cache and trigger
-        // a notifyDataSetChanged to update the widget accordingly
-        final RemoteViewsMetaData metaData = mCache.getMetaData();
-        synchronized (metaData) {
-            metaData.reset();
-        }
-        synchronized (mCache) {
-            mCache.reset();
-        }
-        mMainQueue.post(new Runnable() {
-            @Override
-            public void run() {
-                superNotifyDataSetChanged();
-            }
-        });
-    }
-
-    private void updateTemporaryMetaData() {
-        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
-
+    @WorkerThread
+    private void updateTemporaryMetaData(IRemoteViewsFactory factory) {
         try {
             // get the properties/first view (so that we can use it to
             // measure our dummy views)
             boolean hasStableIds = factory.hasStableIds();
             int viewTypeCount = factory.getViewTypeCount();
             int count = factory.getCount();
-            RemoteViews loadingView = factory.getLoadingView();
-            RemoteViews firstView = null;
-            if ((count > 0) && (loadingView == null)) {
-                firstView = factory.getViewAt(0);
+            LoadingViewTemplate loadingTemplate =
+                    new LoadingViewTemplate(factory.getLoadingView(), mContext);
+            if ((count > 0) && (loadingTemplate.remoteViews == null)) {
+                RemoteViews firstView = factory.getViewAt(0);
+                if (firstView != null) {
+                    loadingTemplate.loadFirstViewHeight(firstView, mContext,
+                            new HandlerThreadExecutor(mWorkerThread));
+                }
             }
             final RemoteViewsMetaData tmpMetaData = mCache.getTemporaryMetaData();
             synchronized (tmpMetaData) {
@@ -1000,42 +967,56 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 // We +1 because the base view type is the loading view
                 tmpMetaData.viewTypeCount = viewTypeCount + 1;
                 tmpMetaData.count = count;
-                tmpMetaData.setLoadingViewTemplates(loadingView, firstView);
+                tmpMetaData.loadingTemplate = loadingTemplate;
             }
-        } catch(RemoteException e) {
-            processException("updateMetaData", e);
-        } catch(RuntimeException e) {
-            processException("updateMetaData", e);
+        } catch (RemoteException | RuntimeException e) {
+            Log.e("RemoteViewsAdapter", "Error in updateMetaData: " + e.getMessage());
+
+            // If we encounter a crash when updating, we should reset the metadata & cache
+            // and trigger a notifyDataSetChanged to update the widget accordingly
+            synchronized (mCache.getMetaData()) {
+                mCache.getMetaData().reset();
+            }
+            synchronized (mCache) {
+                mCache.reset();
+            }
+            mMainHandler.sendEmptyMessage(MSG_MAIN_HANDLER_SUPER_NOTIFY_DATA_SET_CHANGED);
         }
     }
 
-    private void updateRemoteViews(final int position, boolean notifyWhenLoaded) {
-        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
-
+    @WorkerThread
+    private void updateRemoteViews(IRemoteViewsFactory factory, int position,
+            boolean notifyWhenLoaded) {
         // Load the item information from the remote service
-        RemoteViews remoteViews = null;
-        long itemId = 0;
+        final RemoteViews remoteViews;
+        final long itemId;
         try {
             remoteViews = factory.getViewAt(position);
             itemId = factory.getItemId(position);
-        } catch (RemoteException e) {
+
+            if (remoteViews == null) {
+                throw new RuntimeException("Null remoteViews");
+            }
+        } catch (RemoteException | RuntimeException e) {
             Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + e.getMessage());
 
             // Return early to prevent additional work in re-centering the view cache, and
             // swapping from the loading view
             return;
-        } catch (RuntimeException e) {
-            Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + e.getMessage());
-            return;
         }
 
-        if (remoteViews == null) {
-            // If a null view was returned, we break early to prevent it from getting
-            // into our cache and causing problems later. The effect is that the child  at this
-            // position will remain as a loading view until it is updated.
-            Log.e(TAG, "Error in updateRemoteViews(" + position + "): " + " null RemoteViews " +
-                    "returned from RemoteViewsFactory.");
-            return;
+        if (remoteViews.mApplication != null) {
+            // We keep track of last application info. This helps when all the remoteViews have
+            // same applicationInfo, which should be the case for a typical adapter. But if every
+            // view has different application info, there will not be any optimization.
+            if (mLastRemoteViewAppInfo != null
+                    && remoteViews.hasSameAppInfo(mLastRemoteViewAppInfo)) {
+                // We should probably also update the remoteViews for nested ViewActions.
+                // Hopefully, RemoteViews in an adapter would be less complicated.
+                remoteViews.mApplication = mLastRemoteViewAppInfo;
+            } else {
+                mLastRemoteViewAppInfo = remoteViews.mApplication;
+            }
         }
 
         int layoutId = remoteViews.getLayoutId();
@@ -1048,21 +1029,15 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         }
         synchronized (mCache) {
             if (viewTypeInRange) {
-                ArrayList<Integer> visibleWindow = getVisibleWindow(mVisibleWindowLowerBound,
-                        mVisibleWindowUpperBound, cacheCount);
+                int[] visibleWindow = getVisibleWindow(cacheCount);
                 // Cache the RemoteViews we loaded
                 mCache.insert(position, remoteViews, itemId, visibleWindow);
 
-                // Notify all the views that we have previously returned for this index that
-                // there is new data for it.
-                final RemoteViews rv = remoteViews;
                 if (notifyWhenLoaded) {
-                    mMainQueue.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            mRequestedViews.notifyOnRemoteViewsLoaded(position, rv);
-                        }
-                    });
+                    // Notify all the views that we have previously returned for this index that
+                    // there is new data for it.
+                    Message.obtain(mMainHandler, MSG_MAIN_HANDLER_REMOTE_VIEWS_LOADED, position, 0,
+                            remoteViews).sendToTarget();
                 }
             } else {
                 // We need to log an error here, as the the view type count specified by the
@@ -1075,6 +1050,7 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         }
     }
 
+    @UnsupportedAppUsage
     public Intent getRemoteViewsServiceIntent() {
         return mIntent;
     }
@@ -1101,7 +1077,7 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     }
 
     public int getItemViewType(int position) {
-        int typeId = 0;
+        final int typeId;
         synchronized (mCache) {
             if (mCache.containsMetaDataAt(position)) {
                 typeId = mCache.getMetaDataAt(position).typeId;
@@ -1117,25 +1093,11 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
     }
 
     /**
-     * Returns the item type id for the specified convert view.  Returns -1 if the convert view
-     * is invalid.
-     */
-    private int getConvertViewTypeId(View convertView) {
-        int typeId = -1;
-        if (convertView != null) {
-            Object tag = convertView.getTag(com.android.internal.R.id.rowTypeId);
-            if (tag != null) {
-                typeId = (Integer) tag;
-            }
-        }
-        return typeId;
-    }
-
-    /**
      * This method allows an AdapterView using this Adapter to provide information about which
      * views are currently being displayed. This allows for certain optimizations and preloading
      * which  wouldn't otherwise be possible.
      */
+    @UnsupportedAppUsage
     public void setVisibleRangeHint(int lowerBound, int upperBound) {
         mVisibleWindowLowerBound = lowerBound;
         mVisibleWindowUpperBound = upperBound;
@@ -1145,15 +1107,15 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         // "Request" an index so that we can queue it for loading, initiate subsequent
         // preloading, etc.
         synchronized (mCache) {
-            boolean isInCache = mCache.containsRemoteViewAt(position);
-            boolean isConnected = mServiceConnection.isConnected();
+            RemoteViews rv = mCache.getRemoteViewsAt(position);
+            boolean isInCache = (rv != null);
             boolean hasNewItems = false;
 
             if (convertView != null && convertView instanceof RemoteViewsFrameLayout) {
                 mRequestedViews.removeView((RemoteViewsFrameLayout) convertView);
             }
 
-            if (!isInCache && !isConnected) {
+            if (!isInCache) {
                 // Requesting bind service will trigger a super.notifyDataSetChanged(), which will
                 // in turn trigger another request to getView()
                 requestBindService();
@@ -1162,75 +1124,33 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
                 hasNewItems = mCache.queuePositionsToBePreloadedFromRequestedPosition(position);
             }
 
+            final RemoteViewsFrameLayout layout;
+            if (convertView instanceof RemoteViewsFrameLayout) {
+                layout = (RemoteViewsFrameLayout) convertView;
+            } else {
+                layout = new RemoteViewsFrameLayout(parent.getContext(), mCache);
+                layout.setExecutor(mAsyncViewLoadExecutor);
+                layout.setOnLightBackground(mOnLightBackground);
+            }
+
             if (isInCache) {
-                View convertViewChild = null;
-                int convertViewTypeId = 0;
-                RemoteViewsFrameLayout layout = null;
-
-                if (convertView instanceof RemoteViewsFrameLayout) {
-                    layout = (RemoteViewsFrameLayout) convertView;
-                    convertViewChild = layout.getChildAt(0);
-                    convertViewTypeId = getConvertViewTypeId(convertViewChild);
-                }
-
-                // Second, we try and retrieve the RemoteViews from the cache, returning a loading
-                // view and queueing it to be loaded if it has not already been loaded.
-                Context context = parent.getContext();
-                RemoteViews rv = mCache.getRemoteViewsAt(position);
-                RemoteViewsIndexMetaData indexMetaData = mCache.getMetaDataAt(position);
-                int typeId = indexMetaData.typeId;
-
-                try {
-                    // Reuse the convert view where possible
-                    if (layout != null) {
-                        if (convertViewTypeId == typeId) {
-                            rv.reapply(context, convertViewChild, mRemoteViewsOnClickHandler);
-                            return layout;
-                        }
-                        layout.removeAllViews();
-                    } else {
-                        layout = new RemoteViewsFrameLayout(context);
-                    }
-
-                    // Otherwise, create a new view to be returned
-                    View newView = rv.apply(context, parent, mRemoteViewsOnClickHandler);
-                    newView.setTagInternal(com.android.internal.R.id.rowTypeId,
-                            new Integer(typeId));
-                    layout.addView(newView);
-                    return layout;
-
-                } catch (Exception e){
-                    // We have to make sure that we successfully inflated the RemoteViews, if not
-                    // we return the loading view instead.
-                    Log.w(TAG, "Error inflating RemoteViews at position: " + position + ", using" +
-                            "loading view instead" + e);
-
-                    RemoteViewsFrameLayout loadingView = null;
-                    final RemoteViewsMetaData metaData = mCache.getMetaData();
-                    synchronized (metaData) {
-                        loadingView = metaData.createLoadingView(position, convertView, parent,
-                                mCache, mLayoutInflater, mRemoteViewsOnClickHandler);
-                    }
-                    return loadingView;
-                } finally {
-                    if (hasNewItems) loadNextIndexInBackground();
+                // Apply the view synchronously if possible, to avoid flickering
+                layout.onRemoteViewsLoaded(rv, mRemoteViewsOnClickHandler, false);
+                if (hasNewItems) {
+                    mServiceHandler.sendEmptyMessage(MSG_LOAD_NEXT_ITEM);
                 }
             } else {
-                // If the cache does not have the RemoteViews at this position, then create a
-                // loading view and queue the actual position to be loaded in the background
-                RemoteViewsFrameLayout loadingView = null;
-                final RemoteViewsMetaData metaData = mCache.getMetaData();
-                synchronized (metaData) {
-                    loadingView = metaData.createLoadingView(position, convertView, parent,
-                            mCache, mLayoutInflater, mRemoteViewsOnClickHandler);
-                }
-
-                mRequestedViews.add(position, loadingView);
+                // If the views is not loaded, apply the loading view. If the loading view doesn't
+                // exist, the layout will create a default view based on the firstView height.
+                layout.onRemoteViewsLoaded(
+                        mCache.getMetaData().getLoadingTemplate(mContext).remoteViews,
+                        mRemoteViewsOnClickHandler,
+                        false);
+                mRequestedViews.add(position, layout);
                 mCache.queueRequestedPositionToLoad(position);
-                loadNextIndexInBackground();
-
-                return loadingView;
+                mServiceHandler.sendEmptyMessage(MSG_LOAD_NEXT_ITEM);
             }
+            return layout;
         }
     }
 
@@ -1252,108 +1172,43 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
         return getCount() <= 0;
     }
 
-    private void onNotifyDataSetChanged() {
-        // Complete the actual notifyDataSetChanged() call initiated earlier
-        IRemoteViewsFactory factory = mServiceConnection.getRemoteViewsFactory();
-        try {
-            factory.onDataSetChanged();
-        } catch (RemoteException e) {
-            Log.e(TAG, "Error in updateNotifyDataSetChanged(): " + e.getMessage());
-
-            // Return early to prevent from further being notified (since nothing has
-            // changed)
-            return;
-        } catch (RuntimeException e) {
-            Log.e(TAG, "Error in updateNotifyDataSetChanged(): " + e.getMessage());
-            return;
-        }
-
-        // Flush the cache so that we can reload new items from the service
-        synchronized (mCache) {
-            mCache.reset();
-        }
-
-        // Re-request the new metadata (only after the notification to the factory)
-        updateTemporaryMetaData();
-        int newCount;
-        ArrayList<Integer> visibleWindow;
-        synchronized(mCache.getTemporaryMetaData()) {
-            newCount = mCache.getTemporaryMetaData().count;
-            visibleWindow = getVisibleWindow(mVisibleWindowLowerBound,
-                    mVisibleWindowUpperBound, newCount);
-        }
-
-        // Pre-load (our best guess of) the views which are currently visible in the AdapterView.
-        // This mitigates flashing and flickering of loading views when a widget notifies that
-        // its data has changed.
-        for (int i: visibleWindow) {
-            // Because temporary meta data is only ever modified from this thread (ie.
-            // mWorkerThread), it is safe to assume that count is a valid representation.
-            if (i < newCount) {
-                updateRemoteViews(i, false);
-            }
-        }
-
-        // Propagate the notification back to the base adapter
-        mMainQueue.post(new Runnable() {
-            @Override
-            public void run() {
-                synchronized (mCache) {
-                    mCache.commitTemporaryMetaData();
-                }
-
-                superNotifyDataSetChanged();
-                enqueueDeferredUnbindServiceMessage();
-            }
-        });
-
-        // Reset the notify flagflag
-        mNotifyDataSetChangedAfterOnServiceConnected = false;
-    }
-
-    private ArrayList<Integer> getVisibleWindow(int lower, int upper, int count) {
-        ArrayList<Integer> window = new ArrayList<Integer>();
-
+    /**
+     * Returns a sorted array of all integers between lower and upper.
+     */
+    private int[] getVisibleWindow(int count) {
+        int lower = mVisibleWindowLowerBound;
+        int upper = mVisibleWindowUpperBound;
         // In the case that the window is invalid or uninitialized, return an empty window.
         if ((lower == 0 && upper == 0) || lower < 0 || upper < 0) {
-            return window;
+            return new int[0];
         }
 
+        int[] window;
         if (lower <= upper) {
-            for (int i = lower;  i <= upper; i++){
-                window.add(i);
+            window = new int[upper + 1 - lower];
+            for (int i = lower, j = 0;  i <= upper; i++, j++){
+                window[j] = i;
             }
         } else {
             // If the upper bound is less than the lower bound it means that the visible window
             // wraps around.
-            for (int i = lower; i < count; i++) {
-                window.add(i);
+            count = Math.max(count, lower);
+            window = new int[count - lower + upper + 1];
+            int j = 0;
+            // Add the entries in sorted order
+            for (int i = 0; i <= upper; i++, j++) {
+                window[j] = i;
             }
-            for (int i = 0; i <= upper; i++) {
-                window.add(i);
+            for (int i = lower; i < count; i++, j++) {
+                window[j] = i;
             }
         }
         return window;
     }
 
     public void notifyDataSetChanged() {
-        // Dequeue any unbind messages
-        mMainQueue.removeMessages(sUnbindServiceMessageType);
-
-        // If we are not connected, queue up the notifyDataSetChanged to be handled when we do
-        // connect
-        if (!mServiceConnection.isConnected()) {
-            mNotifyDataSetChangedAfterOnServiceConnected = true;
-            requestBindService();
-            return;
-        }
-
-        mWorkerQueue.post(new Runnable() {
-            @Override
-            public void run() {
-                onNotifyDataSetChanged();
-            }
-        });
+        mServiceHandler.removeMessages(MSG_UNBIND_SERVICE);
+        mServiceHandler.sendEmptyMessage(MSG_NOTIFY_DATA_SET_CHANGED);
     }
 
     void superNotifyDataSetChanged() {
@@ -1362,34 +1217,91 @@ public class RemoteViewsAdapter extends BaseAdapter implements Handler.Callback 
 
     @Override
     public boolean handleMessage(Message msg) {
-        boolean result = false;
         switch (msg.what) {
-        case sUnbindServiceMessageType:
-            if (mServiceConnection.isConnected()) {
-                mServiceConnection.unbind(mContext, mAppWidgetId, mIntent);
+            case MSG_MAIN_HANDLER_COMMIT_METADATA: {
+                mCache.commitTemporaryMetaData();
+                return true;
             }
-            result = true;
-            break;
-        default:
-            break;
+            case MSG_MAIN_HANDLER_SUPER_NOTIFY_DATA_SET_CHANGED: {
+                superNotifyDataSetChanged();
+                return true;
+            }
+            case MSG_MAIN_HANDLER_REMOTE_ADAPTER_CONNECTED: {
+                if (mCallback != null) {
+                    mCallback.onRemoteAdapterConnected();
+                }
+                return true;
+            }
+            case MSG_MAIN_HANDLER_REMOTE_ADAPTER_DISCONNECTED: {
+                if (mCallback != null) {
+                    mCallback.onRemoteAdapterDisconnected();
+                }
+                return true;
+            }
+            case MSG_MAIN_HANDLER_REMOTE_VIEWS_LOADED: {
+                mRequestedViews.notifyOnRemoteViewsLoaded(msg.arg1, (RemoteViews) msg.obj);
+                return true;
+            }
         }
-        return result;
+        return false;
     }
 
-    private void enqueueDeferredUnbindServiceMessage() {
-        // Remove any existing deferred-unbind messages
-        mMainQueue.removeMessages(sUnbindServiceMessageType);
-        mMainQueue.sendEmptyMessageDelayed(sUnbindServiceMessageType, sUnbindServiceDelay);
+    private void requestBindService() {
+        mServiceHandler.removeMessages(MSG_UNBIND_SERVICE);
+        Message.obtain(mServiceHandler, MSG_REQUEST_BIND, mAppWidgetId, 0, mIntent).sendToTarget();
     }
 
-    private boolean requestBindService() {
-        // Try binding the service (which will start it if it's not already running)
-        if (!mServiceConnection.isConnected()) {
-            mServiceConnection.bind(mContext, mAppWidgetId, mIntent);
+    private static class HandlerThreadExecutor implements Executor {
+        private final HandlerThread mThread;
+
+        HandlerThreadExecutor(HandlerThread thread) {
+            mThread = thread;
         }
 
-        // Remove any existing deferred-unbind messages
-        mMainQueue.removeMessages(sUnbindServiceMessageType);
-        return mServiceConnection.isConnected();
+        @Override
+        public void execute(Runnable runnable) {
+            if (Thread.currentThread().getId() == mThread.getId()) {
+                runnable.run();
+            } else {
+                new Handler(mThread.getLooper()).post(runnable);
+            }
+        }
+    }
+
+    private static class LoadingViewTemplate {
+        public final RemoteViews remoteViews;
+        public int defaultHeight;
+
+        LoadingViewTemplate(RemoteViews views, Context context) {
+            remoteViews = views;
+
+            float density = context.getResources().getDisplayMetrics().density;
+            defaultHeight = Math.round(DEFAULT_LOADING_VIEW_HEIGHT * density);
+        }
+
+        public void loadFirstViewHeight(
+                RemoteViews firstView, Context context, Executor executor) {
+            // Inflate the first view on the worker thread
+            firstView.applyAsync(context, new RemoteViewsFrameLayout(context, null), executor,
+                    new RemoteViews.OnViewAppliedListener() {
+                        @Override
+                        public void onViewApplied(View v) {
+                            try {
+                                v.measure(
+                                        MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED),
+                                        MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                                defaultHeight = v.getMeasuredHeight();
+                            } catch (Exception e) {
+                                onError(e);
+                            }
+                        }
+
+                        @Override
+                        public void onError(Exception e) {
+                            // Do nothing. The default height will stay the same.
+                            Log.w(TAG, "Error inflating first RemoteViews", e);
+                        }
+                    });
+        }
     }
 }

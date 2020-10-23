@@ -16,8 +16,9 @@
 
 package android.media;
 
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.ContentProviderClient;
 import android.content.ContentValues;
-import android.content.IContentProvider;
 import android.net.Uri;
 import android.os.RemoteException;
 
@@ -37,13 +38,11 @@ public class MediaInserter {
     private final HashMap<Uri, List<ContentValues>> mPriorityRowMap =
             new HashMap<Uri, List<ContentValues>>();
 
-    private final IContentProvider mProvider;
-    private final String mPackageName;
+    private final ContentProviderClient mProvider;
     private final int mBufferSizePerUri;
 
-    public MediaInserter(IContentProvider provider, String packageName, int bufferSizePerUri) {
+    public MediaInserter(ContentProviderClient provider, int bufferSizePerUri) {
         mProvider = provider;
-        mPackageName = packageName;
         mBufferSizePerUri = bufferSizePerUri;
     }
 
@@ -69,6 +68,7 @@ public class MediaInserter {
         }
     }
 
+    @UnsupportedAppUsage
     public void flushAll() throws RemoteException {
         flushAllPriority();
         for (Uri tableUri : mRowMap.keySet()){
@@ -90,7 +90,7 @@ public class MediaInserter {
         if (!list.isEmpty()) {
             ContentValues[] valuesArray = new ContentValues[list.size()];
             valuesArray = list.toArray(valuesArray);
-            mProvider.bulkInsert(mPackageName, tableUri, valuesArray);
+            mProvider.bulkInsert(tableUri, valuesArray);
             list.clear();
         }
     }

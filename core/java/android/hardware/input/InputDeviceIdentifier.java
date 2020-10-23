@@ -16,8 +16,11 @@
 
 package android.hardware.input;
 
+import java.util.Objects;
+
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.text.TextUtils;
 
 /**
  * Wrapper for passing identifying information for input devices.
@@ -65,7 +68,22 @@ public final class InputDeviceIdentifier implements Parcelable {
         return mProductId;
     }
 
-    public static final Parcelable.Creator<InputDeviceIdentifier> CREATOR =
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || !(o instanceof InputDeviceIdentifier)) return false;
+
+        final InputDeviceIdentifier that = (InputDeviceIdentifier) o;
+        return ((mVendorId == that.mVendorId) && (mProductId == that.mProductId)
+                && TextUtils.equals(mDescriptor, that.mDescriptor));
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(mDescriptor, mVendorId, mProductId);
+    }
+
+    public static final @android.annotation.NonNull Parcelable.Creator<InputDeviceIdentifier> CREATOR =
             new Parcelable.Creator<InputDeviceIdentifier>() {
 
         @Override

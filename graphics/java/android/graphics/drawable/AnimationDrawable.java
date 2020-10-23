@@ -16,19 +16,20 @@
 
 package android.graphics.drawable;
 
-import com.android.internal.R;
+import android.annotation.NonNull;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.res.Resources;
+import android.content.res.Resources.Theme;
+import android.content.res.TypedArray;
+import android.os.SystemClock;
+import android.util.AttributeSet;
 
-import java.io.IOException;
+import com.android.internal.R;
 
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
 
-import android.annotation.NonNull;
-import android.content.res.Resources;
-import android.content.res.TypedArray;
-import android.content.res.Resources.Theme;
-import android.os.SystemClock;
-import android.util.AttributeSet;
+import java.io.IOException;
 
 /**
  * An object used to create frame-by-frame animations, defined by a series of
@@ -88,6 +89,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
     private AnimationState mAnimationState;
 
     /** The current frame, ranging from 0 to {@link #mAnimationState#getChildCount() - 1} */
+    @UnsupportedAppUsage
     private int mCurFrame = 0;
 
     /** Whether the drawable has an animation callback posted. */
@@ -105,10 +107,12 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
     /**
      * Sets whether this AnimationDrawable is visible.
      * <p>
-     * When the drawable becomes invisible, it will pause its animation. A
-     * subsequent change to visible with <code>restart</code> set to true will
-     * restart the animation from the first frame. If <code>restart</code> is
-     * false, the animation will resume from the most recent frame.
+     * When the drawable becomes invisible, it will pause its animation. A subsequent change to
+     * visible with <code>restart</code> set to true will restart the animation from the
+     * first frame. If <code>restart</code> is false, the drawable will resume from the most recent
+     * frame. If the drawable has already reached the last frame, it will then loop back to the
+     * first frame, unless it's a one shot drawable (set through {@link #setOneShot(boolean)}),
+     * in which case, it will stay on the last frame.
      *
      * @param visible true if visible, false otherwise
      * @param restart when visible, true to force the animation to restart
@@ -120,7 +124,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
         final boolean changed = super.setVisible(visible, restart);
         if (visible) {
             if (restart || changed) {
-                boolean startFromZero = restart || !mRunning ||
+                boolean startFromZero = restart || (!mRunning && !mAnimationState.mOneShot) ||
                         mCurFrame >= mAnimationState.getChildCount();
                 setFrame(startFromZero ? 0 : mCurFrame, true, mAnimating);
             }
@@ -131,7 +135,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
     }
 
     /**
-     * Starts the animation, looping if necessary. This method has no effect
+     * Starts the animation from the first frame, looping if necessary. This method has no effect
      * if the animation is running.
      * <p>
      * <strong>Note:</strong> Do not call this in the
@@ -158,7 +162,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
     }
 
     /**
-     * Stops the animation. This method has no effect if the animation is not
+     * Stops the animation at the current frame. This method has no effect if the animation is not
      * running.
      *
      * @see #isRunning()
@@ -169,6 +173,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
         mAnimating = false;
 
         if (isRunning()) {
+            mCurFrame = 0;
             unscheduleSelf(this);
         }
     }
@@ -196,7 +201,6 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
 
     @Override
     public void unscheduleSelf(Runnable what) {
-        mCurFrame = 0;
         mRunning = false;
         super.unscheduleSelf(what);
     }
@@ -289,6 +293,7 @@ public class AnimationDrawable extends DrawableContainer implements Runnable, An
         final TypedArray a = obtainAttributes(r, theme, attrs, R.styleable.AnimationDrawable);
         super.inflateWithAttributes(r, parser, a, R.styleable.AnimationDrawable_visible);
         updateStateFromTypedArray(a);
+        updateDensity(r);
         a.recycle();
 
         inflateChildElements(r, parser, attrs, theme);

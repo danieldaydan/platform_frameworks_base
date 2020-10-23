@@ -72,7 +72,13 @@ import java.util.List;
  *                 android:value=".MyChooserTargetService" />
  *     &lt;/activity>
  * </pre>
+ *
+ * @deprecated For publishing direct share targets, please follow the instructions in
+ * https://developer.android.com/training/sharing/receive.html#providing-direct-share-targets
+ * instead.
  */
+
+@Deprecated
 public abstract class ChooserTargetService extends Service {
     // TAG = "ChooserTargetService[MySubclass]";
     private final String TAG = ChooserTargetService.class.getSimpleName()
@@ -139,6 +145,7 @@ public abstract class ChooserTargetService extends Service {
         public void getChooserTargets(ComponentName targetComponentName,
                 IntentFilter matchedFilter, IChooserTargetResult result) throws RemoteException {
             List<ChooserTarget> targets = null;
+            final long id = clearCallingIdentity();
             try {
                 if (DEBUG) {
                     Log.d(TAG, "getChooserTargets calling onGetChooserTargets; "
@@ -146,6 +153,7 @@ public abstract class ChooserTargetService extends Service {
                 }
                 targets = onGetChooserTargets(targetComponentName, matchedFilter);
             } finally {
+                restoreCallingIdentity(id);
                 result.sendResult(targets);
                 if (DEBUG) Log.d(TAG, "Sent results");
             }

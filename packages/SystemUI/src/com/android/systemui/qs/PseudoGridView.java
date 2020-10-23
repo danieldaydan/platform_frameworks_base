@@ -16,8 +16,6 @@
 
 package com.android.systemui.qs;
 
-import com.android.systemui.R;
-
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.database.DataSetObserver;
@@ -25,6 +23,8 @@ import android.util.AttributeSet;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
+
+import com.android.systemui.R;
 
 import java.lang.ref.WeakReference;
 
@@ -47,16 +47,12 @@ public class PseudoGridView extends ViewGroup {
         final int N = a.getIndexCount();
         for (int i = 0; i < N; i++) {
             int attr = a.getIndex(i);
-            switch (attr) {
-                case R.styleable.PseudoGridView_numColumns:
-                    mNumColumns = a.getInt(attr, 3);
-                    break;
-                case R.styleable.PseudoGridView_verticalSpacing:
-                    mVerticalSpacing = a.getDimensionPixelSize(attr, 0);
-                    break;
-                case R.styleable.PseudoGridView_horizontalSpacing:
-                    mHorizontalSpacing = a.getDimensionPixelSize(attr, 0);
-                    break;
+            if (attr == R.styleable.PseudoGridView_numColumns) {
+                mNumColumns = a.getInt(attr, 3);
+            } else if (attr == R.styleable.PseudoGridView_verticalSpacing) {
+                mVerticalSpacing = a.getDimensionPixelSize(attr, 0);
+            } else if (attr == R.styleable.PseudoGridView_horizontalSpacing) {
+                mHorizontalSpacing = a.getDimensionPixelSize(attr, 0);
             }
         }
 
@@ -98,7 +94,7 @@ public class PseudoGridView extends ViewGroup {
             }
         }
 
-        setMeasuredDimension(width, getDefaultSize(totalHeight, heightMeasureSpec));
+        setMeasuredDimension(width, resolveSizeAndState(totalHeight, heightMeasureSpec, 0));
     }
 
     @Override

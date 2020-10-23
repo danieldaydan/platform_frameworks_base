@@ -16,32 +16,35 @@
 
 package android.media;
 
-import java.lang.annotation.Retention;
-import java.lang.annotation.RetentionPolicy;
-import java.lang.ref.WeakReference;
-import java.lang.Math;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.NioUtils;
-import java.util.Collection;
-
+import android.annotation.CallbackExecutor;
+import android.annotation.FloatRange;
 import android.annotation.IntDef;
+import android.annotation.IntRange;
 import android.annotation.NonNull;
-import android.app.ActivityThread;
-import android.app.AppOpsManager;
-import android.content.Context;
+import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
+import android.annotation.SystemApi;
+import android.annotation.TestApi;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Binder;
 import android.os.Handler;
-import android.os.IBinder;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
-import android.os.Process;
-import android.os.RemoteException;
-import android.os.ServiceManager;
+import android.os.PersistableBundle;
 import android.util.ArrayMap;
 import android.util.Log;
 
-import com.android.internal.app.IAppOpsService;
+import com.android.internal.annotations.GuardedBy;
 
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.NioUtils;
+import java.util.LinkedList;
+import java.util.concurrent.Executor;
 
 /**
  * The AudioTrack class manages and plays a single audio resource for Java applications.
@@ -78,7 +81,9 @@ import com.android.internal.app.IAppOpsService;
  *
  * AudioTrack is not final and thus permits subclasses, but such use is not recommended.
  */
-public class AudioTrack
+public class AudioTrack extends PlayerBase
+                        implements AudioRouting
+                                 , VolumeAutomation
 {
     //---------------------------------------------------------
     // Constants
@@ -92,21 +97,26 @@ public class AudioTrack
      */
     private static final float GAIN_MAX = 1.0f;
 
-    /** Minimum value for sample rate */
-    private static final int SAMPLE_RATE_HZ_MIN = 4000;
-    /** Maximum value for sample rate */
-    private static final int SAMPLE_RATE_HZ_MAX = 192000;
-
-    // FCC_8
-    /** Maximum value for AudioTrack channel count */
-    private static final int CHANNEL_COUNT_MAX = 8;
-
     /** indicates AudioTrack state is stopped */
     public static final int PLAYSTATE_STOPPED = 1;  // matches SL_PLAYSTATE_STOPPED
     /** indicates AudioTrack state is paused */
     public static final int PLAYSTATE_PAUSED  = 2;  // matches SL_PLAYSTATE_PAUSED
     /** indicates AudioTrack state is playing */
     public static final int PLAYSTATE_PLAYING = 3;  // matches SL_PLAYSTATE_PLAYING
+    /**
+      * @hide
+      * indicates AudioTrack state is stopping waiting for NATIVE_EVENT_STREAM_END to
+      * transition to PLAYSTATE_STOPPED.
+      * Only valid for offload mode.
+      */
+    private static final int PLAYSTATE_STOPPING = 4;
+    /**
+      * @hide
+      * indicates AudioTrack state is paused from stopping state. Will transition to
+      * PLAYSTATE_STOPPING if play() is called.
+      * Only valid for offload mode.
+      */
+    private static final int PLAYSTATE_PAUSED_STOPPING = 5;
 
     // keep these values in sync with android_media_AudioTrack.cpp
     /**
@@ -161,7 +171,6 @@ public class AudioTrack
     /**
      * An error code indicating that the object reporting it is no longer valid and needs to
      * be recreated.
-     * @hide
      */
     public  static final int ERROR_DEAD_OBJECT                     = AudioSystem.DEAD_OBJECT;
     /**
@@ -181,6 +190,10 @@ public class AudioTrack
 
     // Events:
     // to keep in sync with frameworks/av/include/media/AudioTrack.h
+    // Note: To avoid collisions with other event constants,
+    // do not define an event here that is the same value as
+    // AudioSystem.NATIVE_EVENT_ROUTING_CHANGE.
+
     /**
      * Event id denotes when playback head has reached a previously set marker.
      */
@@ -189,9 +202,159 @@ public class AudioTrack
      * Event id denotes when previously set update period has elapsed during playback.
      */
     private static final int NATIVE_EVENT_NEW_POS = 4;
+    /**
+     * Callback for more data
+     */
+    private static final int NATIVE_EVENT_CAN_WRITE_MORE_DATA = 9;
+    /**
+     * IAudioTrack tear down for offloaded tracks
+     * TODO: when received, java AudioTrack must be released
+     */
+    private static final int NATIVE_EVENT_NEW_IAUDIOTRACK = 6;
+    /**
+     * Event id denotes when all the buffers queued in AF and HW are played
+     * back (after stop is called) for an offloaded track.
+     */
+    private static final int NATIVE_EVENT_STREAM_END = 7;
+    /**
+     * Event id denotes when the codec format changes.
+     *
+     * Note: Similar to a device routing change (AudioSystem.NATIVE_EVENT_ROUTING_CHANGE),
+     * this event comes from the AudioFlinger Thread / Output Stream management
+     * (not from buffer indications as above).
+     */
+    private static final int NATIVE_EVENT_CODEC_FORMAT_CHANGE = 100;
 
     private final static String TAG = "android.media.AudioTrack";
 
+    /** @hide */
+    @IntDef({
+        ENCAPSULATION_MODE_NONE,
+        ENCAPSULATION_MODE_ELEMENTARY_STREAM,
+        // ENCAPSULATION_MODE_HANDLE, @SystemApi
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface EncapsulationMode {}
+
+    // Important: The ENCAPSULATION_MODE values must be kept in sync with native header files.
+    /**
+     * This mode indicates no metadata encapsulation,
+     * which is the default mode for sending audio data
+     * through {@code AudioTrack}.
+     */
+    public static final int ENCAPSULATION_MODE_NONE = 0;
+    /**
+     * This mode indicates metadata encapsulation with an elementary stream payload.
+     * Both compressed and PCM format is allowed.
+     */
+    public static final int ENCAPSULATION_MODE_ELEMENTARY_STREAM = 1;
+    /**
+     * This mode indicates metadata encapsulation with a handle payload
+     * and is set through {@link Builder#setEncapsulationMode(int)}.
+     * The handle is a 64 bit long, provided by the Tuner API
+     * in {@link android.os.Build.VERSION_CODES#R}.
+     * @hide
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.MODIFY_AUDIO_ROUTING)
+    public static final int ENCAPSULATION_MODE_HANDLE = 2;
+
+    /* Enumeration of metadata types permitted for use by
+     * encapsulation mode audio streams.
+     */
+    /** @hide */
+    @IntDef(prefix = { "ENCAPSULATION_METADATA_TYPE_" }, value = {
+        ENCAPSULATION_METADATA_TYPE_NONE, /* reserved */
+        ENCAPSULATION_METADATA_TYPE_FRAMEWORK_TUNER,
+        ENCAPSULATION_METADATA_TYPE_DVB_AD_DESCRIPTOR,
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface EncapsulationMetadataType {}
+
+    /**
+     * Reserved do not use.
+     * @hide
+     */
+    public static final int ENCAPSULATION_METADATA_TYPE_NONE = 0; // reserved
+
+    /**
+     * Encapsulation metadata type for framework tuner information.
+     *
+     * Refer to the Android Media TV Tuner API for details.
+     */
+    public static final int ENCAPSULATION_METADATA_TYPE_FRAMEWORK_TUNER = 1;
+
+    /**
+     * Encapsulation metadata type for DVB AD descriptor.
+     *
+     * This metadata is formatted per ETSI TS 101 154 Table E.1: AD_descriptor.
+     */
+    public static final int ENCAPSULATION_METADATA_TYPE_DVB_AD_DESCRIPTOR = 2;
+
+    /* Dual Mono handling is used when a stereo audio stream
+     * contains separate audio content on the left and right channels.
+     * Such information about the content of the stream may be found, for example, in
+     * ITU T-REC-J.94-201610 A.6.2.3 Component descriptor.
+     */
+    /** @hide */
+    @IntDef({
+        DUAL_MONO_MODE_OFF,
+        DUAL_MONO_MODE_LR,
+        DUAL_MONO_MODE_LL,
+        DUAL_MONO_MODE_RR,
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface DualMonoMode {}
+    // Important: The DUAL_MONO_MODE values must be kept in sync with native header files.
+    /**
+     * This mode disables any Dual Mono presentation effect.
+     *
+     */
+    public static final int DUAL_MONO_MODE_OFF = 0;
+
+    /**
+     * This mode indicates that a stereo stream should be presented
+     * with the left and right audio channels blended together
+     * and delivered to both channels.
+     *
+     * Behavior for non-stereo streams is implementation defined.
+     * A suggested guideline is that the left-right stereo symmetric
+     * channels are pairwise blended;
+     * the other channels such as center are left alone.
+     *
+     * The Dual Mono effect occurs before volume scaling.
+     */
+    public static final int DUAL_MONO_MODE_LR = 1;
+
+    /**
+     * This mode indicates that a stereo stream should be presented
+     * with the left audio channel replicated into the right audio channel.
+     *
+     * Behavior for non-stereo streams is implementation defined.
+     * A suggested guideline is that all channels with left-right
+     * stereo symmetry will have the left channel position replicated
+     * into the right channel position.
+     * The center channels (with no left/right symmetry) or unbalanced
+     * channels are left alone.
+     *
+     * The Dual Mono effect occurs before volume scaling.
+     */
+    public static final int DUAL_MONO_MODE_LL = 2;
+
+    /**
+     * This mode indicates that a stereo stream should be presented
+     * with the right audio channel replicated into the left audio channel.
+     *
+     * Behavior for non-stereo streams is implementation defined.
+     * A suggested guideline is that all channels with left-right
+     * stereo symmetry will have the right channel position replicated
+     * into the left channel position.
+     * The center channels (with no left/right symmetry) or unbalanced
+     * channels are left alone.
+     *
+     * The Dual Mono effect occurs before volume scaling.
+     */
+    public static final int DUAL_MONO_MODE_RR = 3;
 
     /** @hide */
     @IntDef({
@@ -220,6 +383,69 @@ public class AudioTrack
      */
     public final static int WRITE_NON_BLOCKING = 1;
 
+    /** @hide */
+    @IntDef({
+        PERFORMANCE_MODE_NONE,
+        PERFORMANCE_MODE_LOW_LATENCY,
+        PERFORMANCE_MODE_POWER_SAVING
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface PerformanceMode {}
+
+    /**
+     * Default performance mode for an {@link AudioTrack}.
+     */
+    public static final int PERFORMANCE_MODE_NONE = 0;
+
+    /**
+     * Low latency performance mode for an {@link AudioTrack}.
+     * If the device supports it, this mode
+     * enables a lower latency path through to the audio output sink.
+     * Effects may no longer work with such an {@code AudioTrack} and
+     * the sample rate must match that of the output sink.
+     * <p>
+     * Applications should be aware that low latency requires careful
+     * buffer management, with smaller chunks of audio data written by each
+     * {@code write()} call.
+     * <p>
+     * If this flag is used without specifying a {@code bufferSizeInBytes} then the
+     * {@code AudioTrack}'s actual buffer size may be too small.
+     * It is recommended that a fairly
+     * large buffer should be specified when the {@code AudioTrack} is created.
+     * Then the actual size can be reduced by calling
+     * {@link #setBufferSizeInFrames(int)}. The buffer size can be optimized
+     * by lowering it after each {@code write()} call until the audio glitches,
+     * which is detected by calling
+     * {@link #getUnderrunCount()}. Then the buffer size can be increased
+     * until there are no glitches.
+     * This tuning step should be done while playing silence.
+     * This technique provides a compromise between latency and glitch rate.
+     */
+    public static final int PERFORMANCE_MODE_LOW_LATENCY = 1;
+
+    /**
+     * Power saving performance mode for an {@link AudioTrack}.
+     * If the device supports it, this
+     * mode will enable a lower power path to the audio output sink.
+     * In addition, this lower power path typically will have
+     * deeper internal buffers and better underrun resistance,
+     * with a tradeoff of higher latency.
+     * <p>
+     * In this mode, applications should attempt to use a larger buffer size
+     * and deliver larger chunks of audio data per {@code write()} call.
+     * Use {@link #getBufferSizeInFrames()} to determine
+     * the actual buffer size of the {@code AudioTrack} as it may have increased
+     * to accommodate a deeper buffer.
+     */
+    public static final int PERFORMANCE_MODE_POWER_SAVING = 2;
+
+    // keep in sync with system/media/audio/include/system/audio-base.h
+    private static final int AUDIO_OUTPUT_FLAG_FAST = 0x4;
+    private static final int AUDIO_OUTPUT_FLAG_DEEP_BUFFER = 0x8;
+
+    // Size of HW_AV_SYNC track AV header.
+    private static final float HEADER_V2_SIZE_BYTES = 20.0f;
+
     //--------------------------------------------------------------------------
     // Member variables
     //--------------------
@@ -233,14 +459,22 @@ public class AudioTrack
      * One of PLAYSTATE_STOPPED, PLAYSTATE_PAUSED, or PLAYSTATE_PLAYING.
      */
     private int mPlayState = PLAYSTATE_STOPPED;
+
+    /**
+     * Indicates that we are expecting an end of stream callback following a call
+     * to setOffloadEndOfStream() in a gapless track transition context. The native track
+     * will be restarted automatically.
+     */
+    private boolean mOffloadEosPending = false;
+
     /**
      * Lock to ensure mPlayState updates reflect the actual state of the object.
      */
     private final Object mPlayStateLock = new Object();
     /**
-     * Sizes of the native audio buffer.
+     * Sizes of the audio buffer.
      * These values are set during construction and can be stale.
-     * To obtain the current native audio buffer frame count use {@link #getBufferSizeInFrames()}.
+     * To obtain the current audio buffer frame count use {@link #getBufferSizeInFrames()}.
      */
     private int mNativeBufferSizeInBytes = 0;
     private int mNativeBufferSizeInFrames = 0;
@@ -254,6 +488,7 @@ public class AudioTrack
     private final Looper mInitializationLooper;
     /**
      * The audio data source sampling rate in Hz.
+     * Never {@link AudioFormat#SAMPLE_RATE_UNSPECIFIED}.
      */
     private int mSampleRate; // initialized by all constructors via audioParamCheck()
     /**
@@ -272,9 +507,9 @@ public class AudioTrack
      *   {@link AudioManager#STREAM_ALARM}, {@link AudioManager#STREAM_NOTIFICATION}, and
      *   {@link AudioManager#STREAM_DTMF}.
      */
+    @UnsupportedAppUsage
     private int mStreamType = AudioManager.STREAM_MUSIC;
 
-    private final AudioAttributes mAttributes;
     /**
      * The way audio is consumed by the audio sink, one of MODE_STATIC or MODE_STREAM.
      */
@@ -297,13 +532,13 @@ public class AudioTrack
      */
     private int mAudioFormat;   // initialized by all constructors via audioParamCheck()
     /**
+     * The AudioAttributes used in configuration.
+     */
+    private AudioAttributes mConfiguredAudioAttributes;
+    /**
      * Audio session ID
      */
-    private int mSessionId = AudioSystem.AUDIO_SESSION_ALLOCATE;
-    /**
-     * Reference to the app-ops service.
-     */
-    private final IAppOpsService mAppOps;
+    private int mSessionId = AudioManager.AUDIO_SESSION_ID_GENERATE;
     /**
      * HW_AV_SYNC track AV Sync Header
      */
@@ -312,20 +547,39 @@ public class AudioTrack
      * HW_AV_SYNC track audio data bytes remaining to write after current AV sync header
      */
     private int mAvSyncBytesRemaining = 0;
+    /**
+     * Offset of the first sample of the audio in byte from start of HW_AV_SYNC track AV header.
+     */
+    private int mOffset = 0;
+    /**
+     * Indicates whether the track is intended to play in offload mode.
+     */
+    private boolean mOffloaded = false;
+    /**
+     * When offloaded track: delay for decoder in frames
+     */
+    private int mOffloadDelayFrames = 0;
+    /**
+     * When offloaded track: padding for decoder in frames
+     */
+    private int mOffloadPaddingFrames = 0;
 
     //--------------------------------
     // Used exclusively by native code
     //--------------------
     /**
+     * @hide
      * Accessed by native methods: provides access to C++ AudioTrack object.
      */
     @SuppressWarnings("unused")
-    private long mNativeTrackInJavaObj;
+    @UnsupportedAppUsage
+    protected long mNativeTrackInJavaObj;
     /**
      * Accessed by native methods: provides access to the JNI data (i.e. resources used by
      * the native AudioTrack object, but not stored in it).
      */
     @SuppressWarnings("unused")
+    @UnsupportedAppUsage
     private long mJniData;
 
 
@@ -339,6 +593,9 @@ public class AudioTrack
      *   {@link AudioManager#STREAM_RING}, {@link AudioManager#STREAM_MUSIC},
      *   {@link AudioManager#STREAM_ALARM}, and {@link AudioManager#STREAM_NOTIFICATION}.
      * @param sampleRateInHz the initial source sample rate expressed in Hz.
+     *   {@link AudioFormat#SAMPLE_RATE_UNSPECIFIED} means to use a route-dependent value
+     *   which is usually the sample rate of the sink.
+     *   {@link #getSampleRate()} can be used to retrieve the actual sample rate chosen.
      * @param channelConfig describes the configuration of the audio channels.
      *   See {@link AudioFormat#CHANNEL_OUT_MONO} and
      *   {@link AudioFormat#CHANNEL_OUT_STEREO}
@@ -347,28 +604,33 @@ public class AudioTrack
      *   {@link AudioFormat#ENCODING_PCM_8BIT},
      *   and {@link AudioFormat#ENCODING_PCM_FLOAT}.
      * @param bufferSizeInBytes the total size (in bytes) of the internal buffer where audio data is
-     *   read from for playback. This should be a multiple of the frame size in bytes.
+     *   read from for playback. This should be a nonzero multiple of the frame size in bytes.
      *   <p> If the track's creation mode is {@link #MODE_STATIC},
      *   this is the maximum length sample, or audio clip, that can be played by this instance.
      *   <p> If the track's creation mode is {@link #MODE_STREAM},
      *   this should be the desired buffer size
      *   for the <code>AudioTrack</code> to satisfy the application's
-     *   natural latency requirements.
+     *   latency requirements.
      *   If <code>bufferSizeInBytes</code> is less than the
-     *   minimum buffer size for the output sink, it is automatically increased to the minimum
+     *   minimum buffer size for the output sink, it is increased to the minimum
      *   buffer size.
      *   The method {@link #getBufferSizeInFrames()} returns the
-     *   actual size in frames of the native buffer created, which
-     *   determines the frequency to write
+     *   actual size in frames of the buffer created, which
+     *   determines the minimum frequency to write
      *   to the streaming <code>AudioTrack</code> to avoid underrun.
+     *   See {@link #getMinBufferSize(int, int, int)} to determine the estimated minimum buffer size
+     *   for an AudioTrack instance in streaming mode.
      * @param mode streaming or static buffer. See {@link #MODE_STATIC} and {@link #MODE_STREAM}
      * @throws java.lang.IllegalArgumentException
+     * @deprecated use {@link Builder} or
+     *   {@link #AudioTrack(AudioAttributes, AudioFormat, int, int, int)} to specify the
+     *   {@link AudioAttributes} instead of the stream type which is only for volume control.
      */
     public AudioTrack(int streamType, int sampleRateInHz, int channelConfig, int audioFormat,
             int bufferSizeInBytes, int mode)
     throws IllegalArgumentException {
         this(streamType, sampleRateInHz, channelConfig, audioFormat,
-                bufferSizeInBytes, mode, AudioSystem.AUDIO_SESSION_ALLOCATE);
+                bufferSizeInBytes, mode, AudioManager.AUDIO_SESSION_ID_GENERATE);
     }
 
     /**
@@ -388,6 +650,8 @@ public class AudioTrack
      *   {@link AudioManager#STREAM_RING}, {@link AudioManager#STREAM_MUSIC},
      *   {@link AudioManager#STREAM_ALARM}, and {@link AudioManager#STREAM_NOTIFICATION}.
      * @param sampleRateInHz the initial source sample rate expressed in Hz.
+     *   {@link AudioFormat#SAMPLE_RATE_UNSPECIFIED} means to use a route-dependent value
+     *   which is usually the sample rate of the sink.
      * @param channelConfig describes the configuration of the audio channels.
      *   See {@link AudioFormat#CHANNEL_OUT_MONO} and
      *   {@link AudioFormat#CHANNEL_OUT_STEREO}
@@ -395,16 +659,30 @@ public class AudioTrack
      *   See {@link AudioFormat#ENCODING_PCM_16BIT} and
      *   {@link AudioFormat#ENCODING_PCM_8BIT},
      *   and {@link AudioFormat#ENCODING_PCM_FLOAT}.
-     * @param bufferSizeInBytes the total size (in bytes) of the buffer where audio data is read
-     *   from for playback. If using the AudioTrack in streaming mode, you can write data into
-     *   this buffer in smaller chunks than this size. If using the AudioTrack in static mode,
-     *   this is the maximum size of the sound that will be played for this instance.
-     *   See {@link #getMinBufferSize(int, int, int)} to determine the minimum required buffer size
-     *   for the successful creation of an AudioTrack instance in streaming mode. Using values
-     *   smaller than getMinBufferSize() will result in an initialization failure.
+     * @param bufferSizeInBytes the total size (in bytes) of the internal buffer where audio data is
+     *   read from for playback. This should be a nonzero multiple of the frame size in bytes.
+     *   <p> If the track's creation mode is {@link #MODE_STATIC},
+     *   this is the maximum length sample, or audio clip, that can be played by this instance.
+     *   <p> If the track's creation mode is {@link #MODE_STREAM},
+     *   this should be the desired buffer size
+     *   for the <code>AudioTrack</code> to satisfy the application's
+     *   latency requirements.
+     *   If <code>bufferSizeInBytes</code> is less than the
+     *   minimum buffer size for the output sink, it is increased to the minimum
+     *   buffer size.
+     *   The method {@link #getBufferSizeInFrames()} returns the
+     *   actual size in frames of the buffer created, which
+     *   determines the minimum frequency to write
+     *   to the streaming <code>AudioTrack</code> to avoid underrun.
+     *   You can write data into this buffer in smaller chunks than this size.
+     *   See {@link #getMinBufferSize(int, int, int)} to determine the estimated minimum buffer size
+     *   for an AudioTrack instance in streaming mode.
      * @param mode streaming or static buffer. See {@link #MODE_STATIC} and {@link #MODE_STREAM}
      * @param sessionId Id of audio session the AudioTrack must be attached to
      * @throws java.lang.IllegalArgumentException
+     * @deprecated use {@link Builder} or
+     *   {@link #AudioTrack(AudioAttributes, AudioFormat, int, int, int)} to specify the
+     *   {@link AudioAttributes} instead of the stream type which is only for volume control.
      */
     public AudioTrack(int streamType, int sampleRateInHz, int channelConfig, int audioFormat,
             int bufferSizeInBytes, int mode, int sessionId)
@@ -420,6 +698,7 @@ public class AudioTrack
                     .build(),
                 bufferSizeInBytes,
                 mode, sessionId);
+        deprecateStreamTypeForPlayback(streamType, "AudioTrack", "AudioTrack()");
     }
 
     /**
@@ -428,13 +707,23 @@ public class AudioTrack
      * @param format a non-null {@link AudioFormat} instance describing the format of the data
      *     that will be played through this AudioTrack. See {@link AudioFormat.Builder} for
      *     configuring the audio format parameters such as encoding, channel mask and sample rate.
-     * @param bufferSizeInBytes the total size (in bytes) of the buffer where audio data is read
-     *   from for playback. If using the AudioTrack in streaming mode, you can write data into
-     *   this buffer in smaller chunks than this size. If using the AudioTrack in static mode,
-     *   this is the maximum size of the sound that will be played for this instance.
-     *   See {@link #getMinBufferSize(int, int, int)} to determine the minimum required buffer size
-     *   for the successful creation of an AudioTrack instance in streaming mode. Using values
-     *   smaller than getMinBufferSize() will result in an initialization failure.
+     * @param bufferSizeInBytes the total size (in bytes) of the internal buffer where audio data is
+     *   read from for playback. This should be a nonzero multiple of the frame size in bytes.
+     *   <p> If the track's creation mode is {@link #MODE_STATIC},
+     *   this is the maximum length sample, or audio clip, that can be played by this instance.
+     *   <p> If the track's creation mode is {@link #MODE_STREAM},
+     *   this should be the desired buffer size
+     *   for the <code>AudioTrack</code> to satisfy the application's
+     *   latency requirements.
+     *   If <code>bufferSizeInBytes</code> is less than the
+     *   minimum buffer size for the output sink, it is increased to the minimum
+     *   buffer size.
+     *   The method {@link #getBufferSizeInFrames()} returns the
+     *   actual size in frames of the buffer created, which
+     *   determines the minimum frequency to write
+     *   to the streaming <code>AudioTrack</code> to avoid underrun.
+     *   See {@link #getMinBufferSize(int, int, int)} to determine the estimated minimum buffer size
+     *   for an AudioTrack instance in streaming mode.
      * @param mode streaming or static buffer. See {@link #MODE_STATIC} and {@link #MODE_STREAM}.
      * @param sessionId ID of audio session the AudioTrack must be attached to, or
      *   {@link AudioManager#AUDIO_SESSION_ID_GENERATE} if the session isn't known at construction
@@ -445,13 +734,30 @@ public class AudioTrack
     public AudioTrack(AudioAttributes attributes, AudioFormat format, int bufferSizeInBytes,
             int mode, int sessionId)
                     throws IllegalArgumentException {
+        this(attributes, format, bufferSizeInBytes, mode, sessionId, false /*offload*/,
+                ENCAPSULATION_MODE_NONE, null /* tunerConfiguration */);
+    }
+
+    private AudioTrack(AudioAttributes attributes, AudioFormat format, int bufferSizeInBytes,
+            int mode, int sessionId, boolean offload, int encapsulationMode,
+            @Nullable TunerConfiguration tunerConfiguration)
+                    throws IllegalArgumentException {
+        super(attributes, AudioPlaybackConfiguration.PLAYER_TYPE_JAM_AUDIOTRACK);
         // mState already == STATE_UNINITIALIZED
 
-        if (attributes == null) {
-            throw new IllegalArgumentException("Illegal null AudioAttributes");
-        }
+        mConfiguredAudioAttributes = attributes; // object copy not needed, immutable.
+
         if (format == null) {
             throw new IllegalArgumentException("Illegal null AudioFormat");
+        }
+
+        // Check if we should enable deep buffer mode
+        if (shouldEnablePowerSaving(mAttributes, format, bufferSizeInBytes, mode)) {
+            mAttributes = new AudioAttributes.Builder(mAttributes)
+                .replaceFlags((mAttributes.getAllFlags()
+                        | AudioAttributes.FLAG_DEEP_BUFFER)
+                        & ~AudioAttributes.FLAG_LOW_LATENCY)
+                .build();
         }
 
         // remember which looper is associated with the AudioTrack instantiation
@@ -460,16 +766,11 @@ public class AudioTrack
             looper = Looper.getMainLooper();
         }
 
-        int rate = 0;
-        if ((format.getPropertySetMask() & AudioFormat.AUDIO_FORMAT_HAS_PROPERTY_SAMPLE_RATE) != 0)
-        {
-            rate = format.getSampleRate();
-        } else {
-            rate = AudioSystem.getPrimaryOutputSamplingRate();
-            if (rate <= 0) {
-                rate = 44100;
-            }
+        int rate = format.getSampleRate();
+        if (rate == AudioFormat.SAMPLE_RATE_UNSPECIFIED) {
+            rate = 0;
         }
+
         int channelIndexMask = 0;
         if ((format.getPropertySetMask()
                 & AudioFormat.AUDIO_FORMAT_HAS_PROPERTY_CHANNEL_INDEX_MASK) != 0) {
@@ -488,37 +789,176 @@ public class AudioTrack
             encoding = format.getEncoding();
         }
         audioParamCheck(rate, channelMask, channelIndexMask, encoding, mode);
+        mOffloaded = offload;
         mStreamType = AudioSystem.STREAM_DEFAULT;
 
         audioBuffSizeCheck(bufferSizeInBytes);
 
         mInitializationLooper = looper;
-        IBinder b = ServiceManager.getService(Context.APP_OPS_SERVICE);
-        mAppOps = IAppOpsService.Stub.asInterface(b);
-
-        mAttributes = new AudioAttributes.Builder(attributes).build();
 
         if (sessionId < 0) {
             throw new IllegalArgumentException("Invalid audio session ID: "+sessionId);
         }
 
+        int[] sampleRate = new int[] {mSampleRate};
         int[] session = new int[1];
         session[0] = sessionId;
         // native initialization
         int initResult = native_setup(new WeakReference<AudioTrack>(this), mAttributes,
-                mSampleRate, mChannelMask, mChannelIndexMask, mAudioFormat,
-                mNativeBufferSizeInBytes, mDataLoadMode, session);
+                sampleRate, mChannelMask, mChannelIndexMask, mAudioFormat,
+                mNativeBufferSizeInBytes, mDataLoadMode, session, 0 /*nativeTrackInJavaObj*/,
+                offload, encapsulationMode, tunerConfiguration);
         if (initResult != SUCCESS) {
             loge("Error code "+initResult+" when initializing AudioTrack.");
             return; // with mState == STATE_UNINITIALIZED
         }
 
+        mSampleRate = sampleRate[0];
         mSessionId = session[0];
+
+        // TODO: consider caching encapsulationMode and tunerConfiguration in the Java object.
+
+        if ((mAttributes.getFlags() & AudioAttributes.FLAG_HW_AV_SYNC) != 0) {
+            int frameSizeInBytes;
+            if (AudioFormat.isEncodingLinearFrames(mAudioFormat)) {
+                frameSizeInBytes = mChannelCount * AudioFormat.getBytesPerSample(mAudioFormat);
+            } else {
+                frameSizeInBytes = 1;
+            }
+            mOffset = ((int) Math.ceil(HEADER_V2_SIZE_BYTES / frameSizeInBytes)) * frameSizeInBytes;
+        }
 
         if (mDataLoadMode == MODE_STATIC) {
             mState = STATE_NO_STATIC_DATA;
         } else {
             mState = STATE_INITIALIZED;
+        }
+
+        baseRegisterPlayer();
+    }
+
+    /**
+     * A constructor which explicitly connects a Native (C++) AudioTrack. For use by
+     * the AudioTrackRoutingProxy subclass.
+     * @param nativeTrackInJavaObj a C/C++ pointer to a native AudioTrack
+     * (associated with an OpenSL ES player).
+     * IMPORTANT: For "N", this method is ONLY called to setup a Java routing proxy,
+     * i.e. IAndroidConfiguration::AcquireJavaProxy(). If we call with a 0 in nativeTrackInJavaObj
+     * it means that the OpenSL player interface hasn't been realized, so there is no native
+     * Audiotrack to connect to. In this case wait to call deferred_connect() until the
+     * OpenSLES interface is realized.
+     */
+    /*package*/ AudioTrack(long nativeTrackInJavaObj) {
+        super(new AudioAttributes.Builder().build(),
+                AudioPlaybackConfiguration.PLAYER_TYPE_JAM_AUDIOTRACK);
+        // "final"s
+        mNativeTrackInJavaObj = 0;
+        mJniData = 0;
+
+        // remember which looper is associated with the AudioTrack instantiation
+        Looper looper;
+        if ((looper = Looper.myLooper()) == null) {
+            looper = Looper.getMainLooper();
+        }
+        mInitializationLooper = looper;
+
+        // other initialization...
+        if (nativeTrackInJavaObj != 0) {
+            baseRegisterPlayer();
+            deferred_connect(nativeTrackInJavaObj);
+        } else {
+            mState = STATE_UNINITIALIZED;
+        }
+    }
+
+    /**
+     * @hide
+     */
+    @UnsupportedAppUsage
+    /* package */ void deferred_connect(long nativeTrackInJavaObj) {
+        if (mState != STATE_INITIALIZED) {
+            // Note that for this native_setup, we are providing an already created/initialized
+            // *Native* AudioTrack, so the attributes parameters to native_setup() are ignored.
+            int[] session = { 0 };
+            int[] rates = { 0 };
+            int initResult = native_setup(new WeakReference<AudioTrack>(this),
+                    null /*mAttributes - NA*/,
+                    rates /*sampleRate - NA*/,
+                    0 /*mChannelMask - NA*/,
+                    0 /*mChannelIndexMask - NA*/,
+                    0 /*mAudioFormat - NA*/,
+                    0 /*mNativeBufferSizeInBytes - NA*/,
+                    0 /*mDataLoadMode - NA*/,
+                    session,
+                    nativeTrackInJavaObj,
+                    false /*offload*/,
+                    ENCAPSULATION_MODE_NONE,
+                    null /* tunerConfiguration */);
+            if (initResult != SUCCESS) {
+                loge("Error code "+initResult+" when initializing AudioTrack.");
+                return; // with mState == STATE_UNINITIALIZED
+            }
+
+            mSessionId = session[0];
+
+            mState = STATE_INITIALIZED;
+        }
+    }
+
+    /**
+     * TunerConfiguration is used to convey tuner information
+     * from the android.media.tv.Tuner API to AudioTrack construction.
+     *
+     * Use the Builder to construct the TunerConfiguration object,
+     * which is then used by the {@link AudioTrack.Builder} to create an AudioTrack.
+     * @hide
+     */
+    @SystemApi
+    public static class TunerConfiguration {
+        private final int mContentId;
+        private final int mSyncId;
+
+        /**
+         * Constructs a TunerConfiguration instance for use in {@link AudioTrack.Builder}
+         *
+         * @param contentId selects the audio stream to use.
+         *     The contentId may be obtained from
+         *     {@link android.media.tv.tuner.filter.Filter#getId()}.
+         *     This is always a positive number.
+         * @param syncId selects the clock to use for synchronization
+         *     of audio with other streams such as video.
+         *     The syncId may be obtained from
+         *     {@link android.media.tv.tuner.Tuner#getAvSyncHwId()}.
+         *     This is always a positive number.
+         */
+        @RequiresPermission(android.Manifest.permission.MODIFY_AUDIO_ROUTING)
+        public TunerConfiguration(
+                @IntRange(from = 1) int contentId, @IntRange(from = 1)int syncId) {
+            if (contentId < 1) {
+                throw new IllegalArgumentException(
+                        "contentId " + contentId + " must be positive");
+            }
+            if (syncId < 1) {
+                throw new IllegalArgumentException("syncId " + syncId + " must be positive");
+            }
+            mContentId = contentId;
+            mSyncId = syncId;
+        }
+
+        /**
+         * Returns the contentId.
+         */
+        @RequiresPermission(android.Manifest.permission.MODIFY_AUDIO_ROUTING)
+        public @IntRange(from = 1) int getContentId() {
+            return mContentId; // The Builder ensures this is > 0.
+        }
+
+        /**
+         * Returns the syncId.
+         */
+        @RequiresPermission(android.Manifest.permission.MODIFY_AUDIO_ROUTING)
+        public @IntRange(from = 1) int getSyncId() {
+            return mSyncId;  // The Builder ensures this is > 0.
         }
     }
 
@@ -534,37 +974,42 @@ public class AudioTrack
      * AudioTrack player = new AudioTrack.Builder()
      *         .setAudioAttributes(new AudioAttributes.Builder()
      *                  .setUsage(AudioAttributes.USAGE_ALARM)
-     *                  .setContentType(CONTENT_TYPE_MUSIC)
+     *                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
      *                  .build())
      *         .setAudioFormat(new AudioFormat.Builder()
      *                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-     *                 .setSampleRate(441000)
+     *                 .setSampleRate(44100)
      *                 .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
      *                 .build())
-     *         .setBufferSize(minBuffSize)
+     *         .setBufferSizeInBytes(minBuffSize)
      *         .build();
      * </pre>
      * <p>
      * If the audio attributes are not set with {@link #setAudioAttributes(AudioAttributes)},
      * attributes comprising {@link AudioAttributes#USAGE_MEDIA} will be used.
-     * <br>If the audio format is not specified or is incomplete, its sample rate will be the
-     * default output sample rate of the device (see
-     * {@link AudioManager#PROPERTY_OUTPUT_SAMPLE_RATE}), its channel configuration will be
+     * <br>If the audio format is not specified or is incomplete, its channel configuration will be
      * {@link AudioFormat#CHANNEL_OUT_STEREO} and the encoding will be
      * {@link AudioFormat#ENCODING_PCM_16BIT}.
+     * The sample rate will depend on the device actually selected for playback and can be queried
+     * with {@link #getSampleRate()} method.
      * <br>If the buffer size is not specified with {@link #setBufferSizeInBytes(int)},
      * and the mode is {@link AudioTrack#MODE_STREAM}, the minimum buffer size is used.
      * <br>If the transfer mode is not specified with {@link #setTransferMode(int)},
      * <code>MODE_STREAM</code> will be used.
      * <br>If the session ID is not specified with {@link #setSessionId(int)}, a new one will
      * be generated.
+     * <br>Offload is false by default.
      */
     public static class Builder {
         private AudioAttributes mAttributes;
         private AudioFormat mFormat;
         private int mBufferSizeInBytes;
+        private int mEncapsulationMode = ENCAPSULATION_MODE_NONE;
         private int mSessionId = AudioManager.AUDIO_SESSION_ID_GENERATE;
         private int mMode = MODE_STREAM;
+        private int mPerformanceMode = PERFORMANCE_MODE_NONE;
+        private boolean mOffload = false;
+        private TunerConfiguration mTunerConfiguration;
 
         /**
          * Constructs a new Builder with the default values as described above.
@@ -612,9 +1057,8 @@ public class AudioTrack
          * If using the {@link AudioTrack} in streaming mode
          * (see {@link AudioTrack#MODE_STREAM}, you can write data into this buffer in smaller
          * chunks than this size. See {@link #getMinBufferSize(int, int, int)} to determine
-         * the minimum required buffer size for the successful creation of an AudioTrack instance
-         * in streaming mode. Using values smaller than <code>getMinBufferSize()</code> will result
-         * in an exception when trying to build the <code>AudioTrack</code>.
+         * the estimated minimum buffer size for the creation of an AudioTrack instance
+         * in streaming mode.
          * <br>If using the <code>AudioTrack</code> in static mode (see
          * {@link AudioTrack#MODE_STATIC}), this is the maximum size of the sound that will be
          * played by this instance.
@@ -622,12 +1066,39 @@ public class AudioTrack
          * @return the same Builder instance.
          * @throws IllegalArgumentException
          */
-        public @NonNull Builder setBufferSizeInBytes(int bufferSizeInBytes)
+        public @NonNull Builder setBufferSizeInBytes(@IntRange(from = 0) int bufferSizeInBytes)
                 throws IllegalArgumentException {
             if (bufferSizeInBytes <= 0) {
                 throw new IllegalArgumentException("Invalid buffer size " + bufferSizeInBytes);
             }
             mBufferSizeInBytes = bufferSizeInBytes;
+            return this;
+        }
+
+        /**
+         * Sets the encapsulation mode.
+         *
+         * Encapsulation mode allows metadata to be sent together with
+         * the audio data payload in a {@code ByteBuffer}.
+         * This requires a compatible hardware audio codec.
+         *
+         * @param encapsulationMode one of {@link AudioTrack#ENCAPSULATION_MODE_NONE},
+         *        or {@link AudioTrack#ENCAPSULATION_MODE_ELEMENTARY_STREAM}.
+         * @return the same Builder instance.
+         */
+        // Note: with the correct permission {@code AudioTrack#ENCAPSULATION_MODE_HANDLE}
+        // may be used as well.
+        public @NonNull Builder setEncapsulationMode(@EncapsulationMode int encapsulationMode) {
+            switch (encapsulationMode) {
+                case ENCAPSULATION_MODE_NONE:
+                case ENCAPSULATION_MODE_ELEMENTARY_STREAM:
+                case ENCAPSULATION_MODE_HANDLE:
+                    mEncapsulationMode = encapsulationMode;
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "Invalid encapsulation mode " + encapsulationMode);
+            }
             return this;
         }
 
@@ -660,12 +1131,76 @@ public class AudioTrack
          * @return the same Builder instance.
          * @throws IllegalArgumentException
          */
-        public @NonNull Builder setSessionId(int sessionId)
+        public @NonNull Builder setSessionId(@IntRange(from = 1) int sessionId)
                 throws IllegalArgumentException {
             if ((sessionId != AudioManager.AUDIO_SESSION_ID_GENERATE) && (sessionId < 1)) {
                 throw new IllegalArgumentException("Invalid audio session ID " + sessionId);
             }
             mSessionId = sessionId;
+            return this;
+        }
+
+        /**
+         * Sets the {@link AudioTrack} performance mode.  This is an advisory request which
+         * may not be supported by the particular device, and the framework is free
+         * to ignore such request if it is incompatible with other requests or hardware.
+         *
+         * @param performanceMode one of
+         * {@link AudioTrack#PERFORMANCE_MODE_NONE},
+         * {@link AudioTrack#PERFORMANCE_MODE_LOW_LATENCY},
+         * or {@link AudioTrack#PERFORMANCE_MODE_POWER_SAVING}.
+         * @return the same Builder instance.
+         * @throws IllegalArgumentException if {@code performanceMode} is not valid.
+         */
+        public @NonNull Builder setPerformanceMode(@PerformanceMode int performanceMode) {
+            switch (performanceMode) {
+                case PERFORMANCE_MODE_NONE:
+                case PERFORMANCE_MODE_LOW_LATENCY:
+                case PERFORMANCE_MODE_POWER_SAVING:
+                    mPerformanceMode = performanceMode;
+                    break;
+                default:
+                    throw new IllegalArgumentException(
+                            "Invalid performance mode " + performanceMode);
+            }
+            return this;
+        }
+
+        /**
+         * Sets whether this track will play through the offloaded audio path.
+         * When set to true, at build time, the audio format will be checked against
+         * {@link AudioManager#isOffloadedPlaybackSupported(AudioFormat,AudioAttributes)}
+         * to verify the audio format used by this track is supported on the device's offload
+         * path (if any).
+         * <br>Offload is only supported for media audio streams, and therefore requires that
+         * the usage be {@link AudioAttributes#USAGE_MEDIA}.
+         * @param offload true to require the offload path for playback.
+         * @return the same Builder instance.
+         */
+        public @NonNull Builder setOffloadedPlayback(boolean offload) {
+            mOffload = offload;
+            return this;
+        }
+
+        /**
+         * Sets the tuner configuration for the {@code AudioTrack}.
+         *
+         * The {@link AudioTrack.TunerConfiguration} consists of parameters obtained from
+         * the Android TV tuner API which indicate the audio content stream id and the
+         * synchronization id for the {@code AudioTrack}.
+         *
+         * @param tunerConfiguration obtained by {@link AudioTrack.TunerConfiguration.Builder}.
+         * @return the same Builder instance.
+         * @hide
+         */
+        @SystemApi
+        @RequiresPermission(android.Manifest.permission.MODIFY_AUDIO_ROUTING)
+        public @NonNull Builder setTunerConfiguration(
+                @NonNull TunerConfiguration tunerConfiguration) {
+            if (tunerConfiguration == null) {
+                throw new IllegalArgumentException("tunerConfiguration is null");
+            }
+            mTunerConfiguration = tunerConfiguration;
             return this;
         }
 
@@ -683,23 +1218,66 @@ public class AudioTrack
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .build();
             }
+            switch (mPerformanceMode) {
+            case PERFORMANCE_MODE_LOW_LATENCY:
+                mAttributes = new AudioAttributes.Builder(mAttributes)
+                    .replaceFlags((mAttributes.getAllFlags()
+                            | AudioAttributes.FLAG_LOW_LATENCY)
+                            & ~AudioAttributes.FLAG_DEEP_BUFFER)
+                    .build();
+                break;
+            case PERFORMANCE_MODE_NONE:
+                if (!shouldEnablePowerSaving(mAttributes, mFormat, mBufferSizeInBytes, mMode)) {
+                    break; // do not enable deep buffer mode.
+                }
+                // permitted to fall through to enable deep buffer
+            case PERFORMANCE_MODE_POWER_SAVING:
+                mAttributes = new AudioAttributes.Builder(mAttributes)
+                .replaceFlags((mAttributes.getAllFlags()
+                        | AudioAttributes.FLAG_DEEP_BUFFER)
+                        & ~AudioAttributes.FLAG_LOW_LATENCY)
+                .build();
+                break;
+            }
+
             if (mFormat == null) {
                 mFormat = new AudioFormat.Builder()
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                        .setSampleRate(AudioSystem.getPrimaryOutputSamplingRate())
+                        //.setSampleRate(AudioFormat.SAMPLE_RATE_UNSPECIFIED)
                         .setEncoding(AudioFormat.ENCODING_DEFAULT)
                         .build();
             }
-            try {
-                // If the buffer size is not specified in streaming mode,
-                // use a single frame for the buffer size and let the
-                // native code figure out the minimum buffer size.
-                if (mMode == MODE_STREAM && mBufferSizeInBytes == 0) {
-                    mBufferSizeInBytes = mFormat.getChannelCount()
-                            * mFormat.getBytesPerSample(mFormat.getEncoding());
+
+            if (mOffload) {
+                if (mPerformanceMode == PERFORMANCE_MODE_LOW_LATENCY) {
+                    throw new UnsupportedOperationException(
+                            "Offload and low latency modes are incompatible");
                 }
+                if (!AudioSystem.isOffloadSupported(mFormat, mAttributes)) {
+                    throw new UnsupportedOperationException(
+                            "Cannot create AudioTrack, offload format / attributes not supported");
+                }
+            }
+
+            // TODO: Check mEncapsulationMode compatibility with MODE_STATIC, etc?
+
+            // If the buffer size is not specified in streaming mode,
+            // use a single frame for the buffer size and let the
+            // native code figure out the minimum buffer size.
+            if (mMode == MODE_STREAM && mBufferSizeInBytes == 0) {
+                int bytesPerSample = 1;
+                try {
+                    bytesPerSample = mFormat.getBytesPerSample(mFormat.getEncoding());
+                } catch (IllegalArgumentException e) {
+                    // do nothing
+                }
+                mBufferSizeInBytes = mFormat.getChannelCount() * bytesPerSample;
+            }
+
+            try {
                 final AudioTrack track = new AudioTrack(
-                        mAttributes, mFormat, mBufferSizeInBytes, mMode, mSessionId);
+                        mAttributes, mFormat, mBufferSizeInBytes, mMode, mSessionId, mOffload,
+                        mEncapsulationMode, mTunerConfiguration);
                 if (track.getState() == STATE_UNINITIALIZED) {
                     // release is not necessary
                     throw new UnsupportedOperationException("Cannot create AudioTrack");
@@ -711,8 +1289,281 @@ public class AudioTrack
         }
     }
 
+    /**
+     * Configures the delay and padding values for the current compressed stream playing
+     * in offload mode.
+     * This can only be used on a track successfully initialized with
+     * {@link AudioTrack.Builder#setOffloadedPlayback(boolean)}. The unit is frames, where a
+     * frame indicates the number of samples per channel, e.g. 100 frames for a stereo compressed
+     * stream corresponds to 200 decoded interleaved PCM samples.
+     * @param delayInFrames number of frames to be ignored at the beginning of the stream. A value
+     *     of 0 indicates no delay is to be applied.
+     * @param paddingInFrames number of frames to be ignored at the end of the stream. A value of 0
+     *     of 0 indicates no padding is to be applied.
+     */
+    public void setOffloadDelayPadding(@IntRange(from = 0) int delayInFrames,
+            @IntRange(from = 0) int paddingInFrames) {
+        if (paddingInFrames < 0) {
+            throw new IllegalArgumentException("Illegal negative padding");
+        }
+        if (delayInFrames < 0) {
+            throw new IllegalArgumentException("Illegal negative delay");
+        }
+        if (!mOffloaded) {
+            throw new IllegalStateException("Illegal use of delay/padding on non-offloaded track");
+        }
+        if (mState == STATE_UNINITIALIZED) {
+            throw new IllegalStateException("Uninitialized track");
+        }
+        mOffloadDelayFrames = delayInFrames;
+        mOffloadPaddingFrames = paddingInFrames;
+        native_set_delay_padding(delayInFrames, paddingInFrames);
+    }
+
+    /**
+     * Return the decoder delay of an offloaded track, expressed in frames, previously set with
+     * {@link #setOffloadDelayPadding(int, int)}, or 0 if it was never modified.
+     * <p>This delay indicates the number of frames to be ignored at the beginning of the stream.
+     * This value can only be queried on a track successfully initialized with
+     * {@link AudioTrack.Builder#setOffloadedPlayback(boolean)}.
+     * @return decoder delay expressed in frames.
+     */
+    public @IntRange(from = 0) int getOffloadDelay() {
+        if (!mOffloaded) {
+            throw new IllegalStateException("Illegal query of delay on non-offloaded track");
+        }
+        if (mState == STATE_UNINITIALIZED) {
+            throw new IllegalStateException("Illegal query of delay on uninitialized track");
+        }
+        return mOffloadDelayFrames;
+    }
+
+    /**
+     * Return the decoder padding of an offloaded track, expressed in frames, previously set with
+     * {@link #setOffloadDelayPadding(int, int)}, or 0 if it was never modified.
+     * <p>This padding indicates the number of frames to be ignored at the end of the stream.
+     * This value can only be queried on a track successfully initialized with
+     * {@link AudioTrack.Builder#setOffloadedPlayback(boolean)}.
+     * @return decoder padding expressed in frames.
+     */
+    public @IntRange(from = 0) int getOffloadPadding() {
+        if (!mOffloaded) {
+            throw new IllegalStateException("Illegal query of padding on non-offloaded track");
+        }
+        if (mState == STATE_UNINITIALIZED) {
+            throw new IllegalStateException("Illegal query of padding on uninitialized track");
+        }
+        return mOffloadPaddingFrames;
+    }
+
+    /**
+     * Declares that the last write() operation on this track provided the last buffer of this
+     * stream.
+     * After the end of stream, previously set padding and delay values are ignored.
+     * Can only be called only if the AudioTrack is opened in offload mode
+     * {@see Builder#setOffloadedPlayback(boolean)}.
+     * Can only be called only if the AudioTrack is in state {@link #PLAYSTATE_PLAYING}
+     * {@see #getPlayState()}.
+     * Use this method in the same thread as any write() operation.
+     */
+    public void setOffloadEndOfStream() {
+        if (!mOffloaded) {
+            throw new IllegalStateException("EOS not supported on non-offloaded track");
+        }
+        if (mState == STATE_UNINITIALIZED) {
+            throw new IllegalStateException("Uninitialized track");
+        }
+        if (mPlayState != PLAYSTATE_PLAYING) {
+            throw new IllegalStateException("EOS not supported if not playing");
+        }
+        synchronized (mStreamEventCbLock) {
+            if (mStreamEventCbInfoList.size() == 0) {
+                throw new IllegalStateException("EOS not supported without StreamEventCallback");
+            }
+        }
+
+        synchronized (mPlayStateLock) {
+            native_stop();
+            mOffloadEosPending = true;
+            mPlayState = PLAYSTATE_STOPPING;
+        }
+    }
+
+    /**
+     * Returns whether the track was built with {@link Builder#setOffloadedPlayback(boolean)} set
+     * to {@code true}.
+     * @return true if the track is using offloaded playback.
+     */
+    public boolean isOffloadedPlayback() {
+        return mOffloaded;
+    }
+
+    /**
+     * Returns whether direct playback of an audio format with the provided attributes is
+     * currently supported on the system.
+     * <p>Direct playback means that the audio stream is not resampled or downmixed
+     * by the framework. Checking for direct support can help the app select the representation
+     * of audio content that most closely matches the capabilities of the device and peripherials
+     * (e.g. A/V receiver) connected to it. Note that the provided stream can still be re-encoded
+     * or mixed with other streams, if needed.
+     * <p>Also note that this query only provides information about the support of an audio format.
+     * It does not indicate whether the resources necessary for the playback are available
+     * at that instant.
+     * @param format a non-null {@link AudioFormat} instance describing the format of
+     *   the audio data.
+     * @param attributes a non-null {@link AudioAttributes} instance.
+     * @return true if the given audio format can be played directly.
+     */
+    public static boolean isDirectPlaybackSupported(@NonNull AudioFormat format,
+            @NonNull AudioAttributes attributes) {
+        if (format == null) {
+            throw new IllegalArgumentException("Illegal null AudioFormat argument");
+        }
+        if (attributes == null) {
+            throw new IllegalArgumentException("Illegal null AudioAttributes argument");
+        }
+        return native_is_direct_output_supported(format.getEncoding(), format.getSampleRate(),
+                format.getChannelMask(), format.getChannelIndexMask(),
+                attributes.getContentType(), attributes.getUsage(), attributes.getFlags());
+    }
+
+    /*
+     * The MAX_LEVEL should be exactly representable by an IEEE 754-2008 base32 float.
+     * This means fractions must be divisible by a power of 2. For example,
+     * 10.25f is OK as 0.25 is 1/4, but 10.1f is NOT OK as 1/10 is not expressable by
+     * a finite binary fraction.
+     *
+     * 48.f is the nominal max for API level {@link android os.Build.VERSION_CODES#R}.
+     * We use this to suggest a baseline range for implementation.
+     *
+     * The API contract specification allows increasing this value in a future
+     * API release, but not decreasing this value.
+     */
+    private static final float MAX_AUDIO_DESCRIPTION_MIX_LEVEL = 48.f;
+
+    private static boolean isValidAudioDescriptionMixLevel(float level) {
+        return !(Float.isNaN(level) || level > MAX_AUDIO_DESCRIPTION_MIX_LEVEL);
+    }
+
+    /**
+     * Sets the Audio Description mix level in dB.
+     *
+     * For AudioTracks incorporating a secondary Audio Description stream
+     * (where such contents may be sent through an Encapsulation Mode
+     * other than {@link #ENCAPSULATION_MODE_NONE}).
+     * or internally by a HW channel),
+     * the level of mixing of the Audio Description to the Main Audio stream
+     * is controlled by this method.
+     *
+     * Such mixing occurs <strong>prior</strong> to overall volume scaling.
+     *
+     * @param level a floating point value between
+     *     {@code Float.NEGATIVE_INFINITY} to {@code +48.f},
+     *     where {@code Float.NEGATIVE_INFINITY} means the Audio Description is not mixed
+     *     and a level of {@code 0.f} means the Audio Description is mixed without scaling.
+     * @return true on success, false on failure.
+     */
+    public boolean setAudioDescriptionMixLeveldB(
+            @FloatRange(to = 48.f, toInclusive = true) float level) {
+        if (!isValidAudioDescriptionMixLevel(level)) {
+            throw new IllegalArgumentException("level is out of range" + level);
+        }
+        return native_set_audio_description_mix_level_db(level) == SUCCESS;
+    }
+
+    /**
+     * Returns the Audio Description mix level in dB.
+     *
+     * If Audio Description mixing is unavailable from the hardware device,
+     * a value of {@code Float.NEGATIVE_INFINITY} is returned.
+     *
+     * @return the current Audio Description Mix Level in dB.
+     *     A value of {@code Float.NEGATIVE_INFINITY} means
+     *     that the audio description is not mixed or
+     *     the hardware is not available.
+     *     This should reflect the <strong>true</strong> internal device mix level;
+     *     hence the application might receive any floating value
+     *     except {@code Float.NaN}.
+     */
+    public float getAudioDescriptionMixLeveldB() {
+        float[] level = { Float.NEGATIVE_INFINITY };
+        try {
+            final int status = native_get_audio_description_mix_level_db(level);
+            if (status != SUCCESS || Float.isNaN(level[0])) {
+                return Float.NEGATIVE_INFINITY;
+            }
+        } catch (Exception e) {
+            return Float.NEGATIVE_INFINITY;
+        }
+        return level[0];
+    }
+
+    private static boolean isValidDualMonoMode(@DualMonoMode int dualMonoMode) {
+        switch (dualMonoMode) {
+            case DUAL_MONO_MODE_OFF:
+            case DUAL_MONO_MODE_LR:
+            case DUAL_MONO_MODE_LL:
+            case DUAL_MONO_MODE_RR:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Sets the Dual Mono mode presentation on the output device.
+     *
+     * The Dual Mono mode is generally applied to stereo audio streams
+     * where the left and right channels come from separate sources.
+     *
+     * For compressed audio, where the decoding is done in hardware,
+     * Dual Mono presentation needs to be performed
+     * by the hardware output device
+     * as the PCM audio is not available to the framework.
+     *
+     * @param dualMonoMode one of {@link #DUAL_MONO_MODE_OFF},
+     *     {@link #DUAL_MONO_MODE_LR},
+     *     {@link #DUAL_MONO_MODE_LL},
+     *     {@link #DUAL_MONO_MODE_RR}.
+     *
+     * @return true on success, false on failure if the output device
+     *     does not support Dual Mono mode.
+     */
+    public boolean setDualMonoMode(@DualMonoMode int dualMonoMode) {
+        if (!isValidDualMonoMode(dualMonoMode)) {
+            throw new IllegalArgumentException(
+                    "Invalid Dual Mono mode " + dualMonoMode);
+        }
+        return native_set_dual_mono_mode(dualMonoMode) == SUCCESS;
+    }
+
+    /**
+     * Returns the Dual Mono mode presentation setting.
+     *
+     * If no Dual Mono presentation is available for the output device,
+     * then {@link #DUAL_MONO_MODE_OFF} is returned.
+     *
+     * @return one of {@link #DUAL_MONO_MODE_OFF},
+     *     {@link #DUAL_MONO_MODE_LR},
+     *     {@link #DUAL_MONO_MODE_LL},
+     *     {@link #DUAL_MONO_MODE_RR}.
+     */
+    public @DualMonoMode int getDualMonoMode() {
+        int[] dualMonoMode = { DUAL_MONO_MODE_OFF };
+        try {
+            final int status = native_get_dual_mono_mode(dualMonoMode);
+            if (status != SUCCESS || !isValidDualMonoMode(dualMonoMode[0])) {
+                return DUAL_MONO_MODE_OFF;
+            }
+        } catch (Exception e) {
+            return DUAL_MONO_MODE_OFF;
+        }
+        return dualMonoMode[0];
+    }
+
     // mask of all the positional channels supported, however the allowed combinations
-    // are further restricted by the matching left/right rule and CHANNEL_COUNT_MAX
+    // are further restricted by the matching left/right rule and
+    // AudioSystem.OUT_CHANNEL_COUNT_MAX
     private static final int SUPPORTED_OUT_CHANNELS =
             AudioFormat.CHANNEL_OUT_FRONT_LEFT |
             AudioFormat.CHANNEL_OUT_FRONT_RIGHT |
@@ -723,6 +1574,63 @@ public class AudioTrack
             AudioFormat.CHANNEL_OUT_BACK_CENTER |
             AudioFormat.CHANNEL_OUT_SIDE_LEFT |
             AudioFormat.CHANNEL_OUT_SIDE_RIGHT;
+
+    // Returns a boolean whether the attributes, format, bufferSizeInBytes, mode allow
+    // power saving to be automatically enabled for an AudioTrack. Returns false if
+    // power saving is already enabled in the attributes parameter.
+    private static boolean shouldEnablePowerSaving(
+            @Nullable AudioAttributes attributes, @Nullable AudioFormat format,
+            int bufferSizeInBytes, int mode) {
+        // If no attributes, OK
+        // otherwise check attributes for USAGE_MEDIA and CONTENT_UNKNOWN, MUSIC, or MOVIE.
+        // Only consider flags that are not compatible with FLAG_DEEP_BUFFER. We include
+        // FLAG_DEEP_BUFFER because if set the request is explicit and
+        // shouldEnablePowerSaving() should return false.
+        final int flags = attributes.getAllFlags()
+                & (AudioAttributes.FLAG_DEEP_BUFFER | AudioAttributes.FLAG_LOW_LATENCY
+                    | AudioAttributes.FLAG_HW_AV_SYNC | AudioAttributes.FLAG_BEACON);
+
+        if (attributes != null &&
+                (flags != 0  // cannot have any special flags
+                || attributes.getUsage() != AudioAttributes.USAGE_MEDIA
+                || (attributes.getContentType() != AudioAttributes.CONTENT_TYPE_UNKNOWN
+                    && attributes.getContentType() != AudioAttributes.CONTENT_TYPE_MUSIC
+                    && attributes.getContentType() != AudioAttributes.CONTENT_TYPE_MOVIE))) {
+            return false;
+        }
+
+        // Format must be fully specified and be linear pcm
+        if (format == null
+                || format.getSampleRate() == AudioFormat.SAMPLE_RATE_UNSPECIFIED
+                || !AudioFormat.isEncodingLinearPcm(format.getEncoding())
+                || !AudioFormat.isValidEncoding(format.getEncoding())
+                || format.getChannelCount() < 1) {
+            return false;
+        }
+
+        // Mode must be streaming
+        if (mode != MODE_STREAM) {
+            return false;
+        }
+
+        // A buffer size of 0 is always compatible with deep buffer (when called from the Builder)
+        // but for app compatibility we only use deep buffer power saving for large buffer sizes.
+        if (bufferSizeInBytes != 0) {
+            final long BUFFER_TARGET_MODE_STREAM_MS = 100;
+            final int MILLIS_PER_SECOND = 1000;
+            final long bufferTargetSize =
+                    BUFFER_TARGET_MODE_STREAM_MS
+                    * format.getChannelCount()
+                    * format.getBytesPerSample(format.getEncoding())
+                    * format.getSampleRate()
+                    / MILLIS_PER_SECOND;
+            if (bufferSizeInBytes < bufferTargetSize) {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     // Convenience method for the constructor's parameter checks.
     // This is where constructor IllegalArgumentException-s are thrown
@@ -736,11 +1644,22 @@ public class AudioTrack
                                  int audioFormat, int mode) {
         //--------------
         // sample rate, note these values are subject to change
-        if (sampleRateInHz < SAMPLE_RATE_HZ_MIN || sampleRateInHz > SAMPLE_RATE_HZ_MAX) {
+        if ((sampleRateInHz < AudioFormat.SAMPLE_RATE_HZ_MIN ||
+                sampleRateInHz > AudioFormat.SAMPLE_RATE_HZ_MAX) &&
+                sampleRateInHz != AudioFormat.SAMPLE_RATE_UNSPECIFIED) {
             throw new IllegalArgumentException(sampleRateInHz
                     + "Hz is not a supported sample rate.");
         }
         mSampleRate = sampleRateInHz;
+
+        // IEC61937 is based on stereo. We could coerce it to stereo.
+        // But the application needs to know the stream is stereo so that
+        // it is encoded and played correctly. So better to just reject it.
+        if (audioFormat == AudioFormat.ENCODING_IEC61937
+                && channelConfig != AudioFormat.CHANNEL_OUT_STEREO) {
+            throw new IllegalArgumentException(
+                    "ENCODING_IEC61937 must be configured as CHANNEL_OUT_STEREO");
+        }
 
         //--------------
         // channel config
@@ -774,7 +1693,7 @@ public class AudioTrack
         mChannelIndexMask = channelIndexMask;
         if (mChannelIndexMask != 0) {
             // restrictive: indexMask could allow up to AUDIO_CHANNEL_BITS_LOG2
-            final int indexMask = (1 << CHANNEL_COUNT_MAX) - 1;
+            final int indexMask = (1 << AudioSystem.OUT_CHANNEL_COUNT_MAX) - 1;
             if ((channelIndexMask & ~indexMask) != 0) {
                 throw new IllegalArgumentException("Unsupported channel index configuration "
                         + channelIndexMask);
@@ -819,9 +1738,9 @@ public class AudioTrack
             return false;
         }
         final int channelCount = AudioFormat.channelCountFromOutChannelMask(channelConfig);
-        if (channelCount > CHANNEL_COUNT_MAX) {
+        if (channelCount > AudioSystem.OUT_CHANNEL_COUNT_MAX) {
             loge("Channel configuration contains too many channels " +
-                    channelCount + ">" + CHANNEL_COUNT_MAX);
+                    channelCount + ">" + AudioSystem.OUT_CHANNEL_COUNT_MAX);
             return false;
         }
         // check for unsupported multichannel combinations:
@@ -859,10 +1778,10 @@ public class AudioTrack
     // postcondition:
     //    mNativeBufferSizeInBytes is valid (multiple of frame size, positive)
     private void audioBuffSizeCheck(int audioBufferSize) {
-        // NB: this section is only valid with PCM data.
+        // NB: this section is only valid with PCM or IEC61937 data.
         //     To update when supporting compressed formats
         int frameSizeInBytes;
-        if (AudioFormat.isEncodingLinearPcm(mAudioFormat)) {
+        if (AudioFormat.isEncodingLinearFrames(mAudioFormat)) {
             frameSizeInBytes = mChannelCount * AudioFormat.getBytesPerSample(mAudioFormat);
         } else {
             frameSizeInBytes = 1;
@@ -880,6 +1799,9 @@ public class AudioTrack
      * Releases the native AudioTrack resources.
      */
     public void release() {
+        synchronized (mStreamEventCbLock){
+            endStreamEventHandling();
+        }
         // even though native_release() stops the native AudioTrack, we need to stop
         // AudioTrack subclasses too.
         try {
@@ -887,12 +1809,18 @@ public class AudioTrack
         } catch(IllegalStateException ise) {
             // don't raise an exception, we're releasing the resources.
         }
+        baseRelease();
         native_release();
-        mState = STATE_UNINITIALIZED;
+        synchronized (mPlayStateLock) {
+            mState = STATE_UNINITIALIZED;
+            mPlayState = PLAYSTATE_STOPPED;
+            mPlayStateLock.notify();
+        }
     }
 
     @Override
     protected void finalize() {
+        baseRelease();
         native_finalize();
     }
 
@@ -922,7 +1850,13 @@ public class AudioTrack
     }
 
     /**
-     * Returns the configured audio data sample rate in Hz
+     * Returns the configured audio source sample rate in Hz.
+     * The initial source sample rate depends on the constructor parameters,
+     * but the source sample rate may change if {@link #setPlaybackRate(int)} is called.
+     * If the constructor had a specific sample rate, then the initial sink sample rate is that
+     * value.
+     * If the constructor had {@link AudioFormat#SAMPLE_RATE_UNSPECIFIED},
+     * then the initial sink sample rate is a route-dependent default value based on the source [sic].
      */
     public int getSampleRate() {
         return mSampleRate;
@@ -946,6 +1880,23 @@ public class AudioTrack
     }
 
     /**
+     * Returns the {@link AudioAttributes} used in configuration.
+     * If a {@code streamType} is used instead of an {@code AudioAttributes}
+     * to configure the AudioTrack
+     * (the use of {@code streamType} for configuration is deprecated),
+     * then the {@code AudioAttributes}
+     * equivalent to the {@code streamType} is returned.
+     * @return The {@code AudioAttributes} used to configure the AudioTrack.
+     * @throws IllegalStateException If the track is not initialized.
+     */
+    public @NonNull AudioAttributes getAudioAttributes() {
+        if (mState == STATE_UNINITIALIZED || mConfiguredAudioAttributes == null) {
+            throw new IllegalStateException("track not initialized");
+        }
+        return mConfiguredAudioAttributes;
+    }
+
+    /**
      * Returns the configured audio data encoding. See {@link AudioFormat#ENCODING_PCM_8BIT},
      * {@link AudioFormat#ENCODING_PCM_16BIT}, and {@link AudioFormat#ENCODING_PCM_FLOAT}.
      */
@@ -954,11 +1905,12 @@ public class AudioTrack
     }
 
     /**
-     * Returns the type of audio stream this AudioTrack is configured for.
+     * Returns the volume stream type of this AudioTrack.
      * Compare the result against {@link AudioManager#STREAM_VOICE_CALL},
      * {@link AudioManager#STREAM_SYSTEM}, {@link AudioManager#STREAM_RING},
      * {@link AudioManager#STREAM_MUSIC}, {@link AudioManager#STREAM_ALARM},
-     * {@link AudioManager#STREAM_NOTIFICATION}, or {@link AudioManager#STREAM_DTMF}.
+     * {@link AudioManager#STREAM_NOTIFICATION}, {@link AudioManager#STREAM_DTMF} or
+     * {@link AudioManager#STREAM_ACCESSIBILITY}.
      */
     public int getStreamType() {
         return mStreamType;
@@ -1022,31 +1974,92 @@ public class AudioTrack
      */
     public int getPlayState() {
         synchronized (mPlayStateLock) {
-            return mPlayState;
+            switch (mPlayState) {
+                case PLAYSTATE_STOPPING:
+                    return PLAYSTATE_PLAYING;
+                case PLAYSTATE_PAUSED_STOPPING:
+                    return PLAYSTATE_PAUSED;
+                default:
+                    return mPlayState;
+            }
         }
     }
 
+
     /**
-     *  Returns the frame count of the native <code>AudioTrack</code> buffer.
+     * Returns the effective size of the <code>AudioTrack</code> buffer
+     * that the application writes to.
+     * <p> This will be less than or equal to the result of
+     * {@link #getBufferCapacityInFrames()}.
+     * It will be equal if {@link #setBufferSizeInFrames(int)} has never been called.
+     * <p> If the track is subsequently routed to a different output sink, the buffer
+     * size and capacity may enlarge to accommodate.
+     * <p> If the <code>AudioTrack</code> encoding indicates compressed data,
+     * e.g. {@link AudioFormat#ENCODING_AC3}, then the frame count returned is
+     * the size of the <code>AudioTrack</code> buffer in bytes.
+     * <p> See also {@link AudioManager#getProperty(String)} for key
+     * {@link AudioManager#PROPERTY_OUTPUT_FRAMES_PER_BUFFER}.
+     * @return current size in frames of the <code>AudioTrack</code> buffer.
+     * @throws IllegalStateException if track is not initialized.
+     */
+    public @IntRange (from = 0) int getBufferSizeInFrames() {
+        return native_get_buffer_size_frames();
+    }
+
+    /**
+     * Limits the effective size of the <code>AudioTrack</code> buffer
+     * that the application writes to.
+     * <p> A write to this AudioTrack will not fill the buffer beyond this limit.
+     * If a blocking write is used then the write will block until the data
+     * can fit within this limit.
+     * <p>Changing this limit modifies the latency associated with
+     * the buffer for this track. A smaller size will give lower latency
+     * but there may be more glitches due to buffer underruns.
+     * <p>The actual size used may not be equal to this requested size.
+     * It will be limited to a valid range with a maximum of
+     * {@link #getBufferCapacityInFrames()}.
+     * It may also be adjusted slightly for internal reasons.
+     * If bufferSizeInFrames is less than zero then {@link #ERROR_BAD_VALUE}
+     * will be returned.
+     * <p>This method is only supported for PCM audio.
+     * It is not supported for compressed audio tracks.
+     *
+     * @param bufferSizeInFrames requested buffer size in frames
+     * @return the actual buffer size in frames or an error code,
+     *    {@link #ERROR_BAD_VALUE}, {@link #ERROR_INVALID_OPERATION}
+     * @throws IllegalStateException if track is not initialized.
+     */
+    public int setBufferSizeInFrames(@IntRange (from = 0) int bufferSizeInFrames) {
+        if (mDataLoadMode == MODE_STATIC || mState == STATE_UNINITIALIZED) {
+            return ERROR_INVALID_OPERATION;
+        }
+        if (bufferSizeInFrames < 0) {
+            return ERROR_BAD_VALUE;
+        }
+        return native_set_buffer_size_frames(bufferSizeInFrames);
+    }
+
+    /**
+     *  Returns the maximum size of the <code>AudioTrack</code> buffer in frames.
      *  <p> If the track's creation mode is {@link #MODE_STATIC},
      *  it is equal to the specified bufferSizeInBytes on construction, converted to frame units.
-     *  A static track's native frame count will not change.
+     *  A static track's frame count will not change.
      *  <p> If the track's creation mode is {@link #MODE_STREAM},
      *  it is greater than or equal to the specified bufferSizeInBytes converted to frame units.
      *  For streaming tracks, this value may be rounded up to a larger value if needed by
      *  the target output sink, and
-     *  if the track is subsequently routed to a different output sink, the native
+     *  if the track is subsequently routed to a different output sink, the
      *  frame count may enlarge to accommodate.
      *  <p> If the <code>AudioTrack</code> encoding indicates compressed data,
      *  e.g. {@link AudioFormat#ENCODING_AC3}, then the frame count returned is
-     *  the size of the native <code>AudioTrack</code> buffer in bytes.
+     *  the size of the <code>AudioTrack</code> buffer in bytes.
      *  <p> See also {@link AudioManager#getProperty(String)} for key
      *  {@link AudioManager#PROPERTY_OUTPUT_FRAMES_PER_BUFFER}.
-     *  @return current size in frames of the <code>AudioTrack</code> buffer.
-     *  @throws IllegalStateException
+     *  @return maximum size in frames of the <code>AudioTrack</code> buffer.
+     *  @throws IllegalStateException if track is not initialized.
      */
-    public int getBufferSizeInFrames() {
-        return native_get_native_frame_count();
+    public @IntRange (from = 0) int getBufferCapacityInFrames() {
+        return native_get_buffer_capacity_frames();
     }
 
     /**
@@ -1057,7 +2070,7 @@ public class AudioTrack
      */
     @Deprecated
     protected int getNativeFrameCount() {
-        return native_get_native_frame_count();
+        return native_get_buffer_capacity_frames();
     }
 
     /**
@@ -1100,8 +2113,47 @@ public class AudioTrack
      * a better solution.
      * @hide
      */
+    @UnsupportedAppUsage(trackingBug = 130237544)
     public int getLatency() {
         return native_get_latency();
+    }
+
+    /**
+     * Returns the number of underrun occurrences in the application-level write buffer
+     * since the AudioTrack was created.
+     * An underrun occurs if the application does not write audio
+     * data quickly enough, causing the buffer to underflow
+     * and a potential audio glitch or pop.
+     * <p>
+     * Underruns are less likely when buffer sizes are large.
+     * It may be possible to eliminate underruns by recreating the AudioTrack with
+     * a larger buffer.
+     * Or by using {@link #setBufferSizeInFrames(int)} to dynamically increase the
+     * effective size of the buffer.
+     */
+    public int getUnderrunCount() {
+        return native_get_underrun_count();
+    }
+
+    /**
+     * Returns the current performance mode of the {@link AudioTrack}.
+     *
+     * @return one of {@link AudioTrack#PERFORMANCE_MODE_NONE},
+     * {@link AudioTrack#PERFORMANCE_MODE_LOW_LATENCY},
+     * or {@link AudioTrack#PERFORMANCE_MODE_POWER_SAVING}.
+     * Use {@link AudioTrack.Builder#setPerformanceMode}
+     * in the {@link AudioTrack.Builder} to enable a performance mode.
+     * @throws IllegalStateException if track is not initialized.
+     */
+    public @PerformanceMode int getPerformanceMode() {
+        final int flags = native_get_flags();
+        if ((flags & AUDIO_OUTPUT_FLAG_FAST) != 0) {
+            return PERFORMANCE_MODE_LOW_LATENCY;
+        } else if ((flags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) != 0) {
+            return PERFORMANCE_MODE_POWER_SAVING;
+        } else {
+            return PERFORMANCE_MODE_NONE;
+        }
     }
 
     /**
@@ -1112,14 +2164,17 @@ public class AudioTrack
     }
 
     /**
-     * Returns the minimum buffer size required for the successful creation of an AudioTrack
-     * object to be created in the {@link #MODE_STREAM} mode. Note that this size doesn't
+     * Returns the estimated minimum buffer size required for an AudioTrack
+     * object to be created in the {@link #MODE_STREAM} mode.
+     * The size is an estimate because it does not consider either the route or the sink,
+     * since neither is known yet.  Note that this size doesn't
      * guarantee a smooth playback under load, and higher values should be chosen according to
      * the expected frequency at which the buffer will be refilled with additional data to play.
      * For example, if you intend to dynamically set the source sample rate of an AudioTrack
      * to a higher value than the initial source sample rate, be sure to configure the buffer size
      * based on the highest planned sample rate.
      * @param sampleRateInHz the source sample rate expressed in Hz.
+     *   {@link AudioFormat#SAMPLE_RATE_UNSPECIFIED} is not permitted.
      * @param channelConfig describes the configuration of the audio channels.
      *   See {@link AudioFormat#CHANNEL_OUT_MONO} and
      *   {@link AudioFormat#CHANNEL_OUT_STEREO}
@@ -1157,7 +2212,9 @@ public class AudioTrack
         }
 
         // sample rate, note these values are subject to change
-        if ( (sampleRateInHz < SAMPLE_RATE_HZ_MIN) || (sampleRateInHz > SAMPLE_RATE_HZ_MAX) ) {
+        // Note: AudioFormat.SAMPLE_RATE_UNSPECIFIED is not allowed
+        if ( (sampleRateInHz < AudioFormat.SAMPLE_RATE_HZ_MIN) ||
+                (sampleRateInHz > AudioFormat.SAMPLE_RATE_HZ_MAX) ) {
             loge("getMinBufferSize(): " + sampleRateInHz + " Hz is not a supported sample rate.");
             return ERROR_BAD_VALUE;
         }
@@ -1206,7 +2263,7 @@ public class AudioTrack
     * @param timestamp a reference to a non-null AudioTimestamp instance allocated
     *        and owned by caller.
     * @return true if a timestamp is available, or false if no timestamp is available.
-    *         If a timestamp if available,
+    *         If a timestamp is available,
     *         the AudioTimestamp instance is filled in with a position in frame units, together
     *         with the estimated time when that frame was presented or is committed to
     *         be presented.
@@ -1276,6 +2333,23 @@ public class AudioTrack
          return ret;
      }
 
+    /**
+     *  Return Metrics data about the current AudioTrack instance.
+     *
+     * @return a {@link PersistableBundle} containing the set of attributes and values
+     * available for the media being handled by this instance of AudioTrack
+     * The attributes are descibed in {@link MetricsConstants}.
+     *
+     * Additional vendor-specific fields may also be present in
+     * the return value.
+     */
+    public PersistableBundle getMetrics() {
+        PersistableBundle bundle = native_getMetrics();
+        return bundle;
+    }
+
+    private native PersistableBundle native_getMetrics();
+
     //--------------------------------------------------------------------------
     // Initialization / configuration
     //--------------------
@@ -1336,20 +2410,22 @@ public class AudioTrack
      * @deprecated Applications should use {@link #setVolume} instead, as it
      * more gracefully scales down to mono, and up to multi-channel content beyond stereo.
      */
+    @Deprecated
     public int setStereoVolume(float leftGain, float rightGain) {
-        if (isRestricted()) {
-            return SUCCESS;
-        }
         if (mState == STATE_UNINITIALIZED) {
             return ERROR_INVALID_OPERATION;
         }
 
-        leftGain = clampGainOrLevel(leftGain);
-        rightGain = clampGainOrLevel(rightGain);
-
-        native_setVolume(leftGain, rightGain);
-
+        baseSetVolume(leftGain, rightGain);
         return SUCCESS;
+    }
+
+    @Override
+    void playerSetVolume(boolean muting, float leftVolume, float rightVolume) {
+        leftVolume = clampGainOrLevel(muting ? 0.0f : leftVolume);
+        rightVolume = clampGainOrLevel(muting ? 0.0f : rightVolume);
+
+        native_setVolume(leftVolume, rightVolume);
     }
 
 
@@ -1371,6 +2447,23 @@ public class AudioTrack
         return setStereoVolume(gain, gain);
     }
 
+    @Override
+    /* package */ int playerApplyVolumeShaper(
+            @NonNull VolumeShaper.Configuration configuration,
+            @NonNull VolumeShaper.Operation operation) {
+        return native_applyVolumeShaper(configuration, operation);
+    }
+
+    @Override
+    /* package */ @Nullable VolumeShaper.State playerGetVolumeShaperState(int id) {
+        return native_getVolumeShaperState(id);
+    }
+
+    @Override
+    public @NonNull VolumeShaper createVolumeShaper(
+            @NonNull VolumeShaper.Configuration configuration) {
+        return new VolumeShaper(configuration, this);
+    }
 
     /**
      * Sets the playback sample rate for this track. This sets the sampling rate at which
@@ -1472,7 +2565,7 @@ public class AudioTrack
      * @return error code or success, see {@link #SUCCESS}, {@link #ERROR_BAD_VALUE},
      *    {@link #ERROR_INVALID_OPERATION}
      */
-    public int setPlaybackHeadPosition(int positionInFrames) {
+    public int setPlaybackHeadPosition(@IntRange (from = 0) int positionInFrames) {
         if (mDataLoadMode == MODE_STREAM || mState == STATE_UNINITIALIZED ||
                 getPlayState() == PLAYSTATE_PLAYING) {
             return ERROR_INVALID_OPERATION;
@@ -1514,7 +2607,8 @@ public class AudioTrack
      * @return error code or success, see {@link #SUCCESS}, {@link #ERROR_BAD_VALUE},
      *    {@link #ERROR_INVALID_OPERATION}
      */
-    public int setLoopPoints(int startInFrames, int endInFrames, int loopCount) {
+    public int setLoopPoints(@IntRange (from = 0) int startInFrames,
+            @IntRange (from = 0) int endInFrames, @IntRange (from = -1) int loopCount) {
         if (mDataLoadMode == MODE_STREAM || mState == STATE_UNINITIALIZED ||
                 getPlayState() == PLAYSTATE_PLAYING) {
             return ERROR_INVALID_OPERATION;
@@ -1526,6 +2620,26 @@ public class AudioTrack
             return ERROR_BAD_VALUE;
         }
         return native_set_loop(startInFrames, endInFrames, loopCount);
+    }
+
+    /**
+     * Sets the audio presentation.
+     * If the audio presentation is invalid then {@link #ERROR_BAD_VALUE} will be returned.
+     * If a multi-stream decoder (MSD) is not present, or the format does not support
+     * multiple presentations, then {@link #ERROR_INVALID_OPERATION} will be returned.
+     * {@link #ERROR} is returned in case of any other error.
+     * @param presentation see {@link AudioPresentation}. In particular, id should be set.
+     * @return error code or success, see {@link #SUCCESS}, {@link #ERROR},
+     *    {@link #ERROR_BAD_VALUE}, {@link #ERROR_INVALID_OPERATION}
+     * @throws IllegalArgumentException if the audio presentation is null.
+     * @throws IllegalStateException if track is not initialized.
+     */
+    public int setPresentation(@NonNull AudioPresentation presentation) {
+        if (presentation == null) {
+            throw new IllegalArgumentException("audio presentation is null");
+        }
+        return native_setPresentation(presentation.getPresentationId(),
+                presentation.getProgramId());
     }
 
     /**
@@ -1573,26 +2687,41 @@ public class AudioTrack
         if (mState != STATE_INITIALIZED) {
             throw new IllegalStateException("play() called on uninitialized AudioTrack.");
         }
-        if (isRestricted()) {
-            setVolume(0);
-        }
-        synchronized(mPlayStateLock) {
-            native_start();
-            mPlayState = PLAYSTATE_PLAYING;
+        //FIXME use lambda to pass startImpl to superclass
+        final int delay = getStartDelayMs();
+        if (delay == 0) {
+            startImpl();
+        } else {
+            new Thread() {
+                public void run() {
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                    baseSetStartDelayMs(0);
+                    try {
+                        startImpl();
+                    } catch (IllegalStateException e) {
+                        // fail silently for a state exception when it is happening after
+                        // a delayed start, as the player state could have changed between the
+                        // call to start() and the execution of startImpl()
+                    }
+                }
+            }.start();
         }
     }
 
-    private boolean isRestricted() {
-        if ((mAttributes.getAllFlags() & AudioAttributes.FLAG_BYPASS_INTERRUPTION_POLICY) != 0) {
-            return false;
-        }
-        try {
-            final int usage = AudioAttributes.usageForLegacyStreamType(mStreamType);
-            final int mode = mAppOps.checkAudioOperation(AppOpsManager.OP_PLAY_AUDIO, usage,
-                    Process.myUid(), ActivityThread.currentPackageName());
-            return mode != AppOpsManager.MODE_ALLOWED;
-        } catch (RemoteException e) {
-            return false;
+    private void startImpl() {
+        synchronized(mPlayStateLock) {
+            baseStart();
+            native_start();
+            if (mPlayState == PLAYSTATE_PAUSED_STOPPING) {
+                mPlayState = PLAYSTATE_STOPPING;
+            } else {
+                mPlayState = PLAYSTATE_PLAYING;
+                mOffloadEosPending = false;
+            }
         }
     }
 
@@ -1613,9 +2742,16 @@ public class AudioTrack
         // stop playing
         synchronized(mPlayStateLock) {
             native_stop();
-            mPlayState = PLAYSTATE_STOPPED;
-            mAvSyncHeader = null;
-            mAvSyncBytesRemaining = 0;
+            baseStop();
+            if (mOffloaded && mPlayState != PLAYSTATE_PAUSED_STOPPING) {
+                mPlayState = PLAYSTATE_STOPPING;
+            } else {
+                mPlayState = PLAYSTATE_STOPPED;
+                mOffloadEosPending = false;
+                mAvSyncHeader = null;
+                mAvSyncBytesRemaining = 0;
+                mPlayStateLock.notify();
+            }
         }
     }
 
@@ -1631,12 +2767,16 @@ public class AudioTrack
         if (mState != STATE_INITIALIZED) {
             throw new IllegalStateException("pause() called on uninitialized AudioTrack.");
         }
-        //logd("pause()");
 
         // pause playback
         synchronized(mPlayStateLock) {
             native_pause();
-            mPlayState = PLAYSTATE_PAUSED;
+            basePause();
+            if (mPlayState == PLAYSTATE_STOPPING) {
+                mPlayState = PLAYSTATE_PAUSED_STOPPING;
+            } else {
+                mPlayState = PLAYSTATE_PAUSED;
+            }
         }
     }
 
@@ -1671,6 +2811,7 @@ public class AudioTrack
      * or copies audio data for later playback (static buffer mode).
      * The format specified in the AudioTrack constructor should be
      * {@link AudioFormat#ENCODING_PCM_8BIT} to correspond to the data in the array.
+     * The format can be {@link AudioFormat#ENCODING_PCM_16BIT}, but this is deprecated.
      * <p>
      * In streaming mode, the write will normally block until all the data has been enqueued for
      * playback, and will return a full transfer count.  However, if the track is stopped or paused
@@ -1681,18 +2822,22 @@ public class AudioTrack
      * Note that the actual playback of this data might occur after this function returns.
      *
      * @param audioData the array that holds the data to play.
-     * @param offsetInBytes the offset expressed in bytes in audioData where the data to play
+     * @param offsetInBytes the offset expressed in bytes in audioData where the data to write
      *    starts.
-     * @param sizeInBytes the number of bytes to read in audioData after the offset.
-     * @return zero or the positive number of bytes that were written, or
-     *    {@link #ERROR_INVALID_OPERATION}
-     *    if the track isn't properly initialized, or {@link #ERROR_BAD_VALUE} if
-     *    the parameters don't resolve to valid data and indexes, or
-     *    {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *    needs to be recreated.
-     *    The dead object error code is not returned if some data was successfully transferred.
-     *    In this case, the error is returned at the next write().
-     *
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
+     * @param sizeInBytes the number of bytes to write in audioData after the offset.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
+     * @return zero or the positive number of bytes that were written, or one of the following
+     *    error codes. The number of bytes will be a multiple of the frame size in bytes
+     *    not to exceed sizeInBytes.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      * This is equivalent to {@link #write(byte[], int, int, int)} with <code>writeMode</code>
      * set to  {@link #WRITE_BLOCKING}.
      */
@@ -1705,6 +2850,7 @@ public class AudioTrack
      * or copies audio data for later playback (static buffer mode).
      * The format specified in the AudioTrack constructor should be
      * {@link AudioFormat#ENCODING_PCM_8BIT} to correspond to the data in the array.
+     * The format can be {@link AudioFormat#ENCODING_PCM_16BIT}, but this is deprecated.
      * <p>
      * In streaming mode, the blocking behavior depends on the write mode.  If the write mode is
      * {@link #WRITE_BLOCKING}, the write will normally block until all the data has been enqueued
@@ -1718,23 +2864,28 @@ public class AudioTrack
      * Note that the actual playback of this data might occur after this function returns.
      *
      * @param audioData the array that holds the data to play.
-     * @param offsetInBytes the offset expressed in bytes in audioData where the data to play
+     * @param offsetInBytes the offset expressed in bytes in audioData where the data to write
      *    starts.
-     * @param sizeInBytes the number of bytes to read in audioData after the offset.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
+     * @param sizeInBytes the number of bytes to write in audioData after the offset.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
      * @param writeMode one of {@link #WRITE_BLOCKING}, {@link #WRITE_NON_BLOCKING}. It has no
      *     effect in static mode.
      *     <br>With {@link #WRITE_BLOCKING}, the write will block until all data has been written
      *         to the audio sink.
      *     <br>With {@link #WRITE_NON_BLOCKING}, the write will return immediately after
      *     queuing as much audio data for playback as possible without blocking.
-     * @return zero or the positive number of bytes that were written, or
-     *    {@link #ERROR_INVALID_OPERATION}
-     *    if the track isn't properly initialized, or {@link #ERROR_BAD_VALUE} if
-     *    the parameters don't resolve to valid data and indexes, or
-     *    {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *    needs to be recreated.
-     *    The dead object error code is not returned if some data was successfully transferred.
-     *    In this case, the error is returned at the next write().
+     * @return zero or the positive number of bytes that were written, or one of the following
+     *    error codes. The number of bytes will be a multiple of the frame size in bytes
+     *    not to exceed sizeInBytes.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      */
     public int write(@NonNull byte[] audioData, int offsetInBytes, int sizeInBytes,
             @WriteMode int writeMode) {
@@ -1754,7 +2905,11 @@ public class AudioTrack
             return ERROR_BAD_VALUE;
         }
 
-        int ret = native_write_byte(audioData, offsetInBytes, sizeInBytes, mAudioFormat,
+        if (!blockUntilOffloadDrain(writeMode)) {
+            return 0;
+        }
+
+        final int ret = native_write_byte(audioData, offsetInBytes, sizeInBytes, mAudioFormat,
                 writeMode == WRITE_BLOCKING);
 
         if ((mDataLoadMode == MODE_STATIC)
@@ -1784,16 +2939,20 @@ public class AudioTrack
      * @param audioData the array that holds the data to play.
      * @param offsetInShorts the offset expressed in shorts in audioData where the data to play
      *     starts.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
      * @param sizeInShorts the number of shorts to read in audioData after the offset.
-     * @return zero or the positive number of shorts that were written, or
-     *    {@link #ERROR_INVALID_OPERATION}
-     *    if the track isn't properly initialized, or {@link #ERROR_BAD_VALUE} if
-     *    the parameters don't resolve to valid data and indexes, or
-     *    {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *    needs to be recreated.
-     *    The dead object error code is not returned if some data was successfully transferred.
-     *    In this case, the error is returned at the next write().
-     *
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
+     * @return zero or the positive number of shorts that were written, or one of the following
+     *    error codes. The number of shorts will be a multiple of the channel count not to
+     *    exceed sizeInShorts.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      * This is equivalent to {@link #write(short[], int, int, int)} with <code>writeMode</code>
      * set to  {@link #WRITE_BLOCKING}.
      */
@@ -1817,24 +2976,29 @@ public class AudioTrack
      * In static buffer mode, copies the data to the buffer starting at offset 0.
      * Note that the actual playback of this data might occur after this function returns.
      *
-     * @param audioData the array that holds the data to play.
-     * @param offsetInShorts the offset expressed in shorts in audioData where the data to play
+     * @param audioData the array that holds the data to write.
+     * @param offsetInShorts the offset expressed in shorts in audioData where the data to write
      *     starts.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
      * @param sizeInShorts the number of shorts to read in audioData after the offset.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
      * @param writeMode one of {@link #WRITE_BLOCKING}, {@link #WRITE_NON_BLOCKING}. It has no
      *     effect in static mode.
      *     <br>With {@link #WRITE_BLOCKING}, the write will block until all data has been written
      *         to the audio sink.
      *     <br>With {@link #WRITE_NON_BLOCKING}, the write will return immediately after
      *     queuing as much audio data for playback as possible without blocking.
-     * @return zero or the positive number of shorts that were written, or
-     *    {@link #ERROR_INVALID_OPERATION}
-     *    if the track isn't properly initialized, or {@link #ERROR_BAD_VALUE} if
-     *    the parameters don't resolve to valid data and indexes, or
-     *    {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *    needs to be recreated.
-     *    The dead object error code is not returned if some data was successfully transferred.
-     *    In this case, the error is returned at the next write().
+     * @return zero or the positive number of shorts that were written, or one of the following
+     *    error codes. The number of shorts will be a multiple of the channel count not to
+     *    exceed sizeInShorts.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      */
     public int write(@NonNull short[] audioData, int offsetInShorts, int sizeInShorts,
             @WriteMode int writeMode) {
@@ -1854,7 +3018,11 @@ public class AudioTrack
             return ERROR_BAD_VALUE;
         }
 
-        int ret = native_write_short(audioData, offsetInShorts, sizeInShorts, mAudioFormat,
+        if (!blockUntilOffloadDrain(writeMode)) {
+            return 0;
+        }
+
+        final int ret = native_write_short(audioData, offsetInShorts, sizeInShorts, mAudioFormat,
                 writeMode == WRITE_BLOCKING);
 
         if ((mDataLoadMode == MODE_STATIC)
@@ -1884,7 +3052,7 @@ public class AudioTrack
      * and the write mode is ignored.
      * Note that the actual playback of this data might occur after this function returns.
      *
-     * @param audioData the array that holds the data to play.
+     * @param audioData the array that holds the data to write.
      *     The implementation does not clip for sample values within the nominal range
      *     [-1.0f, 1.0f], provided that all gains in the audio pipeline are
      *     less than or equal to unity (1.0f), and in the absence of post-processing effects
@@ -1895,22 +3063,27 @@ public class AudioTrack
      *     and later processing in the audio path.  Therefore applications are encouraged
      *     to provide samples values within the nominal range.
      * @param offsetInFloats the offset, expressed as a number of floats,
-     *     in audioData where the data to play starts.
-     * @param sizeInFloats the number of floats to read in audioData after the offset.
+     *     in audioData where the data to write starts.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
+     * @param sizeInFloats the number of floats to write in audioData after the offset.
+     *    Must not be negative, or cause the data access to go out of bounds of the array.
      * @param writeMode one of {@link #WRITE_BLOCKING}, {@link #WRITE_NON_BLOCKING}. It has no
      *     effect in static mode.
      *     <br>With {@link #WRITE_BLOCKING}, the write will block until all data has been written
      *         to the audio sink.
      *     <br>With {@link #WRITE_NON_BLOCKING}, the write will return immediately after
      *     queuing as much audio data for playback as possible without blocking.
-     * @return zero or the positive number of floats that were written, or
-     *    {@link #ERROR_INVALID_OPERATION}
-     *    if the track isn't properly initialized, or {@link #ERROR_BAD_VALUE} if
-     *    the parameters don't resolve to valid data and indexes, or
-     *    {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *    needs to be recreated.
-     *    The dead object error code is not returned if some data was successfully transferred.
-     *    In this case, the error is returned at the next write().
+     * @return zero or the positive number of floats that were written, or one of the following
+     *    error codes. The number of floats will be a multiple of the channel count not to
+     *    exceed sizeInFloats.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      */
     public int write(@NonNull float[] audioData, int offsetInFloats, int sizeInFloats,
             @WriteMode int writeMode) {
@@ -1937,7 +3110,11 @@ public class AudioTrack
             return ERROR_BAD_VALUE;
         }
 
-        int ret = native_write_float(audioData, offsetInFloats, sizeInFloats, mAudioFormat,
+        if (!blockUntilOffloadDrain(writeMode)) {
+            return 0;
+        }
+
+        final int ret = native_write_float(audioData, offsetInFloats, sizeInFloats, mAudioFormat,
                 writeMode == WRITE_BLOCKING);
 
         if ((mDataLoadMode == MODE_STATIC)
@@ -1967,12 +3144,14 @@ public class AudioTrack
      * and the write mode is ignored.
      * Note that the actual playback of this data might occur after this function returns.
      *
-     * @param audioData the buffer that holds the data to play, starting at the position reported
+     * @param audioData the buffer that holds the data to write, starting at the position reported
      *     by <code>audioData.position()</code>.
      *     <BR>Note that upon return, the buffer position (<code>audioData.position()</code>) will
      *     have been advanced to reflect the amount of data that was successfully written to
      *     the AudioTrack.
-     * @param sizeInBytes number of bytes to write.
+     * @param sizeInBytes number of bytes to write.  It is recommended but not enforced
+     *     that the number of bytes requested be a multiple of the frame size (sample size in
+     *     bytes multiplied by the channel count).
      *     <BR>Note this may differ from <code>audioData.remaining()</code>, but cannot exceed it.
      * @param writeMode one of {@link #WRITE_BLOCKING}, {@link #WRITE_NON_BLOCKING}. It has no
      *     effect in static mode.
@@ -1980,12 +3159,16 @@ public class AudioTrack
      *         to the audio sink.
      *     <BR>With {@link #WRITE_NON_BLOCKING}, the write will return immediately after
      *     queuing as much audio data for playback as possible without blocking.
-     * @return zero or the positive number of bytes that were written, or
-     *     {@link #ERROR_BAD_VALUE}, {@link #ERROR_INVALID_OPERATION}, or
-     *     {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *     needs to be recreated.
-     *     The dead object error code is not returned if some data was successfully transferred.
-     *     In this case, the error is returned at the next write().
+     * @return zero or the positive number of bytes that were written, or one of the following
+     *    error codes.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      */
     public int write(@NonNull ByteBuffer audioData, int sizeInBytes,
             @WriteMode int writeMode) {
@@ -2003,6 +3186,10 @@ public class AudioTrack
         if ( (audioData == null) || (sizeInBytes < 0) || (sizeInBytes > audioData.remaining())) {
             Log.e(TAG, "AudioTrack.write() called with invalid size (" + sizeInBytes + ") value");
             return ERROR_BAD_VALUE;
+        }
+
+        if (!blockUntilOffloadDrain(writeMode)) {
+            return 0;
         }
 
         int ret = 0;
@@ -2034,25 +3221,32 @@ public class AudioTrack
     /**
      * Writes the audio data to the audio sink for playback in streaming mode on a HW_AV_SYNC track.
      * The blocking behavior will depend on the write mode.
-     * @param audioData the buffer that holds the data to play, starting at the position reported
+     * @param audioData the buffer that holds the data to write, starting at the position reported
      *     by <code>audioData.position()</code>.
      *     <BR>Note that upon return, the buffer position (<code>audioData.position()</code>) will
      *     have been advanced to reflect the amount of data that was successfully written to
      *     the AudioTrack.
-     * @param sizeInBytes number of bytes to write.
+     * @param sizeInBytes number of bytes to write.  It is recommended but not enforced
+     *     that the number of bytes requested be a multiple of the frame size (sample size in
+     *     bytes multiplied by the channel count).
      *     <BR>Note this may differ from <code>audioData.remaining()</code>, but cannot exceed it.
      * @param writeMode one of {@link #WRITE_BLOCKING}, {@link #WRITE_NON_BLOCKING}.
      *     <BR>With {@link #WRITE_BLOCKING}, the write will block until all data has been written
      *         to the audio sink.
      *     <BR>With {@link #WRITE_NON_BLOCKING}, the write will return immediately after
      *     queuing as much audio data for playback as possible without blocking.
-     * @param timestamp The timestamp of the first decodable audio frame in the provided audioData.
-     * @return zero or a positive number of bytes that were written, or
-     *     {@link #ERROR_BAD_VALUE}, {@link #ERROR_INVALID_OPERATION}, or
-     *     {@link AudioManager#ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
-     *     needs to be recreated.
-     *     The dead object error code is not returned if some data was successfully transferred.
-     *     In this case, the error is returned at the next write().
+     * @param timestamp The timestamp, in nanoseconds, of the first decodable audio frame in the
+     *     provided audioData.
+     * @return zero or the positive number of bytes that were written, or one of the following
+     *    error codes.
+     * <ul>
+     * <li>{@link #ERROR_INVALID_OPERATION} if the track isn't properly initialized</li>
+     * <li>{@link #ERROR_BAD_VALUE} if the parameters don't resolve to valid data and indexes</li>
+     * <li>{@link #ERROR_DEAD_OBJECT} if the AudioTrack is not valid anymore and
+     *    needs to be recreated. The dead object error code is not returned if some data was
+     *    successfully transferred. In this case, the error is returned at the next write()</li>
+     * <li>{@link #ERROR} in case of other error</li>
+     * </ul>
      */
     public int write(@NonNull ByteBuffer audioData, int sizeInBytes,
             @WriteMode int writeMode, long timestamp) {
@@ -2082,13 +3276,21 @@ public class AudioTrack
             return ERROR_BAD_VALUE;
         }
 
+        if (!blockUntilOffloadDrain(writeMode)) {
+            return 0;
+        }
+
         // create timestamp header if none exists
         if (mAvSyncHeader == null) {
-            mAvSyncHeader = ByteBuffer.allocate(16);
+            mAvSyncHeader = ByteBuffer.allocate(mOffset);
             mAvSyncHeader.order(ByteOrder.BIG_ENDIAN);
-            mAvSyncHeader.putInt(0x55550001);
-            mAvSyncHeader.putInt(sizeInBytes);
-            mAvSyncHeader.putLong(timestamp);
+            mAvSyncHeader.putInt(0x55550002);
+        }
+
+        if (mAvSyncBytesRemaining == 0) {
+            mAvSyncHeader.putInt(4, sizeInBytes);
+            mAvSyncHeader.putLong(8, timestamp);
+            mAvSyncHeader.putInt(16, mOffset);
             mAvSyncHeader.position(0);
             mAvSyncBytesRemaining = sizeInBytes;
         }
@@ -2120,9 +3322,6 @@ public class AudioTrack
         }
 
         mAvSyncBytesRemaining -= ret;
-        if (mAvSyncBytesRemaining == 0) {
-            mAvSyncHeader = null;
-        }
 
         return ret;
     }
@@ -2148,6 +3347,25 @@ public class AudioTrack
             return ERROR_INVALID_OPERATION;
         }
         return native_reload_static();
+    }
+
+    /**
+     * When an AudioTrack in offload mode is in STOPPING play state, wait until event STREAM_END is
+     * received if blocking write or return with 0 frames written if non blocking mode.
+     */
+    private boolean blockUntilOffloadDrain(int writeMode) {
+        synchronized (mPlayStateLock) {
+            while (mPlayState == PLAYSTATE_STOPPING || mPlayState == PLAYSTATE_PAUSED_STOPPING) {
+                if (writeMode == WRITE_NON_BLOCKING) {
+                    return false;
+                }
+                try {
+                    mPlayStateLock.wait();
+                } catch (InterruptedException e) {
+                }
+            }
+            return true;
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -2196,14 +3414,16 @@ public class AudioTrack
      * @return error code or success, see {@link #SUCCESS},
      *    {@link #ERROR_INVALID_OPERATION}, {@link #ERROR}
      */
-    public int setAuxEffectSendLevel(float level) {
-        if (isRestricted()) {
-            return SUCCESS;
-        }
+    public int setAuxEffectSendLevel(@FloatRange(from = 0.0) float level) {
         if (mState == STATE_UNINITIALIZED) {
             return ERROR_INVALID_OPERATION;
         }
-        level = clampGainOrLevel(level);
+        return baseSetAuxEffectSendLevel(level);
+    }
+
+    @Override
+    int playerSetAuxEffectSendLevel(boolean muting, float level) {
+        level = clampGainOrLevel(muting ? 0.0f : level);
         int err = native_setAuxEffectSendLevel(level);
         return err == 0 ? SUCCESS : ERROR;
     }
@@ -2221,6 +3441,7 @@ public class AudioTrack
      * @return true if succesful, false if the specified {@link AudioDeviceInfo} is non-null and
      * does not correspond to a valid audio output device.
      */
+    @Override
     public boolean setPreferredDevice(AudioDeviceInfo deviceInfo) {
         // Do some validation....
         if (deviceInfo != null && !deviceInfo.isSink()) {
@@ -2240,26 +3461,11 @@ public class AudioTrack
      * Returns the selected output specified by {@link #setPreferredDevice}. Note that this
      * is not guaranteed to correspond to the actual device being used for playback.
      */
+    @Override
     public AudioDeviceInfo getPreferredDevice() {
         synchronized (this) {
             return mPreferredDevice;
         }
-    }
-
-    //--------------------------------------------------------------------------
-    // (Re)Routing Info
-    //--------------------
-    /**
-     * Defines the interface by which applications can receive notifications of routing
-     * changes for the associated {@link AudioTrack}.
-     */
-    public interface OnRoutingChangedListener {
-        /**
-         * Called when the routing of an AudioTrack changes from either and explicit or
-         * policy rerouting.  Use {@link #getRoutedDevice()} to retrieve the newly routed-to
-         * device.
-         */
-        public void onRoutingChanged(AudioTrack audioTrack);
     }
 
     /**
@@ -2267,6 +3473,7 @@ public class AudioTrack
      * Note: The query is only valid if the AudioTrack is currently playing. If it is not,
      * <code>getRoutedDevice()</code> will return null.
      */
+    @Override
     public AudioDeviceInfo getRoutedDevice() {
         int deviceId = native_getRoutedDeviceId();
         if (deviceId == 0) {
@@ -2282,14 +3489,102 @@ public class AudioTrack
         return null;
     }
 
+    /*
+     * Call BEFORE adding a routing callback handler.
+     */
+    @GuardedBy("mRoutingChangeListeners")
+    private void testEnableNativeRoutingCallbacksLocked() {
+        if (mRoutingChangeListeners.size() == 0) {
+            native_enableDeviceCallback();
+        }
+    }
+
+    /*
+     * Call AFTER removing a routing callback handler.
+     */
+    @GuardedBy("mRoutingChangeListeners")
+    private void testDisableNativeRoutingCallbacksLocked() {
+        if (mRoutingChangeListeners.size() == 0) {
+            native_disableDeviceCallback();
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // (Re)Routing Info
+    //--------------------
     /**
-     * The list of AudioTrack.OnRoutingChangedListener interfaces added (with
-     * {@link AudioTrack#addOnRoutingChangedListener(OnRoutingChangedListener, android.os.Handler)}
+     * The list of AudioRouting.OnRoutingChangedListener interfaces added (with
+     * {@link #addOnRoutingChangedListener(android.media.AudioRouting.OnRoutingChangedListener, Handler)}
      * by an app to receive (re)routing notifications.
      */
-    private ArrayMap<OnRoutingChangedListener, NativeRoutingEventHandlerDelegate>
-        mRoutingChangeListeners =
-            new ArrayMap<OnRoutingChangedListener, NativeRoutingEventHandlerDelegate>();
+    @GuardedBy("mRoutingChangeListeners")
+    private ArrayMap<AudioRouting.OnRoutingChangedListener,
+            NativeRoutingEventHandlerDelegate> mRoutingChangeListeners = new ArrayMap<>();
+
+   /**
+    * Adds an {@link AudioRouting.OnRoutingChangedListener} to receive notifications of routing
+    * changes on this AudioTrack.
+    * @param listener The {@link AudioRouting.OnRoutingChangedListener} interface to receive
+    * notifications of rerouting events.
+    * @param handler  Specifies the {@link Handler} object for the thread on which to execute
+    * the callback. If <code>null</code>, the {@link Handler} associated with the main
+    * {@link Looper} will be used.
+    */
+    @Override
+    public void addOnRoutingChangedListener(AudioRouting.OnRoutingChangedListener listener,
+            Handler handler) {
+        synchronized (mRoutingChangeListeners) {
+            if (listener != null && !mRoutingChangeListeners.containsKey(listener)) {
+                testEnableNativeRoutingCallbacksLocked();
+                mRoutingChangeListeners.put(
+                        listener, new NativeRoutingEventHandlerDelegate(this, listener,
+                                handler != null ? handler : new Handler(mInitializationLooper)));
+            }
+        }
+    }
+
+    /**
+     * Removes an {@link AudioRouting.OnRoutingChangedListener} which has been previously added
+     * to receive rerouting notifications.
+     * @param listener The previously added {@link AudioRouting.OnRoutingChangedListener} interface
+     * to remove.
+     */
+    @Override
+    public void removeOnRoutingChangedListener(AudioRouting.OnRoutingChangedListener listener) {
+        synchronized (mRoutingChangeListeners) {
+            if (mRoutingChangeListeners.containsKey(listener)) {
+                mRoutingChangeListeners.remove(listener);
+            }
+            testDisableNativeRoutingCallbacksLocked();
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // (Re)Routing Info
+    //--------------------
+    /**
+     * Defines the interface by which applications can receive notifications of
+     * routing changes for the associated {@link AudioTrack}.
+     *
+     * @deprecated users should switch to the general purpose
+     *             {@link AudioRouting.OnRoutingChangedListener} class instead.
+     */
+    @Deprecated
+    public interface OnRoutingChangedListener extends AudioRouting.OnRoutingChangedListener {
+        /**
+         * Called when the routing of an AudioTrack changes from either and
+         * explicit or policy rerouting. Use {@link #getRoutedDevice()} to
+         * retrieve the newly routed-to device.
+         */
+        public void onRoutingChanged(AudioTrack audioTrack);
+
+        @Override
+        default public void onRoutingChanged(AudioRouting router) {
+            if (router instanceof AudioTrack) {
+                onRoutingChanged((AudioTrack) router);
+            }
+        }
+    }
 
     /**
      * Adds an {@link OnRoutingChangedListener} to receive notifications of routing changes
@@ -2299,52 +3594,98 @@ public class AudioTrack
      * @param handler  Specifies the {@link Handler} object for the thread on which to execute
      * the callback. If <code>null</code>, the {@link Handler} associated with the main
      * {@link Looper} will be used.
+     * @deprecated users should switch to the general purpose
+     *             {@link AudioRouting.OnRoutingChangedListener} class instead.
      */
+    @Deprecated
     public void addOnRoutingChangedListener(OnRoutingChangedListener listener,
             android.os.Handler handler) {
-        if (listener != null && !mRoutingChangeListeners.containsKey(listener)) {
-            synchronized (mRoutingChangeListeners) {
-                if (mRoutingChangeListeners.size() == 0) {
-                    native_enableDeviceCallback();
-                }
-                mRoutingChangeListeners.put(
-                    listener, new NativeRoutingEventHandlerDelegate(this, listener,
-                            handler != null ? handler : new Handler(mInitializationLooper)));
-            }
-        }
+        addOnRoutingChangedListener((AudioRouting.OnRoutingChangedListener) listener, handler);
     }
 
     /**
      * Removes an {@link OnRoutingChangedListener} which has been previously added
      * to receive rerouting notifications.
      * @param listener The previously added {@link OnRoutingChangedListener} interface to remove.
+     * @deprecated users should switch to the general purpose
+     *             {@link AudioRouting.OnRoutingChangedListener} class instead.
      */
+    @Deprecated
     public void removeOnRoutingChangedListener(OnRoutingChangedListener listener) {
-        synchronized (mRoutingChangeListeners) {
-            if (mRoutingChangeListeners.containsKey(listener)) {
-                mRoutingChangeListeners.remove(listener);
-            }
-            if (mRoutingChangeListeners.size() == 0) {
-                native_disableDeviceCallback();
-            }
-        }
+        removeOnRoutingChangedListener((AudioRouting.OnRoutingChangedListener) listener);
     }
 
     /**
      * Sends device list change notification to all listeners.
      */
     private void broadcastRoutingChange() {
-        Collection<NativeRoutingEventHandlerDelegate> values;
-        synchronized (mRoutingChangeListeners) {
-            values = mRoutingChangeListeners.values();
-        }
         AudioManager.resetAudioPortGeneration();
-        for(NativeRoutingEventHandlerDelegate delegate : values) {
-            Handler handler = delegate.getHandler();
-            if (handler != null) {
-                handler.sendEmptyMessage(AudioSystem.NATIVE_EVENT_ROUTING_CHANGE);
+        synchronized (mRoutingChangeListeners) {
+            for (NativeRoutingEventHandlerDelegate delegate : mRoutingChangeListeners.values()) {
+                delegate.notifyClient();
             }
         }
+    }
+
+    //--------------------------------------------------------------------------
+    // Codec notifications
+    //--------------------
+
+    // OnCodecFormatChangedListener notifications uses an instance
+    // of ListenerList to manage its listeners.
+
+    private final Utils.ListenerList<AudioMetadataReadMap> mCodecFormatChangedListeners =
+            new Utils.ListenerList();
+
+    /**
+     * Interface definition for a listener for codec format changes.
+     */
+    public interface OnCodecFormatChangedListener {
+        /**
+         * Called when the compressed codec format changes.
+         *
+         * @param audioTrack is the {@code AudioTrack} instance associated with the codec.
+         * @param info is a {@link AudioMetadataReadMap} of values which contains decoded format
+         *     changes reported by the codec.  Not all hardware
+         *     codecs indicate codec format changes. Acceptable keys are taken from
+         *     {@code AudioMetadata.Format.KEY_*} range, with the associated value type.
+         */
+        void onCodecFormatChanged(
+                @NonNull AudioTrack audioTrack, @Nullable AudioMetadataReadMap info);
+    }
+
+    /**
+     * Adds an {@link OnCodecFormatChangedListener} to receive notifications of
+     * codec format change events on this {@code AudioTrack}.
+     *
+     * @param executor  Specifies the {@link Executor} object to control execution.
+     *
+     * @param listener The {@link OnCodecFormatChangedListener} interface to receive
+     *     notifications of codec events.
+     */
+    public void addOnCodecFormatChangedListener(
+            @NonNull @CallbackExecutor Executor executor,
+            @NonNull OnCodecFormatChangedListener listener) { // NPE checks done by ListenerList.
+        mCodecFormatChangedListeners.add(
+                listener, /* key for removal */
+                executor,
+                (int eventCode, AudioMetadataReadMap readMap) -> {
+                    // eventCode is unused by this implementation.
+                    listener.onCodecFormatChanged(this, readMap);
+                }
+        );
+    }
+
+    /**
+     * Removes an {@link OnCodecFormatChangedListener} which has been previously added
+     * to receive codec format change events.
+     *
+     * @param listener The previously added {@link OnCodecFormatChangedListener} interface
+     * to remove.
+     */
+    public void removeOnCodecFormatChangedListener(
+            @NonNull OnCodecFormatChangedListener listener) {
+        mCodecFormatChangedListeners.remove(listener);  // NPE checks done by ListenerList.
     }
 
     //---------------------------------------------------------
@@ -2366,6 +3707,227 @@ public class AudioTrack
          * a multiple of the notification period.
          */
         void onPeriodicNotification(AudioTrack track);
+    }
+
+    /**
+     * Abstract class to receive event notifications about the stream playback in offloaded mode.
+     * See {@link AudioTrack#registerStreamEventCallback(Executor, StreamEventCallback)} to register
+     * the callback on the given {@link AudioTrack} instance.
+     */
+    public abstract static class StreamEventCallback {
+        /**
+         * Called when an offloaded track is no longer valid and has been discarded by the system.
+         * An example of this happening is when an offloaded track has been paused too long, and
+         * gets invalidated by the system to prevent any other offload.
+         * @param track the {@link AudioTrack} on which the event happened.
+         */
+        public void onTearDown(@NonNull AudioTrack track) { }
+        /**
+         * Called when all the buffers of an offloaded track that were queued in the audio system
+         * (e.g. the combination of the Android audio framework and the device's audio hardware)
+         * have been played after {@link AudioTrack#stop()} has been called.
+         * @param track the {@link AudioTrack} on which the event happened.
+         */
+        public void onPresentationEnded(@NonNull AudioTrack track) { }
+        /**
+         * Called when more audio data can be written without blocking on an offloaded track.
+         * @param track the {@link AudioTrack} on which the event happened.
+         * @param sizeInFrames the number of frames available to write without blocking.
+         *   Note that the frame size of a compressed stream is 1 byte.
+         */
+        public void onDataRequest(@NonNull AudioTrack track, @IntRange(from = 0) int sizeInFrames) {
+        }
+    }
+
+    /**
+     * Registers a callback for the notification of stream events.
+     * This callback can only be registered for instances operating in offloaded mode
+     * (see {@link AudioTrack.Builder#setOffloadedPlayback(boolean)} and
+     * {@link AudioManager#isOffloadedPlaybackSupported(AudioFormat,AudioAttributes)} for
+     * more details).
+     * @param executor {@link Executor} to handle the callbacks.
+     * @param eventCallback the callback to receive the stream event notifications.
+     */
+    public void registerStreamEventCallback(@NonNull @CallbackExecutor Executor executor,
+            @NonNull StreamEventCallback eventCallback) {
+        if (eventCallback == null) {
+            throw new IllegalArgumentException("Illegal null StreamEventCallback");
+        }
+        if (!mOffloaded) {
+            throw new IllegalStateException(
+                    "Cannot register StreamEventCallback on non-offloaded AudioTrack");
+        }
+        if (executor == null) {
+            throw new IllegalArgumentException("Illegal null Executor for the StreamEventCallback");
+        }
+        synchronized (mStreamEventCbLock) {
+            // check if eventCallback already in list
+            for (StreamEventCbInfo seci : mStreamEventCbInfoList) {
+                if (seci.mStreamEventCb == eventCallback) {
+                    throw new IllegalArgumentException(
+                            "StreamEventCallback already registered");
+                }
+            }
+            beginStreamEventHandling();
+            mStreamEventCbInfoList.add(new StreamEventCbInfo(executor, eventCallback));
+        }
+    }
+
+    /**
+     * Unregisters the callback for notification of stream events, previously registered
+     * with {@link #registerStreamEventCallback(Executor, StreamEventCallback)}.
+     * @param eventCallback the callback to unregister.
+     */
+    public void unregisterStreamEventCallback(@NonNull StreamEventCallback eventCallback) {
+        if (eventCallback == null) {
+            throw new IllegalArgumentException("Illegal null StreamEventCallback");
+        }
+        if (!mOffloaded) {
+            throw new IllegalStateException("No StreamEventCallback on non-offloaded AudioTrack");
+        }
+        synchronized (mStreamEventCbLock) {
+            StreamEventCbInfo seciToRemove = null;
+            for (StreamEventCbInfo seci : mStreamEventCbInfoList) {
+                if (seci.mStreamEventCb == eventCallback) {
+                    // ok to remove while iterating over list as we exit iteration
+                    mStreamEventCbInfoList.remove(seci);
+                    if (mStreamEventCbInfoList.size() == 0) {
+                        endStreamEventHandling();
+                    }
+                    return;
+                }
+            }
+            throw new IllegalArgumentException("StreamEventCallback was not registered");
+        }
+    }
+
+    //---------------------------------------------------------
+    // Offload
+    //--------------------
+    private static class StreamEventCbInfo {
+        final Executor mStreamEventExec;
+        final StreamEventCallback mStreamEventCb;
+
+        StreamEventCbInfo(Executor e, StreamEventCallback cb) {
+            mStreamEventExec = e;
+            mStreamEventCb = cb;
+        }
+    }
+
+    private final Object mStreamEventCbLock = new Object();
+    @GuardedBy("mStreamEventCbLock")
+    @NonNull private LinkedList<StreamEventCbInfo> mStreamEventCbInfoList =
+            new LinkedList<StreamEventCbInfo>();
+    /**
+     * Dedicated thread for handling the StreamEvent callbacks
+     */
+    private @Nullable HandlerThread mStreamEventHandlerThread;
+    private @Nullable volatile StreamEventHandler mStreamEventHandler;
+
+    /**
+     * Called from native AudioTrack callback thread, filter messages if necessary
+     * and repost event on AudioTrack message loop to prevent blocking native thread.
+     * @param what event code received from native
+     * @param arg optional argument for event
+     */
+    void handleStreamEventFromNative(int what, int arg) {
+        if (mStreamEventHandler == null) {
+            return;
+        }
+        switch (what) {
+            case NATIVE_EVENT_CAN_WRITE_MORE_DATA:
+                // replace previous CAN_WRITE_MORE_DATA messages with the latest value
+                mStreamEventHandler.removeMessages(NATIVE_EVENT_CAN_WRITE_MORE_DATA);
+                mStreamEventHandler.sendMessage(
+                        mStreamEventHandler.obtainMessage(
+                                NATIVE_EVENT_CAN_WRITE_MORE_DATA, arg, 0/*ignored*/));
+                break;
+            case NATIVE_EVENT_NEW_IAUDIOTRACK:
+                mStreamEventHandler.sendMessage(
+                        mStreamEventHandler.obtainMessage(NATIVE_EVENT_NEW_IAUDIOTRACK));
+                break;
+            case NATIVE_EVENT_STREAM_END:
+                mStreamEventHandler.sendMessage(
+                        mStreamEventHandler.obtainMessage(NATIVE_EVENT_STREAM_END));
+                break;
+        }
+    }
+
+    private class StreamEventHandler extends Handler {
+
+        StreamEventHandler(Looper looper) {
+            super(looper);
+        }
+
+        @Override
+        public void handleMessage(Message msg) {
+            final LinkedList<StreamEventCbInfo> cbInfoList;
+            synchronized (mStreamEventCbLock) {
+                if (msg.what == NATIVE_EVENT_STREAM_END) {
+                    synchronized (mPlayStateLock) {
+                        if (mPlayState == PLAYSTATE_STOPPING) {
+                            if (mOffloadEosPending) {
+                                native_start();
+                                mPlayState = PLAYSTATE_PLAYING;
+                            } else {
+                                mAvSyncHeader = null;
+                                mAvSyncBytesRemaining = 0;
+                                mPlayState = PLAYSTATE_STOPPED;
+                            }
+                            mOffloadEosPending = false;
+                            mPlayStateLock.notify();
+                        }
+                    }
+                }
+                if (mStreamEventCbInfoList.size() == 0) {
+                    return;
+                }
+                cbInfoList = new LinkedList<StreamEventCbInfo>(mStreamEventCbInfoList);
+            }
+
+            final long identity = Binder.clearCallingIdentity();
+            try {
+                for (StreamEventCbInfo cbi : cbInfoList) {
+                    switch (msg.what) {
+                        case NATIVE_EVENT_CAN_WRITE_MORE_DATA:
+                            cbi.mStreamEventExec.execute(() ->
+                                    cbi.mStreamEventCb.onDataRequest(AudioTrack.this, msg.arg1));
+                            break;
+                        case NATIVE_EVENT_NEW_IAUDIOTRACK:
+                            // TODO also release track as it's not longer usable
+                            cbi.mStreamEventExec.execute(() ->
+                                    cbi.mStreamEventCb.onTearDown(AudioTrack.this));
+                            break;
+                        case NATIVE_EVENT_STREAM_END:
+                            cbi.mStreamEventExec.execute(() ->
+                                    cbi.mStreamEventCb.onPresentationEnded(AudioTrack.this));
+                            break;
+                    }
+                }
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+        }
+    }
+
+    @GuardedBy("mStreamEventCbLock")
+    private void beginStreamEventHandling() {
+        if (mStreamEventHandlerThread == null) {
+            mStreamEventHandlerThread = new HandlerThread(TAG + ".StreamEvent");
+            mStreamEventHandlerThread.start();
+            final Looper looper = mStreamEventHandlerThread.getLooper();
+            if (looper != null) {
+                mStreamEventHandler = new StreamEventHandler(looper);
+            }
+        }
+    }
+
+    @GuardedBy("mStreamEventCbLock")
+    private void endStreamEventHandling() {
+        if (mStreamEventHandlerThread != null) {
+            mStreamEventHandlerThread.quit();
+            mStreamEventHandlerThread = null;
+        }
     }
 
     //---------------------------------------------------------
@@ -2426,64 +3988,33 @@ public class AudioTrack
         }
     }
 
-    /**
-     * Helper class to handle the forwarding of native events to the appropriate listener
-     * (potentially) handled in a different thread
-     */
-    private class NativeRoutingEventHandlerDelegate {
-        private final Handler mHandler;
+    //---------------------------------------------------------
+    // Methods for IPlayer interface
+    //--------------------
+    @Override
+    void playerStart() {
+        play();
+    }
 
-        NativeRoutingEventHandlerDelegate(final AudioTrack track,
-                                   final OnRoutingChangedListener listener,
-                                   Handler handler) {
-            // find the looper for our new event handler
-            Looper looper;
-            if (handler != null) {
-                looper = handler.getLooper();
-            } else {
-                // no given handler, use the looper the AudioTrack was created in
-                looper = mInitializationLooper;
-            }
+    @Override
+    void playerPause() {
+        pause();
+    }
 
-            // construct the event handler with this looper
-            if (looper != null) {
-                // implement the event handler delegate
-                mHandler = new Handler(looper) {
-                    @Override
-                    public void handleMessage(Message msg) {
-                        if (track == null) {
-                            return;
-                        }
-                        switch(msg.what) {
-                        case AudioSystem.NATIVE_EVENT_ROUTING_CHANGE:
-                            if (listener != null) {
-                                listener.onRoutingChanged(track);
-                            }
-                            break;
-                        default:
-                            loge("Unknown native event type: " + msg.what);
-                            break;
-                        }
-                    }
-                };
-            } else {
-                mHandler = null;
-            }
-        }
-
-        Handler getHandler() {
-            return mHandler;
-        }
+    @Override
+    void playerStop() {
+        stop();
     }
 
     //---------------------------------------------------------
     // Java methods called from the native side
     //--------------------
     @SuppressWarnings("unused")
+    @UnsupportedAppUsage
     private static void postEventFromNative(Object audiotrack_ref,
             int what, int arg1, int arg2, Object obj) {
         //logd("Event posted from the native side: event="+ what + " args="+ arg1+" "+arg2);
-        AudioTrack track = (AudioTrack)((WeakReference)audiotrack_ref).get();
+        final AudioTrack track = (AudioTrack) ((WeakReference) audiotrack_ref).get();
         if (track == null) {
             return;
         }
@@ -2492,6 +4023,27 @@ public class AudioTrack
             track.broadcastRoutingChange();
             return;
         }
+
+        if (what == NATIVE_EVENT_CODEC_FORMAT_CHANGE) {
+            ByteBuffer buffer = (ByteBuffer) obj;
+            buffer.order(ByteOrder.nativeOrder());
+            buffer.rewind();
+            AudioMetadataReadMap audioMetaData = AudioMetadata.fromByteBuffer(buffer);
+            if (audioMetaData == null) {
+                Log.e(TAG, "Unable to get audio metadata from byte buffer");
+                return;
+            }
+            track.mCodecFormatChangedListeners.notify(0 /* eventCode, unused */, audioMetaData);
+            return;
+        }
+
+        if (what == NATIVE_EVENT_CAN_WRITE_MORE_DATA
+                || what == NATIVE_EVENT_NEW_IAUDIOTRACK
+                || what == NATIVE_EVENT_STREAM_END) {
+            track.handleStreamEventFromNative(what, arg1);
+            return;
+        }
+
         NativePositionEventHandlerDelegate delegate = track.mEventHandlerDelegate;
         if (delegate != null) {
             Handler handler = delegate.getHandler();
@@ -2502,22 +4054,29 @@ public class AudioTrack
         }
     }
 
-
     //---------------------------------------------------------
     // Native methods called from the Java side
     //--------------------
+
+    private static native boolean native_is_direct_output_supported(int encoding, int sampleRate,
+            int channelMask, int channelIndexMask, int contentType, int usage, int flags);
 
     // post-condition: mStreamType is overwritten with a value
     //     that reflects the audio attributes (e.g. an AudioAttributes object with a usage of
     //     AudioAttributes.USAGE_MEDIA will map to AudioManager.STREAM_MUSIC
     private native final int native_setup(Object /*WeakReference<AudioTrack>*/ audiotrack_this,
             Object /*AudioAttributes*/ attributes,
-            int sampleRate, int channelMask, int channelIndexMask, int audioFormat,
-            int buffSizeInBytes, int mode, int[] sessionId);
+            int[] sampleRate, int channelMask, int channelIndexMask, int audioFormat,
+            int buffSizeInBytes, int mode, int[] sessionId, long nativeAudioTrack,
+            boolean offload, int encapsulationMode, Object tunerConfiguration);
 
     private native final void native_finalize();
 
-    private native final void native_release();
+    /**
+     * @hide
+     */
+    @UnsupportedAppUsage
+    public native final void native_release();
 
     private native final void native_start();
 
@@ -2539,12 +4098,14 @@ public class AudioTrack
                                                 int offsetInFloats, int sizeInFloats, int format,
                                                 boolean isBlocking);
 
-    private native final int native_write_native_bytes(Object audioData,
+    private native final int native_write_native_bytes(ByteBuffer audioData,
             int positionInBytes, int sizeInBytes, int format, boolean blocking);
 
     private native final int native_reload_static();
 
-    private native final int native_get_native_frame_count();
+    private native final int native_get_buffer_size_frames();
+    private native final int native_set_buffer_size_frames(int bufferSizeInFrames);
+    private native final int native_get_buffer_capacity_frames();
 
     private native final void native_setVolume(float leftVolume, float rightVolume);
 
@@ -2565,6 +4126,10 @@ public class AudioTrack
 
     private native final int native_get_latency();
 
+    private native final int native_get_underrun_count();
+
+    private native final int native_get_flags();
+
     // longArray must be a non-null array of length >= 2
     // [0] is assigned the frame position
     // [1] is assigned the time in CLOCK_MONOTONIC nanoseconds
@@ -2584,6 +4149,22 @@ public class AudioTrack
     private native final void native_enableDeviceCallback();
     private native final void native_disableDeviceCallback();
 
+    private native int native_applyVolumeShaper(
+            @NonNull VolumeShaper.Configuration configuration,
+            @NonNull VolumeShaper.Operation operation);
+
+    private native @Nullable VolumeShaper.State native_getVolumeShaperState(int id);
+    private native final int native_setPresentation(int presentationId, int programId);
+
+    private native int native_getPortId();
+
+    private native void native_set_delay_padding(int delayInFrames, int paddingInFrames);
+
+    private native int native_set_audio_description_mix_level_db(float level);
+    private native int native_get_audio_description_mix_level_db(float[] level);
+    private native int native_set_dual_mono_mode(int dualMonoMode);
+    private native int native_get_dual_mono_mode(int[] dualMonoMode);
+
     //---------------------------------------------------------
     // Utility methods
     //------------------
@@ -2594,5 +4175,109 @@ public class AudioTrack
 
     private static void loge(String msg) {
         Log.e(TAG, msg);
+    }
+
+    public final static class MetricsConstants
+    {
+        private MetricsConstants() {}
+
+        // MM_PREFIX is slightly different than TAG, used to avoid cut-n-paste errors.
+        private static final String MM_PREFIX = "android.media.audiotrack.";
+
+        /**
+         * Key to extract the stream type for this track
+         * from the {@link AudioTrack#getMetrics} return value.
+         * This value may not exist in API level {@link android.os.Build.VERSION_CODES#P}.
+         * The value is a {@code String}.
+         */
+        public static final String STREAMTYPE = MM_PREFIX + "streamtype";
+
+        /**
+         * Key to extract the attribute content type for this track
+         * from the {@link AudioTrack#getMetrics} return value.
+         * The value is a {@code String}.
+         */
+        public static final String CONTENTTYPE = MM_PREFIX + "type";
+
+        /**
+         * Key to extract the attribute usage for this track
+         * from the {@link AudioTrack#getMetrics} return value.
+         * The value is a {@code String}.
+         */
+        public static final String USAGE = MM_PREFIX + "usage";
+
+        /**
+         * Key to extract the sample rate for this track in Hz
+         * from the {@link AudioTrack#getMetrics} return value.
+         * The value is an {@code int}.
+         * @deprecated This does not work. Use {@link AudioTrack#getSampleRate()} instead.
+         */
+        @Deprecated
+        public static final String SAMPLERATE = "android.media.audiorecord.samplerate";
+
+        /**
+         * Key to extract the native channel mask information for this track
+         * from the {@link AudioTrack#getMetrics} return value.
+         *
+         * The value is a {@code long}.
+         * @deprecated This does not work. Use {@link AudioTrack#getFormat()} and read from
+         * the returned format instead.
+         */
+        @Deprecated
+        public static final String CHANNELMASK = "android.media.audiorecord.channelmask";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The current sample rate.
+         * The value is an {@code int}.
+         * @hide
+         */
+        @TestApi
+        public static final String SAMPLE_RATE = MM_PREFIX + "sampleRate";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The native channel mask.
+         * The value is a {@code long}.
+         * @hide
+         */
+        @TestApi
+        public static final String CHANNEL_MASK = MM_PREFIX + "channelMask";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The output audio data encoding.
+         * The value is a {@code String}.
+         * @hide
+         */
+        @TestApi
+        public static final String ENCODING = MM_PREFIX + "encoding";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The port id of this track port in audioserver.
+         * The value is an {@code int}.
+         * @hide
+         */
+        @TestApi
+        public static final String PORT_ID = MM_PREFIX + "portId";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The buffer frameCount.
+         * The value is an {@code int}.
+         * @hide
+         */
+        @TestApi
+        public static final String FRAME_COUNT = MM_PREFIX + "frameCount";
+
+        /**
+         * Use for testing only. Do not expose.
+         * The actual track attributes used.
+         * The value is a {@code String}.
+         * @hide
+         */
+        @TestApi
+        public static final String ATTRIBUTES = MM_PREFIX + "attributes";
     }
 }

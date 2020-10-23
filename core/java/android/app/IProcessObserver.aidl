@@ -18,9 +18,7 @@ package android.app;
 
 /** {@hide} */
 oneway interface IProcessObserver {
-
     void onForegroundActivitiesChanged(int pid, int uid, boolean foregroundActivities);
-    void onProcessStateChanged(int pid, int uid, int procState);
+    void onForegroundServicesChanged(int pid, int uid, int serviceTypes);
     void onProcessDied(int pid, int uid);
-
 }

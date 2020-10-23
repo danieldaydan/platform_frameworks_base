@@ -22,10 +22,20 @@ import android.media.AudioFocusInfo;
  */
 oneway interface IAudioPolicyCallback {
 
-    // callbacks for audio focus
+    // callbacks for audio focus listening
     void notifyAudioFocusGrant(in AudioFocusInfo afi, int requestResult);
     void notifyAudioFocusLoss(in AudioFocusInfo afi, boolean wasNotified);
+    // callback for audio focus policy
+    void notifyAudioFocusRequest(in AudioFocusInfo afi, int requestResult);
+    void notifyAudioFocusAbandon(in AudioFocusInfo afi);
 
     // callback for mix activity status update
     void notifyMixStateUpdate(in String regId, int state);
+
+    // callback for volume events
+    void notifyVolumeAdjust(int adjustment);
+
+    // callback for unregistration (e.g. if policy couldn't automatically be re-registered after
+    // an audioserver crash)
+    void notifyUnregistration();
 }

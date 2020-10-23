@@ -28,47 +28,55 @@ oneway interface IAccountAuthenticator {
     /**
      * prompts the user for account information and adds the result to the IAccountManager
      */
+    @UnsupportedAppUsage
     void addAccount(in IAccountAuthenticatorResponse response, String accountType,
         String authTokenType, in String[] requiredFeatures, in Bundle options);
 
     /**
      * prompts the user for the credentials of the account
      */
+    @UnsupportedAppUsage
     void confirmCredentials(in IAccountAuthenticatorResponse response, in Account account,
         in Bundle options);
 
     /**
      * gets the password by either prompting the user or querying the IAccountManager
      */
+    @UnsupportedAppUsage
     void getAuthToken(in IAccountAuthenticatorResponse response, in Account account,
         String authTokenType, in Bundle options);
 
     /**
      * Gets the user-visible label of the given authtoken type.
      */
+    @UnsupportedAppUsage
     void getAuthTokenLabel(in IAccountAuthenticatorResponse response, String authTokenType);
 
     /**
      * prompts the user for a new password and writes it to the IAccountManager
      */
+    @UnsupportedAppUsage
     void updateCredentials(in IAccountAuthenticatorResponse response, in Account account,
         String authTokenType, in Bundle options);
 
     /**
      * launches an activity that lets the user edit and set the properties for an authenticator
      */
+    @UnsupportedAppUsage
     void editProperties(in IAccountAuthenticatorResponse response, String accountType);
 
     /**
      * returns a Bundle where the boolean value BOOLEAN_RESULT_KEY is set if the account has the
      * specified features
      */
+    @UnsupportedAppUsage
     void hasFeatures(in IAccountAuthenticatorResponse response, in Account account, 
         in String[] features);
 
     /**
      * Gets whether or not the account is allowed to be removed.
      */
+    @UnsupportedAppUsage
     void getAccountRemovalAllowed(in IAccountAuthenticatorResponse response, in Account account);
 
     /**
@@ -83,4 +91,31 @@ oneway interface IAccountAuthenticator {
      */
     void addAccountFromCredentials(in IAccountAuthenticatorResponse response, in Account account,
             in Bundle accountCredentials);
+
+    /**
+     * Starts the add account session by prompting the user for account information
+     * and return a Bundle containing data to finish the session later.
+     */
+    void startAddAccountSession(in IAccountAuthenticatorResponse response, String accountType,
+        String authTokenType, in String[] requiredFeatures, in Bundle options);
+
+    /**
+     * Prompts the user for a new password but does not write it to the IAccountManager.
+     */
+    void startUpdateCredentialsSession(in IAccountAuthenticatorResponse response, in Account account,
+        String authTokenType, in Bundle options);
+
+    /**
+     * Finishes the session started by startAddAccountSession(...) or
+     * startUpdateCredentialsSession(...) by adding account to or updating local credentials
+     * in the IAccountManager.
+     */
+    void finishSession(in IAccountAuthenticatorResponse response, String accountType,
+        in Bundle sessionBundle);
+
+    /**
+     * Checks if the credentials of the provided account should be updated.
+     */
+    void isCredentialsUpdateSuggested(in IAccountAuthenticatorResponse response, in Account account,
+        String statusToken);
 }

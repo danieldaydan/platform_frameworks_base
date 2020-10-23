@@ -15,591 +15,201 @@
  */
 
 #define LOG_TAG "PointerController"
-
 //#define LOG_NDEBUG 0
 
 // Log debug messages about pointer updates
 #define DEBUG_POINTER_UPDATES 0
 
 #include "PointerController.h"
+#include "MouseCursorController.h"
+#include "PointerControllerContext.h"
+#include "TouchSpotController.h"
 
-#include <cutils/log.h>
+#include <log/log.h>
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <SkBitmap.h>
+#include <SkBlendMode.h>
 #include <SkCanvas.h>
 #include <SkColor.h>
 #include <SkPaint.h>
-#include <SkXfermode.h>
-#pragma GCC diagnostic pop
 
 namespace android {
 
 // --- PointerController ---
 
-// Time to wait before starting the fade when the pointer is inactive.
-static const nsecs_t INACTIVITY_TIMEOUT_DELAY_TIME_NORMAL = 15 * 1000 * 1000000LL; // 15 seconds
-static const nsecs_t INACTIVITY_TIMEOUT_DELAY_TIME_SHORT = 3 * 1000 * 1000000LL; // 3 seconds
+std::shared_ptr<PointerController> PointerController::create(
+        const sp<PointerControllerPolicyInterface>& policy, const sp<Looper>& looper,
+        const sp<SpriteController>& spriteController) {
+    // using 'new' to access non-public constructor
+    std::shared_ptr<PointerController> controller = std::shared_ptr<PointerController>(
+            new PointerController(policy, looper, spriteController));
 
-// Time to wait between animation frames.
-static const nsecs_t ANIMATION_FRAME_INTERVAL = 1000000000LL / 60;
+    /*
+     * Now we need to hook up the constructed PointerController object to its callbacks.
+     *
+     * This must be executed after the constructor but before any other methods on PointerController
+     * in order to ensure that the fully constructed object is visible on the Looper thread, since
+     * that may be a different thread than where the PointerController is initially constructed.
+     *
+     * Unfortunately, this cannot be done as part of the constructor since we need to hand out
+     * weak_ptr's which themselves cannot be constructed until there's at least one shared_ptr.
+     */
 
-// Time to spend fading out the spot completely.
-static const nsecs_t SPOT_FADE_DURATION = 200 * 1000000LL; // 200 ms
-
-// Time to spend fading out the pointer completely.
-static const nsecs_t POINTER_FADE_DURATION = 500 * 1000000LL; // 500 ms
-
-
-// --- PointerController ---
+    controller->mContext.setHandlerController(controller);
+    controller->mContext.setCallbackController(controller);
+    return controller;
+}
 
 PointerController::PointerController(const sp<PointerControllerPolicyInterface>& policy,
-        const sp<Looper>& looper, const sp<SpriteController>& spriteController) :
-        mPolicy(policy), mLooper(looper), mSpriteController(spriteController) {
-    mHandler = new WeakMessageHandler(this);
-
-    AutoMutex _l(mLock);
-
-    mLocked.animationPending = false;
-
-    mLocked.displayWidth = -1;
-    mLocked.displayHeight = -1;
-    mLocked.displayOrientation = DISPLAY_ORIENTATION_0;
-
-    mLocked.presentation = PRESENTATION_POINTER;
-    mLocked.presentationChanged = false;
-
-    mLocked.inactivityTimeout = INACTIVITY_TIMEOUT_NORMAL;
-
-    mLocked.pointerFadeDirection = 0;
-    mLocked.pointerX = 0;
-    mLocked.pointerY = 0;
-    mLocked.pointerAlpha = 0.0f; // pointer is initially faded
-    mLocked.pointerSprite = mSpriteController->createSprite();
-    mLocked.pointerIconChanged = false;
-
-    mLocked.buttonState = 0;
-
-    loadResources();
+                                     const sp<Looper>& looper,
+                                     const sp<SpriteController>& spriteController)
+      : mContext(policy, looper, spriteController, *this), mCursorController(mContext) {
+    std::scoped_lock lock(mLock);
+    mLocked.presentation = Presentation::SPOT;
 }
 
-PointerController::~PointerController() {
-    mLooper->removeMessages(mHandler);
-
-    AutoMutex _l(mLock);
-
-    mLocked.pointerSprite.clear();
-
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        delete mLocked.spots.itemAt(i);
-    }
-    mLocked.spots.clear();
-    mLocked.recycledSprites.clear();
-}
-
-bool PointerController::getBounds(float* outMinX, float* outMinY,
-        float* outMaxX, float* outMaxY) const {
-    AutoMutex _l(mLock);
-
-    return getBoundsLocked(outMinX, outMinY, outMaxX, outMaxY);
-}
-
-bool PointerController::getBoundsLocked(float* outMinX, float* outMinY,
-        float* outMaxX, float* outMaxY) const {
-    if (mLocked.displayWidth <= 0 || mLocked.displayHeight <= 0) {
-        return false;
-    }
-
-    *outMinX = 0;
-    *outMinY = 0;
-    switch (mLocked.displayOrientation) {
-    case DISPLAY_ORIENTATION_90:
-    case DISPLAY_ORIENTATION_270:
-        *outMaxX = mLocked.displayHeight - 1;
-        *outMaxY = mLocked.displayWidth - 1;
-        break;
-    default:
-        *outMaxX = mLocked.displayWidth - 1;
-        *outMaxY = mLocked.displayHeight - 1;
-        break;
-    }
-    return true;
+bool PointerController::getBounds(float* outMinX, float* outMinY, float* outMaxX,
+                                  float* outMaxY) const {
+    return mCursorController.getBounds(outMinX, outMinY, outMaxX, outMaxY);
 }
 
 void PointerController::move(float deltaX, float deltaY) {
-#if DEBUG_POINTER_UPDATES
-    ALOGD("Move pointer by deltaX=%0.3f, deltaY=%0.3f", deltaX, deltaY);
-#endif
-    if (deltaX == 0.0f && deltaY == 0.0f) {
-        return;
-    }
-
-    AutoMutex _l(mLock);
-
-    setPositionLocked(mLocked.pointerX + deltaX, mLocked.pointerY + deltaY);
+    mCursorController.move(deltaX, deltaY);
 }
 
 void PointerController::setButtonState(int32_t buttonState) {
-#if DEBUG_POINTER_UPDATES
-    ALOGD("Set button state 0x%08x", buttonState);
-#endif
-    AutoMutex _l(mLock);
-
-    if (mLocked.buttonState != buttonState) {
-        mLocked.buttonState = buttonState;
-    }
+    mCursorController.setButtonState(buttonState);
 }
 
 int32_t PointerController::getButtonState() const {
-    AutoMutex _l(mLock);
-
-    return mLocked.buttonState;
+    return mCursorController.getButtonState();
 }
 
 void PointerController::setPosition(float x, float y) {
-#if DEBUG_POINTER_UPDATES
-    ALOGD("Set pointer position to x=%0.3f, y=%0.3f", x, y);
-#endif
-    AutoMutex _l(mLock);
-
-    setPositionLocked(x, y);
-}
-
-void PointerController::setPositionLocked(float x, float y) {
-    float minX, minY, maxX, maxY;
-    if (getBoundsLocked(&minX, &minY, &maxX, &maxY)) {
-        if (x <= minX) {
-            mLocked.pointerX = minX;
-        } else if (x >= maxX) {
-            mLocked.pointerX = maxX;
-        } else {
-            mLocked.pointerX = x;
-        }
-        if (y <= minY) {
-            mLocked.pointerY = minY;
-        } else if (y >= maxY) {
-            mLocked.pointerY = maxY;
-        } else {
-            mLocked.pointerY = y;
-        }
-        updatePointerLocked();
-    }
+    std::scoped_lock lock(mLock);
+    mCursorController.setPosition(x, y);
 }
 
 void PointerController::getPosition(float* outX, float* outY) const {
-    AutoMutex _l(mLock);
+    mCursorController.getPosition(outX, outY);
+}
 
-    *outX = mLocked.pointerX;
-    *outY = mLocked.pointerY;
+int32_t PointerController::getDisplayId() const {
+    return mCursorController.getDisplayId();
 }
 
 void PointerController::fade(Transition transition) {
-    AutoMutex _l(mLock);
-
-    // Remove the inactivity timeout, since we are fading now.
-    removeInactivityTimeoutLocked();
-
-    // Start fading.
-    if (transition == TRANSITION_IMMEDIATE) {
-        mLocked.pointerFadeDirection = 0;
-        mLocked.pointerAlpha = 0.0f;
-        updatePointerLocked();
-    } else {
-        mLocked.pointerFadeDirection = -1;
-        startAnimationLocked();
-    }
+    std::scoped_lock lock(mLock);
+    mCursorController.fade(transition);
 }
 
 void PointerController::unfade(Transition transition) {
-    AutoMutex _l(mLock);
-
-    // Always reset the inactivity timer.
-    resetInactivityTimeoutLocked();
-
-    // Start unfading.
-    if (transition == TRANSITION_IMMEDIATE) {
-        mLocked.pointerFadeDirection = 0;
-        mLocked.pointerAlpha = 1.0f;
-        updatePointerLocked();
-    } else {
-        mLocked.pointerFadeDirection = 1;
-        startAnimationLocked();
-    }
+    std::scoped_lock lock(mLock);
+    mCursorController.unfade(transition);
 }
 
 void PointerController::setPresentation(Presentation presentation) {
-    AutoMutex _l(mLock);
+    std::scoped_lock lock(mLock);
 
-    if (mLocked.presentation != presentation) {
-        mLocked.presentation = presentation;
-        mLocked.presentationChanged = true;
+    if (mLocked.presentation == presentation) {
+        return;
+    }
 
-        if (presentation != PRESENTATION_SPOT) {
-            fadeOutAndReleaseAllSpotsLocked();
-        }
+    mLocked.presentation = presentation;
 
-        updatePointerLocked();
+    if (!mCursorController.isViewportValid()) {
+        return;
+    }
+
+    if (presentation == Presentation::POINTER) {
+        mCursorController.getAdditionalMouseResources();
+        clearSpotsLocked();
     }
 }
 
-void PointerController::setSpots(const PointerCoords* spotCoords,
-        const uint32_t* spotIdToIndex, BitSet32 spotIdBits) {
-#if DEBUG_POINTER_UPDATES
-    ALOGD("setSpots: idBits=%08x", spotIdBits.value);
-    for (BitSet32 idBits(spotIdBits); !idBits.isEmpty(); ) {
-        uint32_t id = idBits.firstMarkedBit();
-        idBits.clearBit(id);
-        const PointerCoords& c = spotCoords[spotIdToIndex[id]];
-        ALOGD(" spot %d: position=(%0.3f, %0.3f), pressure=%0.3f", id,
-                c.getAxisValue(AMOTION_EVENT_AXIS_X),
-                c.getAxisValue(AMOTION_EVENT_AXIS_Y),
-                c.getAxisValue(AMOTION_EVENT_AXIS_PRESSURE));
+void PointerController::setSpots(const PointerCoords* spotCoords, const uint32_t* spotIdToIndex,
+                                 BitSet32 spotIdBits, int32_t displayId) {
+    std::scoped_lock lock(mLock);
+    auto it = mLocked.spotControllers.find(displayId);
+    if (it == mLocked.spotControllers.end()) {
+        mLocked.spotControllers.try_emplace(displayId, displayId, mContext);
     }
-#endif
-
-    AutoMutex _l(mLock);
-
-    mSpriteController->openTransaction();
-
-    // Add or move spots for fingers that are down.
-    for (BitSet32 idBits(spotIdBits); !idBits.isEmpty(); ) {
-        uint32_t id = idBits.clearFirstMarkedBit();
-        const PointerCoords& c = spotCoords[spotIdToIndex[id]];
-        const SpriteIcon& icon = c.getAxisValue(AMOTION_EVENT_AXIS_PRESSURE) > 0
-                ? mResources.spotTouch : mResources.spotHover;
-        float x = c.getAxisValue(AMOTION_EVENT_AXIS_X);
-        float y = c.getAxisValue(AMOTION_EVENT_AXIS_Y);
-
-        Spot* spot = getSpotLocked(id);
-        if (!spot) {
-            spot = createAndAddSpotLocked(id);
-        }
-
-        spot->updateSprite(&icon, x, y);
-    }
-
-    // Remove spots for fingers that went up.
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        Spot* spot = mLocked.spots.itemAt(i);
-        if (spot->id != Spot::INVALID_ID
-                && !spotIdBits.hasBit(spot->id)) {
-            fadeOutAndReleaseSpotLocked(spot);
-        }
-    }
-
-    mSpriteController->closeTransaction();
+    mLocked.spotControllers.at(displayId).setSpots(spotCoords, spotIdToIndex, spotIdBits);
 }
 
 void PointerController::clearSpots() {
-#if DEBUG_POINTER_UPDATES
-    ALOGD("clearSpots");
-#endif
+    std::scoped_lock lock(mLock);
+    clearSpotsLocked();
+}
 
-    AutoMutex _l(mLock);
-
-    fadeOutAndReleaseAllSpotsLocked();
+void PointerController::clearSpotsLocked() REQUIRES(mLock) {
+    for (auto& [displayID, spotController] : mLocked.spotControllers) {
+        spotController.clearSpots();
+    }
 }
 
 void PointerController::setInactivityTimeout(InactivityTimeout inactivityTimeout) {
-    AutoMutex _l(mLock);
+    mContext.setInactivityTimeout(inactivityTimeout);
+}
 
-    if (mLocked.inactivityTimeout != inactivityTimeout) {
-        mLocked.inactivityTimeout = inactivityTimeout;
-        resetInactivityTimeoutLocked();
+void PointerController::reloadPointerResources() {
+    std::scoped_lock lock(mLock);
+
+    for (auto& [displayID, spotController] : mLocked.spotControllers) {
+        spotController.reloadSpotResources();
+    }
+
+    if (mCursorController.resourcesLoaded()) {
+        bool getAdditionalMouseResources = false;
+        if (mLocked.presentation == PointerController::Presentation::POINTER) {
+            getAdditionalMouseResources = true;
+        }
+        mCursorController.reloadPointerResources(getAdditionalMouseResources);
     }
 }
 
-void PointerController::setDisplayViewport(int32_t width, int32_t height, int32_t orientation) {
-    AutoMutex _l(mLock);
+void PointerController::setDisplayViewport(const DisplayViewport& viewport) {
+    std::scoped_lock lock(mLock);
 
-    // Adjust to use the display's unrotated coordinate frame.
-    if (orientation == DISPLAY_ORIENTATION_90
-            || orientation == DISPLAY_ORIENTATION_270) {
-        int32_t temp = height;
-        height = width;
-        width = temp;
+    bool getAdditionalMouseResources = false;
+    if (mLocked.presentation == PointerController::Presentation::POINTER) {
+        getAdditionalMouseResources = true;
     }
-
-    if (mLocked.displayWidth != width || mLocked.displayHeight != height) {
-        mLocked.displayWidth = width;
-        mLocked.displayHeight = height;
-
-        float minX, minY, maxX, maxY;
-        if (getBoundsLocked(&minX, &minY, &maxX, &maxY)) {
-            mLocked.pointerX = (minX + maxX) * 0.5f;
-            mLocked.pointerY = (minY + maxY) * 0.5f;
-        } else {
-            mLocked.pointerX = 0;
-            mLocked.pointerY = 0;
-        }
-
-        fadeOutAndReleaseAllSpotsLocked();
-    }
-
-    if (mLocked.displayOrientation != orientation) {
-        // Apply offsets to convert from the pixel top-left corner position to the pixel center.
-        // This creates an invariant frame of reference that we can easily rotate when
-        // taking into account that the pointer may be located at fractional pixel offsets.
-        float x = mLocked.pointerX + 0.5f;
-        float y = mLocked.pointerY + 0.5f;
-        float temp;
-
-        // Undo the previous rotation.
-        switch (mLocked.displayOrientation) {
-        case DISPLAY_ORIENTATION_90:
-            temp = x;
-            x = mLocked.displayWidth - y;
-            y = temp;
-            break;
-        case DISPLAY_ORIENTATION_180:
-            x = mLocked.displayWidth - x;
-            y = mLocked.displayHeight - y;
-            break;
-        case DISPLAY_ORIENTATION_270:
-            temp = x;
-            x = y;
-            y = mLocked.displayHeight - temp;
-            break;
-        }
-
-        // Perform the new rotation.
-        switch (orientation) {
-        case DISPLAY_ORIENTATION_90:
-            temp = x;
-            x = y;
-            y = mLocked.displayWidth - temp;
-            break;
-        case DISPLAY_ORIENTATION_180:
-            x = mLocked.displayWidth - x;
-            y = mLocked.displayHeight - y;
-            break;
-        case DISPLAY_ORIENTATION_270:
-            temp = x;
-            x = mLocked.displayHeight - y;
-            y = temp;
-            break;
-        }
-
-        // Apply offsets to convert from the pixel center to the pixel top-left corner position
-        // and save the results.
-        mLocked.pointerX = x - 0.5f;
-        mLocked.pointerY = y - 0.5f;
-        mLocked.displayOrientation = orientation;
-    }
-
-    updatePointerLocked();
+    mCursorController.setDisplayViewport(viewport, getAdditionalMouseResources);
 }
 
-void PointerController::setPointerIcon(const SpriteIcon& icon) {
-    AutoMutex _l(mLock);
-
-    mLocked.pointerIcon = icon.copy();
-    mLocked.pointerIconChanged = true;
-
-    updatePointerLocked();
+void PointerController::updatePointerIcon(int32_t iconId) {
+    std::scoped_lock lock(mLock);
+    mCursorController.updatePointerIcon(iconId);
 }
 
-void PointerController::handleMessage(const Message& message) {
-    switch (message.what) {
-    case MSG_ANIMATE:
-        doAnimate();
-        break;
-    case MSG_INACTIVITY_TIMEOUT:
-        doInactivityTimeout();
-        break;
-    }
-}
-
-void PointerController::doAnimate() {
-    AutoMutex _l(mLock);
-
-    bool keepAnimating = false;
-    mLocked.animationPending = false;
-    nsecs_t frameDelay = systemTime(SYSTEM_TIME_MONOTONIC) - mLocked.animationTime;
-
-    // Animate pointer fade.
-    if (mLocked.pointerFadeDirection < 0) {
-        mLocked.pointerAlpha -= float(frameDelay) / POINTER_FADE_DURATION;
-        if (mLocked.pointerAlpha <= 0.0f) {
-            mLocked.pointerAlpha = 0.0f;
-            mLocked.pointerFadeDirection = 0;
-        } else {
-            keepAnimating = true;
-        }
-        updatePointerLocked();
-    } else if (mLocked.pointerFadeDirection > 0) {
-        mLocked.pointerAlpha += float(frameDelay) / POINTER_FADE_DURATION;
-        if (mLocked.pointerAlpha >= 1.0f) {
-            mLocked.pointerAlpha = 1.0f;
-            mLocked.pointerFadeDirection = 0;
-        } else {
-            keepAnimating = true;
-        }
-        updatePointerLocked();
-    }
-
-    // Animate spots that are fading out and being removed.
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        Spot* spot = mLocked.spots.itemAt(i);
-        if (spot->id == Spot::INVALID_ID) {
-            spot->alpha -= float(frameDelay) / SPOT_FADE_DURATION;
-            if (spot->alpha <= 0) {
-                mLocked.spots.removeAt(i--);
-                releaseSpotLocked(spot);
-            } else {
-                spot->sprite->setAlpha(spot->alpha);
-                keepAnimating = true;
-            }
-        }
-    }
-
-    if (keepAnimating) {
-        startAnimationLocked();
-    }
+void PointerController::setCustomPointerIcon(const SpriteIcon& icon) {
+    std::scoped_lock lock(mLock);
+    mCursorController.setCustomPointerIcon(icon);
 }
 
 void PointerController::doInactivityTimeout() {
-    fade(TRANSITION_GRADUAL);
+    fade(Transition::GRADUAL);
 }
 
-void PointerController::startAnimationLocked() {
-    if (!mLocked.animationPending) {
-        mLocked.animationPending = true;
-        mLocked.animationTime = systemTime(SYSTEM_TIME_MONOTONIC);
-        mLooper->sendMessageDelayed(ANIMATION_FRAME_INTERVAL, mHandler, Message(MSG_ANIMATE));
-    }
-}
-
-void PointerController::resetInactivityTimeoutLocked() {
-    mLooper->removeMessages(mHandler, MSG_INACTIVITY_TIMEOUT);
-
-    nsecs_t timeout = mLocked.inactivityTimeout == INACTIVITY_TIMEOUT_SHORT
-            ? INACTIVITY_TIMEOUT_DELAY_TIME_SHORT : INACTIVITY_TIMEOUT_DELAY_TIME_NORMAL;
-    mLooper->sendMessageDelayed(timeout, mHandler, MSG_INACTIVITY_TIMEOUT);
-}
-
-void PointerController::removeInactivityTimeoutLocked() {
-    mLooper->removeMessages(mHandler, MSG_INACTIVITY_TIMEOUT);
-}
-
-void PointerController::updatePointerLocked() {
-    mSpriteController->openTransaction();
-
-    mLocked.pointerSprite->setLayer(Sprite::BASE_LAYER_POINTER);
-    mLocked.pointerSprite->setPosition(mLocked.pointerX, mLocked.pointerY);
-
-    if (mLocked.pointerAlpha > 0) {
-        mLocked.pointerSprite->setAlpha(mLocked.pointerAlpha);
-        mLocked.pointerSprite->setVisible(true);
-    } else {
-        mLocked.pointerSprite->setVisible(false);
+void PointerController::onDisplayViewportsUpdated(std::vector<DisplayViewport>& viewports) {
+    std::unordered_set<int32_t> displayIdSet;
+    for (DisplayViewport viewport : viewports) {
+        displayIdSet.insert(viewport.displayId);
     }
 
-    if (mLocked.pointerIconChanged || mLocked.presentationChanged) {
-        mLocked.pointerSprite->setIcon(mLocked.presentation == PRESENTATION_POINTER
-                ? mLocked.pointerIcon : mResources.spotAnchor);
-        mLocked.pointerIconChanged = false;
-        mLocked.presentationChanged = false;
-    }
-
-    mSpriteController->closeTransaction();
-}
-
-PointerController::Spot* PointerController::getSpotLocked(uint32_t id) {
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        Spot* spot = mLocked.spots.itemAt(i);
-        if (spot->id == id) {
-            return spot;
-        }
-    }
-    return NULL;
-}
-
-PointerController::Spot* PointerController::createAndAddSpotLocked(uint32_t id) {
-    // Remove spots until we have fewer than MAX_SPOTS remaining.
-    while (mLocked.spots.size() >= MAX_SPOTS) {
-        Spot* spot = removeFirstFadingSpotLocked();
-        if (!spot) {
-            spot = mLocked.spots.itemAt(0);
-            mLocked.spots.removeAt(0);
-        }
-        releaseSpotLocked(spot);
-    }
-
-    // Obtain a sprite from the recycled pool.
-    sp<Sprite> sprite;
-    if (! mLocked.recycledSprites.isEmpty()) {
-        sprite = mLocked.recycledSprites.top();
-        mLocked.recycledSprites.pop();
-    } else {
-        sprite = mSpriteController->createSprite();
-    }
-
-    // Return the new spot.
-    Spot* spot = new Spot(id, sprite);
-    mLocked.spots.push(spot);
-    return spot;
-}
-
-PointerController::Spot* PointerController::removeFirstFadingSpotLocked() {
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        Spot* spot = mLocked.spots.itemAt(i);
-        if (spot->id == Spot::INVALID_ID) {
-            mLocked.spots.removeAt(i);
-            return spot;
-        }
-    }
-    return NULL;
-}
-
-void PointerController::releaseSpotLocked(Spot* spot) {
-    spot->sprite->clearIcon();
-
-    if (mLocked.recycledSprites.size() < MAX_RECYCLED_SPRITES) {
-        mLocked.recycledSprites.push(spot->sprite);
-    }
-
-    delete spot;
-}
-
-void PointerController::fadeOutAndReleaseSpotLocked(Spot* spot) {
-    if (spot->id != Spot::INVALID_ID) {
-        spot->id = Spot::INVALID_ID;
-        startAnimationLocked();
-    }
-}
-
-void PointerController::fadeOutAndReleaseAllSpotsLocked() {
-    for (size_t i = 0; i < mLocked.spots.size(); i++) {
-        Spot* spot = mLocked.spots.itemAt(i);
-        fadeOutAndReleaseSpotLocked(spot);
-    }
-}
-
-void PointerController::loadResources() {
-    mPolicy->loadPointerResources(&mResources);
-}
-
-
-// --- PointerController::Spot ---
-
-void PointerController::Spot::updateSprite(const SpriteIcon* icon, float x, float y) {
-    sprite->setLayer(Sprite::BASE_LAYER_SPOT + id);
-    sprite->setAlpha(alpha);
-    sprite->setTransformationMatrix(SpriteTransformationMatrix(scale, 0.0f, 0.0f, scale));
-    sprite->setPosition(x, y);
-
-    this->x = x;
-    this->y = y;
-
-    if (icon != lastIcon) {
-        lastIcon = icon;
-        if (icon) {
-            sprite->setIcon(*icon);
-            sprite->setVisible(true);
+    std::scoped_lock lock(mLock);
+    for (auto it = mLocked.spotControllers.begin(); it != mLocked.spotControllers.end();) {
+        int32_t displayID = it->first;
+        if (!displayIdSet.count(displayID)) {
+            /*
+             * Ensures that an in-progress animation won't dereference
+             * a null pointer to TouchSpotController.
+             */
+            mContext.removeAnimationCallback(displayID);
+            it = mLocked.spotControllers.erase(it);
         } else {
-            sprite->setVisible(false);
+            ++it;
         }
     }
 }

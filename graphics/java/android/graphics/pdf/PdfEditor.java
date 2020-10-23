@@ -23,10 +23,10 @@ import android.graphics.Point;
 import android.graphics.Rect;
 import android.os.ParcelFileDescriptor;
 import android.system.ErrnoException;
+import android.system.Os;
 import android.system.OsConstants;
 import dalvik.system.CloseGuard;
 import libcore.io.IoUtils;
-import libcore.io.Libcore;
 
 import java.io.IOException;
 
@@ -39,7 +39,7 @@ public final class PdfEditor {
 
     private final CloseGuard mCloseGuard = CloseGuard.get();
 
-    private final long mNativeDocument;
+    private long mNativeDocument;
 
     private int mPageCount;
 
@@ -72,15 +72,24 @@ public final class PdfEditor {
 
         final long size;
         try {
-            Libcore.os.lseek(input.getFileDescriptor(), 0, OsConstants.SEEK_SET);
-            size = Libcore.os.fstat(input.getFileDescriptor()).st_size;
+            Os.lseek(input.getFileDescriptor(), 0, OsConstants.SEEK_SET);
+            size = Os.fstat(input.getFileDescriptor()).st_size;
         } catch (ErrnoException ee) {
             throw new IllegalArgumentException("file descriptor not seekable");
         }
-
         mInput = input;
-        mNativeDocument = nativeOpen(mInput.getFd(), size);
-        mPageCount = nativeGetPageCount(mNativeDocument);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            mNativeDocument = nativeOpen(mInput.getFd(), size);
+            try {
+                mPageCount = nativeGetPageCount(mNativeDocument);
+            } catch (Throwable t) {
+                nativeClose(mNativeDocument);
+                mNativeDocument = 0;
+                throw t;
+            }
+        }
+
         mCloseGuard.open("close");
     }
 
@@ -102,7 +111,10 @@ public final class PdfEditor {
     public void removePage(int pageIndex) {
         throwIfClosed();
         throwIfPageNotInDocument(pageIndex);
-        mPageCount = nativeRemovePage(mNativeDocument, pageIndex);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            mPageCount = nativeRemovePage(mNativeDocument, pageIndex);
+        }
     }
 
     /**
@@ -125,11 +137,16 @@ public final class PdfEditor {
         if (clip == null) {
             Point size = new Point();
             getPageSize(pageIndex, size);
-            nativeSetTransformAndClip(mNativeDocument, pageIndex, transform.native_instance,
-                    0, 0, size.x, size.y);
+
+            synchronized (PdfRenderer.sPdfiumLock) {
+                nativeSetTransformAndClip(mNativeDocument, pageIndex, transform.native_instance,
+                        0, 0, size.x, size.y);
+            }
         } else {
-            nativeSetTransformAndClip(mNativeDocument, pageIndex, transform.native_instance,
-                    clip.left, clip.top, clip.right, clip.bottom);
+            synchronized (PdfRenderer.sPdfiumLock) {
+                nativeSetTransformAndClip(mNativeDocument, pageIndex, transform.native_instance,
+                        clip.left, clip.top, clip.right, clip.bottom);
+            }
         }
     }
 
@@ -143,7 +160,10 @@ public final class PdfEditor {
         throwIfClosed();
         throwIfOutSizeNull(outSize);
         throwIfPageNotInDocument(pageIndex);
-        nativeGetPageSize(mNativeDocument, pageIndex, outSize);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            nativeGetPageSize(mNativeDocument, pageIndex, outSize);
+        }
     }
 
     /**
@@ -156,7 +176,10 @@ public final class PdfEditor {
         throwIfClosed();
         throwIfOutMediaBoxNull(outMediaBox);
         throwIfPageNotInDocument(pageIndex);
-        return nativeGetPageMediaBox(mNativeDocument, pageIndex, outMediaBox);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            return nativeGetPageMediaBox(mNativeDocument, pageIndex, outMediaBox);
+        }
     }
 
     /**
@@ -169,7 +192,10 @@ public final class PdfEditor {
         throwIfClosed();
         throwIfMediaBoxNull(mediaBox);
         throwIfPageNotInDocument(pageIndex);
-        nativeSetPageMediaBox(mNativeDocument, pageIndex, mediaBox);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            nativeSetPageMediaBox(mNativeDocument, pageIndex, mediaBox);
+        }
     }
 
     /**
@@ -182,7 +208,10 @@ public final class PdfEditor {
         throwIfClosed();
         throwIfOutCropBoxNull(outCropBox);
         throwIfPageNotInDocument(pageIndex);
-        return nativeGetPageCropBox(mNativeDocument, pageIndex, outCropBox);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            return nativeGetPageCropBox(mNativeDocument, pageIndex, outCropBox);
+        }
     }
 
     /**
@@ -195,7 +224,10 @@ public final class PdfEditor {
         throwIfClosed();
         throwIfCropBoxNull(cropBox);
         throwIfPageNotInDocument(pageIndex);
-        nativeSetPageCropBox(mNativeDocument, pageIndex, cropBox);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            nativeSetPageCropBox(mNativeDocument, pageIndex, cropBox);
+        }
     }
 
     /**
@@ -205,7 +237,10 @@ public final class PdfEditor {
      */
     public boolean shouldScaleForPrinting() {
         throwIfClosed();
-        return nativeScaleForPrinting(mNativeDocument);
+
+        synchronized (PdfRenderer.sPdfiumLock) {
+            return nativeScaleForPrinting(mNativeDocument);
+        }
     }
 
     /**
@@ -219,7 +254,10 @@ public final class PdfEditor {
     public void write(ParcelFileDescriptor output) throws IOException {
         try {
             throwIfClosed();
-            nativeWrite(mNativeDocument, output.getFd());
+
+            synchronized (PdfRenderer.sPdfiumLock) {
+                nativeWrite(mNativeDocument, output.getFd());
+            }
         } finally {
             IoUtils.closeQuietly(output);
         }
@@ -237,19 +275,28 @@ public final class PdfEditor {
     @Override
     protected void finalize() throws Throwable {
         try {
-            mCloseGuard.warnIfOpen();
-            if (mInput != null) {
-                doClose();
+            if (mCloseGuard != null) {
+                mCloseGuard.warnIfOpen();
             }
+
+            doClose();
         } finally {
             super.finalize();
         }
     }
 
     private void doClose() {
-        nativeClose(mNativeDocument);
-        IoUtils.closeQuietly(mInput);
-        mInput = null;
+        if (mNativeDocument != 0) {
+            synchronized (PdfRenderer.sPdfiumLock) {
+                nativeClose(mNativeDocument);
+            }
+            mNativeDocument = 0;
+        }
+
+        if (mInput != null) {
+            IoUtils.closeQuietly(mInput);
+            mInput = null;
+        }
         mCloseGuard.close();
     }
 

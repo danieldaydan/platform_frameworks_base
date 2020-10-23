@@ -14,31 +14,31 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_HWUI_MATRIX_H
-#define ANDROID_HWUI_MATRIX_H
-
-#include <SkMatrix.h>
-
-#include <cutils/compiler.h>
+#pragma once
 
 #include "Rect.h"
+
+#include <SkMatrix.h>
+#include <cutils/compiler.h>
+#include <iomanip>
+#include <ostream>
 
 namespace android {
 namespace uirenderer {
 
 #define SK_MATRIX_STRING "[%.2f %.2f %.2f] [%.2f %.2f %.2f] [%.2f %.2f %.2f]"
-#define SK_MATRIX_ARGS(m) \
-    (m)->get(0), (m)->get(1), (m)->get(2), \
-    (m)->get(3), (m)->get(4), (m)->get(5), \
-    (m)->get(6), (m)->get(7), (m)->get(8)
+#define SK_MATRIX_STRING_V "[%.9f %.9f %.9f] [%.9f %.9f %.9f] [%.9f %.9f %.9f]"
+#define SK_MATRIX_ARGS(m)                                                                      \
+    (m)->get(0), (m)->get(1), (m)->get(2), (m)->get(3), (m)->get(4), (m)->get(5), (m)->get(6), \
+            (m)->get(7), (m)->get(8)
 
-#define MATRIX_4_STRING "[%.2f %.2f %.2f %.2f] [%.2f %.2f %.2f %.2f]" \
+#define MATRIX_4_STRING                           \
+    "[%.2f %.2f %.2f %.2f] [%.2f %.2f %.2f %.2f]" \
     " [%.2f %.2f %.2f %.2f] [%.2f %.2f %.2f %.2f]"
-#define MATRIX_4_ARGS(m) \
-    (m)->data[0], (m)->data[4], (m)->data[8], (m)->data[12], \
-    (m)->data[1], (m)->data[5], (m)->data[9], (m)->data[13], \
-    (m)->data[2], (m)->data[6], (m)->data[10], (m)->data[14], \
-    (m)->data[3], (m)->data[7], (m)->data[11], (m)->data[15] \
+#define MATRIX_4_ARGS(m)                                                                           \
+    (m)->data[0], (m)->data[4], (m)->data[8], (m)->data[12], (m)->data[1], (m)->data[5],           \
+            (m)->data[9], (m)->data[13], (m)->data[2], (m)->data[6], (m)->data[10], (m)->data[14], \
+            (m)->data[3], (m)->data[7], (m)->data[11], (m)->data[15]
 
 ///////////////////////////////////////////////////////////////////////////////
 // Classes
@@ -77,21 +77,15 @@ public:
 
     static const int sGeometryMask = 0xf;
 
-    Matrix4() {
-        loadIdentity();
-    }
+    Matrix4() { loadIdentity(); }
 
-    Matrix4(const float* v) {
+    explicit Matrix4(const float* v) { load(v); }
+
+    Matrix4(const SkMatrix& v) {  // NOLINT(google-explicit-constructor)
         load(v);
     }
 
-    Matrix4(const SkMatrix& v) {
-        load(v);
-    }
-
-    float operator[](int index) const {
-        return data[index];
-    }
+    float operator[](int index) const { return data[index]; }
 
     float& operator[](int index) {
         mType = kTypeUnknown;
@@ -107,14 +101,11 @@ public:
         return !memcmp(&a.data[0], &b.data[0], 16 * sizeof(float));
     }
 
-    friend bool operator!=(const Matrix4& a, const Matrix4& b) {
-        return !(a == b);
-    }
+    friend bool operator!=(const Matrix4& a, const Matrix4& b) { return !(a == b); }
 
     void loadIdentity();
 
     void load(const float* v);
-    void load(const Matrix4& v);
     void load(const SkMatrix& v);
 
     void loadInverse(const Matrix4& v);
@@ -127,6 +118,7 @@ public:
     void loadMultiply(const Matrix4& u, const Matrix4& v);
 
     void loadOrtho(float left, float right, float bottom, float top, float near, float far);
+    void loadOrtho(int width, int height) { loadOrtho(0, width, height, 0, -1, 1); }
 
     uint8_t getType() const;
 
@@ -137,9 +129,11 @@ public:
     }
 
     void multiply(const Matrix4& v) {
-        Matrix4 u;
-        u.loadMultiply(*this, v);
-        load(u);
+        if (!v.isIdentity()) {
+            Matrix4 u;
+            u.loadMultiply(*this, v);
+            *this = u;
+        }
     }
 
     void multiply(float v);
@@ -204,8 +198,8 @@ public:
 
     float mapZ(const Vector3& orig) const;
     void mapPoint3d(Vector3& vec) const;
-    void mapPoint(float& x, float& y) const; // 2d only
-    void mapRect(Rect& r) const; // 2d only
+    void mapPoint(float& x, float& y) const;  // 2d only
+    void mapRect(Rect& r) const;              // 2d only
 
     float getTranslateX() const;
     float getTranslateY() const;
@@ -214,22 +208,36 @@ public:
 
     void dump(const char* label = nullptr) const;
 
+    friend std::ostream& operator<<(std::ostream& os, const Matrix4& matrix) {
+        if (matrix.isSimple()) {
+            os << "offset " << matrix.getTranslateX() << "x" << matrix.getTranslateY();
+            if (!matrix.isPureTranslate()) {
+                os << ", scale " << matrix[kScaleX] << "x" << matrix[kScaleY];
+            }
+        } else {
+            os << "[" << matrix[0];
+            for (int i = 1; i < 16; i++) {
+                os << ", " << matrix[i];
+            }
+            os << "]";
+        }
+        return os;
+    }
+
     static const Matrix4& identity();
+
+    void invalidateType() { mType = kTypeUnknown; }
 
 private:
     mutable uint8_t mType;
 
-    inline float get(int i, int j) const {
-        return data[i * 4 + j];
-    }
+    inline float get(int i, int j) const { return data[i * 4 + j]; }
 
-    inline void set(int i, int j, float v) {
-        data[i * 4 + j] = v;
-    }
+    inline void set(int i, int j, float v) { data[i * 4 + j] = v; }
 
     uint8_t getGeometryType() const;
 
-}; // class Matrix4
+};  // class Matrix4
 
 ///////////////////////////////////////////////////////////////////////////////
 // Types
@@ -237,7 +245,5 @@ private:
 
 typedef Matrix4 mat4;
 
-}; // namespace uirenderer
-}; // namespace android
-
-#endif // ANDROID_HWUI_MATRIX_H
+}  // namespace uirenderer
+}  // namespace android

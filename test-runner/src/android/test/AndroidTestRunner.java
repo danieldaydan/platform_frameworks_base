@@ -18,10 +18,8 @@ package android.test;
 
 import android.app.Instrumentation;
 import android.content.Context;
-import android.os.PerformanceCollector.PerformanceResultsWriter;
 
-import com.google.android.collect.Lists;
-
+import java.util.ArrayList;
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestListener;
@@ -33,6 +31,13 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 
+/**
+ * @deprecated Use
+ * <a href="{@docRoot}reference/android/support/test/runner/AndroidJUnitRunner.html">
+ * AndroidJUnitRunner</a> instead. New tests should be written using the
+ * <a href="{@docRoot}tools/testing-support-library/index.html">Android Testing Support Library</a>.
+ */
+@Deprecated
 public class AndroidTestRunner extends BaseTestRunner {
 
     private TestResult mTestResult;
@@ -41,9 +46,8 @@ public class AndroidTestRunner extends BaseTestRunner {
     private Context mContext;
     private boolean mSkipExecution = false;
 
-    private List<TestListener> mTestListeners = Lists.newArrayList();
+    private List<TestListener> mTestListeners = new ArrayList<>();
     private Instrumentation mInstrumentation;
-    private PerformanceResultsWriter mPerfWriter;
 
     @SuppressWarnings("unchecked")
     public void setTestClassName(String testClassName, String testMethodName) {
@@ -51,7 +55,8 @@ public class AndroidTestRunner extends BaseTestRunner {
 
         if (shouldRunSingleTestMethod(testMethodName, testClass)) {
             TestCase testCase = buildSingleTestMethod(testClass, testMethodName);
-            mTestCases = Lists.newArrayList(testCase);
+            mTestCases = new ArrayList<>();
+            mTestCases.add(testCase);
             mTestClassName = testClass.getSimpleName();
         } else {
             setTest(getTest(testClass), testClass);
@@ -120,7 +125,7 @@ public class AndroidTestRunner extends BaseTestRunner {
         } catch (IllegalArgumentException e) {
             runFailed("Illegal argument passed to constructor. Class: " + testClass.getName());
         } catch (InvocationTargetException e) {
-            runFailed("Constructor thew an exception. Class: " + testClass.getName());
+            runFailed("Constructor threw an exception. Class: " + testClass.getName());
         }
         return null;
     }
@@ -187,7 +192,6 @@ public class AndroidTestRunner extends BaseTestRunner {
         for (TestCase testCase : mTestCases) {
             setContextIfAndroidTestCase(testCase, mContext, testContext);
             setInstrumentationIfInstrumentationTestCase(testCase, mInstrumentation);
-            setPerformanceWriterIfPerformanceCollectorTestCase(testCase, mPerfWriter);
             testCase.run(mTestResult);
         }
     }
@@ -210,13 +214,6 @@ public class AndroidTestRunner extends BaseTestRunner {
         }
     }
 
-    private void setPerformanceWriterIfPerformanceCollectorTestCase(
-            Test test, PerformanceResultsWriter writer) {
-        if (PerformanceCollectorTestCase.class.isAssignableFrom(test.getClass())) {
-            ((PerformanceCollectorTestCase) test).setPerformanceResultsWriter(writer);
-        }
-    }
-
     public void setInstrumentation(Instrumentation instrumentation) {
         mInstrumentation = instrumentation;
     }
@@ -228,13 +225,6 @@ public class AndroidTestRunner extends BaseTestRunner {
     @Deprecated
     public void setInstrumentaiton(Instrumentation instrumentation) {
         setInstrumentation(instrumentation);
-    }
-
-    /**
-     * {@hide} Pending approval for public API.
-     */
-    public void setPerformanceResultsWriter(PerformanceResultsWriter writer) {
-        mPerfWriter = writer;
     }
 
     @Override

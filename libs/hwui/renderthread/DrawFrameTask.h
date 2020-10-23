@@ -24,15 +24,14 @@
 
 #include "RenderTask.h"
 
-#include "../Rect.h"
 #include "../FrameInfo.h"
+#include "../Rect.h"
 #include "../TreeInfo.h"
 
 namespace android {
 namespace uirenderer {
 
 class DeferredLayerUpdater;
-class DisplayListData;
 class RenderNode;
 
 namespace renderthread {
@@ -40,24 +39,31 @@ namespace renderthread {
 class CanvasContext;
 class RenderThread;
 
-enum SyncResult {
-    kSync_OK = 0,
-    kSync_UIRedrawRequired = 1 << 0,
-    kSync_LostSurfaceRewardIfFound = 1 << 1,
+namespace SyncResult {
+enum {
+    OK = 0,
+    UIRedrawRequired = 1 << 0,
+    LostSurfaceRewardIfFound = 1 << 1,
+    ContextIsStopped = 1 << 2,
+    FrameDropped = 1 << 3,
 };
+}
 
 /*
  * This is a special Super Task. It is re-used multiple times by RenderProxy,
- * and contains state (such as layer updaters & new DisplayListDatas) that is
+ * and contains state (such as layer updaters & new DisplayLists) that is
  * tracked across many frames not just a single frame.
  * It is the sync-state task, and will kick off the post-sync draw
  */
-class DrawFrameTask : public RenderTask {
+class DrawFrameTask {
 public:
     DrawFrameTask();
     virtual ~DrawFrameTask();
 
-    void setContext(RenderThread* thread, CanvasContext* context);
+    void setContext(RenderThread* thread, CanvasContext* context, RenderNode* targetNode);
+    void setContentDrawBounds(int left, int top, int right, int bottom) {
+        mContentDrawBounds.set(left, top, right, bottom);
+    }
 
     void pushLayerUpdate(DeferredLayerUpdater* layer);
     void removeLayerUpdate(DeferredLayerUpdater* layer);
@@ -66,7 +72,15 @@ public:
 
     int64_t* frameInfo() { return mFrameInfo; }
 
-    virtual void run() override;
+    void run();
+
+    void setFrameCallback(std::function<void(int64_t)>&& callback) {
+        mFrameCallback = std::move(callback);
+    }
+
+    void setFrameCompleteCallback(std::function<void(int64_t)>&& callback) {
+        mFrameCompleteCallback = std::move(callback);
+    }
 
 private:
     void postAndWait();
@@ -78,16 +92,21 @@ private:
 
     RenderThread* mRenderThread;
     CanvasContext* mContext;
+    RenderNode* mTargetNode = nullptr;
+    Rect mContentDrawBounds;
 
     /*********************************************
      *  Single frame data
      *********************************************/
-    std::vector< sp<DeferredLayerUpdater> > mLayers;
+    std::vector<sp<DeferredLayerUpdater> > mLayers;
 
     int mSyncResult;
     int64_t mSyncQueued;
 
     int64_t mFrameInfo[UI_THREAD_FRAME_INFO_SIZE];
+
+    std::function<void(int64_t)> mFrameCallback;
+    std::function<void(int64_t)> mFrameCompleteCallback;
 };
 
 } /* namespace renderthread */

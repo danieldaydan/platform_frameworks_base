@@ -16,6 +16,9 @@
 
 package android.os;
 
+import android.compat.annotation.UnsupportedAppUsage;
+import android.util.MathUtils;
+
 /**
  * Parcelable containing a raw Parcel of data.
  * @hide
@@ -24,6 +27,7 @@ public class ParcelableParcel implements Parcelable {
     final Parcel mParcel;
     final ClassLoader mClassLoader;
 
+    @UnsupportedAppUsage
     public ParcelableParcel(ClassLoader loader) {
         mParcel = Parcel.obtain();
         mClassLoader = loader;
@@ -33,16 +37,22 @@ public class ParcelableParcel implements Parcelable {
         mParcel = Parcel.obtain();
         mClassLoader = loader;
         int size = src.readInt();
+        if (size < 0) {
+            throw new IllegalArgumentException("Negative size read from parcel");
+        }
+
         int pos = src.dataPosition();
-        mParcel.appendFrom(src, src.dataPosition(), size);
-        src.setDataPosition(pos + size);
+        src.setDataPosition(MathUtils.addOrThrow(pos, size));
+        mParcel.appendFrom(src, pos, size);
     }
 
+    @UnsupportedAppUsage
     public Parcel getParcel() {
         mParcel.setDataPosition(0);
         return mParcel;
     }
 
+    @UnsupportedAppUsage
     public ClassLoader getClassLoader() {
         return mClassLoader;
     }
@@ -58,6 +68,7 @@ public class ParcelableParcel implements Parcelable {
         dest.appendFrom(mParcel, 0, mParcel.dataSize());
     }
 
+    @UnsupportedAppUsage
     public static final Parcelable.ClassLoaderCreator<ParcelableParcel> CREATOR
             = new Parcelable.ClassLoaderCreator<ParcelableParcel>() {
         public ParcelableParcel createFromParcel(Parcel in) {

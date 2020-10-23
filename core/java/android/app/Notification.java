@@ -16,55 +16,94 @@
 
 package android.app;
 
+import static android.annotation.Dimension.DP;
+import static android.graphics.drawable.Icon.TYPE_URI;
+import static android.graphics.drawable.Icon.TYPE_URI_ADAPTIVE_BITMAP;
+
+import static com.android.internal.util.ContrastColorUtil.satisfiesTextContrast;
+
 import android.annotation.ColorInt;
+import android.annotation.DimenRes;
+import android.annotation.Dimension;
 import android.annotation.DrawableRes;
+import android.annotation.IdRes;
 import android.annotation.IntDef;
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
 import android.annotation.SdkConstant;
 import android.annotation.SdkConstant.SdkConstantType;
+import android.annotation.SuppressLint;
+import android.annotation.SystemApi;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.Intent;
+import android.content.LocusId;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.ShortcutInfo;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
+import android.content.res.Resources;
+import android.content.res.TypedArray;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.PorterDuff;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.Icon;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
+import android.media.PlayerBase;
 import android.media.session.MediaSession;
 import android.net.Uri;
 import android.os.BadParcelableException;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.IBinder;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.UserHandle;
+import android.text.BidiFormatter;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
 import android.text.TextUtils;
+import android.text.style.AbsoluteSizeSpan;
+import android.text.style.CharacterStyle;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
+import android.text.style.TextAppearanceSpan;
+import android.util.ArraySet;
 import android.util.Log;
-import android.util.MathUtils;
+import android.util.Pair;
 import android.util.SparseArray;
-import android.util.TypedValue;
+import android.util.proto.ProtoOutputStream;
 import android.view.Gravity;
+import android.view.NotificationHeaderView;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.contentcapture.ContentCaptureContext;
 import android.widget.ProgressBar;
 import android.widget.RemoteViews;
 
 import com.android.internal.R;
-import com.android.internal.util.NotificationColorUtil;
+import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.util.ArrayUtils;
+import com.android.internal.util.ContrastColorUtil;
 
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
-import java.text.NumberFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * A class that represents how a persistent notification is to be presented to
@@ -86,12 +125,39 @@ public class Notification implements Parcelable
 
     /**
      * An activity that provides a user interface for adjusting notification preferences for its
-     * containing application. Optional but recommended for apps that post
-     * {@link android.app.Notification Notifications}.
+     * containing application.
      */
     @SdkConstant(SdkConstantType.INTENT_CATEGORY)
     public static final String INTENT_CATEGORY_NOTIFICATION_PREFERENCES
             = "android.intent.category.NOTIFICATION_PREFERENCES";
+
+    /**
+     * Optional extra for {@link #INTENT_CATEGORY_NOTIFICATION_PREFERENCES}. If provided, will
+     * contain a {@link NotificationChannel#getId() channel id} that can be used to narrow down
+     * what settings should be shown in the target app.
+     */
+    public static final String EXTRA_CHANNEL_ID = "android.intent.extra.CHANNEL_ID";
+
+    /**
+     * Optional extra for {@link #INTENT_CATEGORY_NOTIFICATION_PREFERENCES}. If provided, will
+     * contain a {@link NotificationChannelGroup#getId() group id} that can be used to narrow down
+     * what settings should be shown in the target app.
+     */
+    public static final String EXTRA_CHANNEL_GROUP_ID = "android.intent.extra.CHANNEL_GROUP_ID";
+
+    /**
+     * Optional extra for {@link #INTENT_CATEGORY_NOTIFICATION_PREFERENCES}. If provided, will
+     * contain the tag provided to {@link NotificationManager#notify(String, int, Notification)}
+     * that can be used to narrow down what settings should be shown in the target app.
+     */
+    public static final String EXTRA_NOTIFICATION_TAG = "android.intent.extra.NOTIFICATION_TAG";
+
+    /**
+     * Optional extra for {@link #INTENT_CATEGORY_NOTIFICATION_PREFERENCES}. If provided, will
+     * contain the id provided to {@link NotificationManager#notify(String, int, Notification)}
+     * that can be used to narrow down what settings should be shown in the target app.
+     */
+    public static final String EXTRA_NOTIFICATION_ID = "android.intent.extra.NOTIFICATION_ID";
 
     /**
      * Use all default values (where applicable).
@@ -144,6 +210,27 @@ public class Notification implements Parcelable
     private static final int MAX_CHARSEQUENCE_LENGTH = 5 * 1024;
 
     /**
+     * Maximum entries of reply text that are accepted by Builder and friends.
+     */
+    private static final int MAX_REPLY_HISTORY = 5;
+
+    /**
+     * Maximum number of (generic) action buttons in a notification (contextual action buttons are
+     * handled separately).
+     * @hide
+     */
+    public static final int MAX_ACTION_BUTTONS = 3;
+
+    /**
+     * If the notification contained an unsent draft for a RemoteInput when the user clicked on it,
+     * we're adding the draft as a String extra to the {@link #contentIntent} using this key.
+     *
+     * <p>Apps may use this extra to prepopulate text fields in the app, where the user usually
+     * sends messages.</p>
+     */
+    public static final String EXTRA_REMOTE_INPUT_DRAFT = "android.remoteInputDraft";
+
+    /**
      * A timestamp related to this notification, in milliseconds since the epoch.
      *
      * Default value: {@link System#currentTimeMillis() Now}.
@@ -164,8 +251,16 @@ public class Notification implements Parcelable
      *   <li>Notification of an ongoing countdown timer should be stamped with the timer's end time.
      * </ul>
      *
+     * For apps targeting {@link android.os.Build.VERSION_CODES#N} and above, this time is not shown
+     * anymore by default and must be opted into by using
+     * {@link android.app.Notification.Builder#setShowWhen(boolean)}
      */
     public long when;
+
+    /**
+     * The creation time of the notification
+     */
+    private long creationTime;
 
     /**
      * The resource id of a drawable to use as the icon in the status bar.
@@ -189,15 +284,11 @@ public class Notification implements Parcelable
      * The number of events that this notification represents. For example, in a new mail
      * notification, this could be the number of unread messages.
      *
-     * The system may or may not use this field to modify the appearance of the notification. For
-     * example, before {@link android.os.Build.VERSION_CODES#HONEYCOMB}, this number was
-     * superimposed over the icon in the status bar. Starting with
-     * {@link android.os.Build.VERSION_CODES#HONEYCOMB}, the template used by
-     * {@link Notification.Builder} has displayed the number in the expanded notification view.
-     *
-     * If the number is 0 or negative, it is never shown.
+     * The system may or may not use this field to modify the appearance of the notification.
+     * Starting with {@link android.os.Build.VERSION_CODES#O}, the number may be displayed as a
+     * badge icon in Launchers that support badging.
      */
-    public int number;
+    public int number = 0;
 
     /**
      * The intent to execute when the expanded status entry is clicked.  If
@@ -253,15 +344,26 @@ public class Notification implements Parcelable
     public RemoteViews tickerView;
 
     /**
-     * The view that will represent this notification in the expanded status bar.
+     * The view that will represent this notification in the notification list (which is pulled
+     * down from the status bar).
+     *
+     * As of N, this field may be null. The notification view is determined by the inputs
+     * to {@link Notification.Builder}; a custom RemoteViews can optionally be
+     * supplied with {@link Notification.Builder#setCustomContentView(RemoteViews)}.
      */
+    @Deprecated
     public RemoteViews contentView;
 
     /**
      * A large-format version of {@link #contentView}, giving the Notification an
      * opportunity to show more detail. The system UI may choose to show this
      * instead of the normal content view at its discretion.
+     *
+     * As of N, this field may be null. The expanded notification view is determined by the
+     * inputs to {@link Notification.Builder}; a custom RemoteViews can optionally be
+     * supplied with {@link Notification.Builder#setCustomBigContentView(RemoteViews)}.
      */
+    @Deprecated
     public RemoteViews bigContentView;
 
 
@@ -270,8 +372,29 @@ public class Notification implements Parcelable
      * opportunity to add action buttons to contentView. At its discretion, the system UI may
      * choose to show this as a heads-up notification, which will pop up so the user can see
      * it without leaving their current activity.
+     *
+     * As of N, this field may be null. The heads-up notification view is determined by the
+     * inputs to {@link Notification.Builder}; a custom RemoteViews can optionally be
+     * supplied with {@link Notification.Builder#setCustomHeadsUpContentView(RemoteViews)}.
      */
+    @Deprecated
     public RemoteViews headsUpContentView;
+
+    private boolean mUsesStandardHeader;
+
+    private static final ArraySet<Integer> STANDARD_LAYOUTS = new ArraySet<>();
+    static {
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_base);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_big_base);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_big_picture);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_big_text);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_inbox);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_messaging);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_conversation);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_media);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_material_big_media);
+        STANDARD_LAYOUTS.add(R.layout.notification_template_header);
+    }
 
     /**
      * A large bitmap to be shown in the notification content area.
@@ -291,7 +414,9 @@ public class Notification implements Parcelable
      * <p>
      * To play the default notification sound, see {@link #defaults}.
      * </p>
+     * @deprecated use {@link NotificationChannel#getSound()}.
      */
+    @Deprecated
     public Uri sound;
 
     /**
@@ -299,7 +424,7 @@ public class Notification implements Parcelable
      * the default stream type for notifications be used.  Currently the
      * default stream type is {@link AudioManager#STREAM_NOTIFICATION}.
      *
-     * @deprecated Use {@link #audioAttributes} instead.
+     * @deprecated Use {@link NotificationChannel#getAudioAttributes()} instead.
      */
     @Deprecated
     public static final int STREAM_DEFAULT = -1;
@@ -324,7 +449,10 @@ public class Notification implements Parcelable
 
     /**
      * The {@link AudioAttributes audio attributes} to use when playing the sound.
+     *
+     * @deprecated use {@link NotificationChannel#getAudioAttributes()} instead.
      */
+    @Deprecated
     public AudioAttributes audioAttributes = AUDIO_ATTRIBUTES_DEFAULT;
 
     /**
@@ -334,12 +462,10 @@ public class Notification implements Parcelable
      * To vibrate the default pattern, see {@link #defaults}.
      * </p>
      *
-     * <p>
-     * A notification that vibrates is more likely to be presented as a heads-up notification.
-     * </p>
-     *
      * @see android.os.Vibrator#vibrate(long[],int)
+     * @deprecated use {@link NotificationChannel#getVibrationPattern()}.
      */
+    @Deprecated
     public long[] vibrate;
 
     /**
@@ -347,8 +473,10 @@ public class Notification implements Parcelable
      *
      * @see #FLAG_SHOW_LIGHTS
      * @see #flags
+     * @deprecated use {@link NotificationChannel#shouldShowLights()}.
      */
     @ColorInt
+    @Deprecated
     public int ledARGB;
 
     /**
@@ -357,7 +485,9 @@ public class Notification implements Parcelable
      *
      * @see #FLAG_SHOW_LIGHTS
      * @see #flags
+     * @deprecated use {@link NotificationChannel#shouldShowLights()}.
      */
+    @Deprecated
     public int ledOnMS;
 
     /**
@@ -366,7 +496,10 @@ public class Notification implements Parcelable
      *
      * @see #FLAG_SHOW_LIGHTS
      * @see #flags
+     *
+     * @deprecated use {@link NotificationChannel#shouldShowLights()}.
      */
+    @Deprecated
     public int ledOffMS;
 
     /**
@@ -376,7 +509,12 @@ public class Notification implements Parcelable
      * {@link #DEFAULT_VIBRATE}, {@link #DEFAULT_LIGHTS}. For all default
      * values, use {@link #DEFAULT_ALL}.
      * </p>
+     *
+     * @deprecated use {@link NotificationChannel#getSound()} and
+     * {@link NotificationChannel#shouldShowLights()} and
+     * {@link NotificationChannel#shouldVibrate()}.
      */
+    @Deprecated
     public int defaults;
 
     /**
@@ -391,12 +529,14 @@ public class Notification implements Parcelable
      * </ul>
      * <p>
      * Since hardware varies, you are not guaranteed that any of the values
-     * you pass are honored exactly.  Use the system defaults (TODO) if possible
+     * you pass are honored exactly.  Use the system defaults if possible
      * because they will be set to values that work on any given hardware.
      * <p>
      * The alpha channel must be set for forward compatibility.
      *
+     * @deprecated use {@link NotificationChannel#shouldShowLights()}.
      */
+    @Deprecated
     public static final int FLAG_SHOW_LIGHTS        = 0x00000001;
 
     /**
@@ -448,6 +588,7 @@ public class Notification implements Parcelable
      *
      * @deprecated Use {@link #priority} with a positive value.
      */
+    @Deprecated
     public static final int FLAG_HIGH_PRIORITY      = 0x00000080;
 
     /**
@@ -465,43 +606,96 @@ public class Notification implements Parcelable
      */
     public static final int FLAG_GROUP_SUMMARY      = 0x00000200;
 
+    /**
+     * Bit to be bitswise-ored into the {@link #flags} field that should be
+     * set if this notification is the group summary for an auto-group of notifications.
+     *
+     * @hide
+     */
+    @SystemApi
+    public static final int FLAG_AUTOGROUP_SUMMARY  = 0x00000400;
+
+    /**
+     * @hide
+     */
+    public static final int FLAG_CAN_COLORIZE = 0x00000800;
+
+    /**
+     * Bit to be bitswised-ored into the {@link #flags} field that should be
+     * set by the system if this notification is showing as a bubble.
+     *
+     * Applications cannot set this flag directly; they should instead call
+     * {@link Notification.Builder#setBubbleMetadata(BubbleMetadata)} to
+     * request that a notification be displayed as a bubble, and then check
+     * this flag to see whether that request was honored by the system.
+     */
+    public static final int FLAG_BUBBLE = 0x00001000;
+
+    /** @hide */
+    @IntDef({FLAG_SHOW_LIGHTS, FLAG_ONGOING_EVENT, FLAG_INSISTENT, FLAG_ONLY_ALERT_ONCE,
+            FLAG_AUTO_CANCEL, FLAG_NO_CLEAR, FLAG_FOREGROUND_SERVICE, FLAG_HIGH_PRIORITY,
+            FLAG_LOCAL_ONLY, FLAG_GROUP_SUMMARY, FLAG_AUTOGROUP_SUMMARY, FLAG_BUBBLE})
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface NotificationFlags{};
+
     public int flags;
 
     /** @hide */
-    @IntDef({PRIORITY_DEFAULT,PRIORITY_LOW,PRIORITY_MIN,PRIORITY_HIGH,PRIORITY_MAX})
+    @IntDef(prefix = { "PRIORITY_" }, value = {
+            PRIORITY_DEFAULT,
+            PRIORITY_LOW,
+            PRIORITY_MIN,
+            PRIORITY_HIGH,
+            PRIORITY_MAX
+    })
     @Retention(RetentionPolicy.SOURCE)
     public @interface Priority {}
 
     /**
      * Default notification {@link #priority}. If your application does not prioritize its own
      * notifications, use this value for all notifications.
+     *
+     * @deprecated use {@link NotificationManager#IMPORTANCE_DEFAULT} instead.
      */
+    @Deprecated
     public static final int PRIORITY_DEFAULT = 0;
 
     /**
      * Lower {@link #priority}, for items that are less important. The UI may choose to show these
      * items smaller, or at a different position in the list, compared with your app's
      * {@link #PRIORITY_DEFAULT} items.
+     *
+     * @deprecated use {@link NotificationManager#IMPORTANCE_LOW} instead.
      */
+    @Deprecated
     public static final int PRIORITY_LOW = -1;
 
     /**
      * Lowest {@link #priority}; these items might not be shown to the user except under special
      * circumstances, such as detailed notification logs.
+     *
+     * @deprecated use {@link NotificationManager#IMPORTANCE_MIN} instead.
      */
+    @Deprecated
     public static final int PRIORITY_MIN = -2;
 
     /**
      * Higher {@link #priority}, for more important notifications or alerts. The UI may choose to
      * show these items larger, or at a different position in notification lists, compared with
      * your app's {@link #PRIORITY_DEFAULT} items.
+     *
+     * @deprecated use {@link NotificationManager#IMPORTANCE_HIGH} instead.
      */
+    @Deprecated
     public static final int PRIORITY_HIGH = 1;
 
     /**
      * Highest {@link #priority}, for your application's most important items that require the
      * user's prompt attention or input.
+     *
+     * @deprecated use {@link NotificationManager#IMPORTANCE_HIGH} instead.
      */
+    @Deprecated
     public static final int PRIORITY_MAX = 2;
 
     /**
@@ -518,8 +712,10 @@ public class Notification implements Parcelable
      * as a heads-up notification.
      * </p>
      *
+     * @deprecated use {@link NotificationChannel#getImportance()} instead.
      */
     @Priority
+    @Deprecated
     public int priority;
 
     /**
@@ -541,8 +737,15 @@ public class Notification implements Parcelable
     public static final int COLOR_DEFAULT = 0; // AKA Color.TRANSPARENT
 
     /**
-     * Sphere of visibility of this notification, which affects how and when the SystemUI reveals 
-     * the notification's presence and contents in untrusted situations (namely, on the secure 
+     * Special value of {@link #color} used as a place holder for an invalid color.
+     * @hide
+     */
+    @ColorInt
+    public static final int COLOR_INVALID = 1;
+
+    /**
+     * Sphere of visibility of this notification, which affects how and when the SystemUI reveals
+     * the notification's presence and contents in untrusted situations (namely, on the secure
      * lockscreen).
      *
      * The default level, {@link #VISIBILITY_PRIVATE}, behaves exactly as notifications have always
@@ -558,7 +761,16 @@ public class Notification implements Parcelable
      * Finally, a notification can be made {@link #VISIBILITY_SECRET}, which will suppress its icon
      * and ticker until the user has bypassed the lockscreen.
      */
-    public int visibility;
+    public @Visibility int visibility;
+
+    /** @hide */
+    @IntDef(prefix = { "VISIBILITY_" }, value = {
+            VISIBILITY_PUBLIC,
+            VISIBILITY_PRIVATE,
+            VISIBILITY_SECRET,
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface Visibility {}
 
     /**
      * Notification visibility: Show this notification in its entirety on all lockscreens.
@@ -586,6 +798,11 @@ public class Notification implements Parcelable
      * Notification category: incoming call (voice or video) or similar synchronous communication request.
      */
     public static final String CATEGORY_CALL = "call";
+
+    /**
+     * Notification category: map turn-by-turn navigation.
+     */
+    public static final String CATEGORY_NAVIGATION = "navigation";
 
     /**
      * Notification category: incoming direct message (SMS, instant message, etc.).
@@ -660,11 +877,33 @@ public class Notification implements Parcelable
     public static final String CATEGORY_REMINDER = "reminder";
 
     /**
+     * Notification category: extreme car emergencies.
+     * @hide
+     */
+    @SystemApi
+    public static final String CATEGORY_CAR_EMERGENCY = "car_emergency";
+
+    /**
+     * Notification category: car warnings.
+     * @hide
+     */
+    @SystemApi
+    public static final String CATEGORY_CAR_WARNING = "car_warning";
+
+    /**
+     * Notification category: general car system information.
+     * @hide
+     */
+    @SystemApi
+    public static final String CATEGORY_CAR_INFORMATION = "car_information";
+
+    /**
      * One of the predefined notification categories (see the <code>CATEGORY_*</code> constants)
      * that best describes this Notification.  May be used by the system for ranking and filtering.
      */
     public String category;
 
+    @UnsupportedAppUsage
     private String mGroupKey;
 
     /**
@@ -704,6 +943,32 @@ public class Notification implements Parcelable
     public Bundle extras = new Bundle();
 
     /**
+     * All pending intents in the notification as the system needs to be able to access them but
+     * touching the extras bundle in the system process is not safe because the bundle may contain
+     * custom parcelable objects.
+     *
+     * @hide
+     */
+    @UnsupportedAppUsage
+    public ArraySet<PendingIntent> allPendingIntents;
+
+    /**
+     * Token identifying the notification that is applying doze/bgcheck allowlisting to the
+     * pending intents inside of it, so only those will get the behavior.
+     *
+     * @hide
+     */
+    private IBinder mAllowlistToken;
+
+    /**
+     * Must be set by a process to start associating tokens with Notification objects
+     * coming in to it.  This is set by NotificationManagerService.
+     *
+     * @hide
+     */
+    static public IBinder processAllowlistToken;
+
+    /**
      * {@link #extras} key: this is the title of the notification,
      * as supplied to {@link Builder#setContentTitle(CharSequence)}.
      */
@@ -728,6 +993,70 @@ public class Notification implements Parcelable
     public static final String EXTRA_SUB_TEXT = "android.subText";
 
     /**
+     * {@link #extras} key: this is the remote input history, as supplied to
+     * {@link Builder#setRemoteInputHistory(CharSequence[])}.
+     *
+     * Apps can fill this through {@link Builder#setRemoteInputHistory(CharSequence[])}
+     * with the most recent inputs that have been sent through a {@link RemoteInput} of this
+     * Notification and are expected to clear it once the it is no longer relevant (e.g. for chat
+     * notifications once the other party has responded).
+     *
+     * The extra with this key is of type CharSequence[] and contains the most recent entry at
+     * the 0 index, the second most recent at the 1 index, etc.
+     *
+     * @see Builder#setRemoteInputHistory(CharSequence[])
+     */
+    public static final String EXTRA_REMOTE_INPUT_HISTORY = "android.remoteInputHistory";
+
+
+    /**
+     * {@link #extras} key: this is a remote input history which can include media messages
+     * in addition to text, as supplied to
+     * {@link Builder#setRemoteInputHistory(RemoteInputHistoryItem[])} or
+     * {@link Builder#setRemoteInputHistory(CharSequence[])}.
+     *
+     * SystemUI can populate this through
+     * {@link Builder#setRemoteInputHistory(RemoteInputHistoryItem[])} with the most recent inputs
+     * that have been sent through a {@link RemoteInput} of this Notification. These items can
+     * represent either media content (specified by a URI and a MIME type) or a text message
+     * (described by a CharSequence).
+     *
+     * To maintain compatibility, this can also be set by apps with
+     * {@link Builder#setRemoteInputHistory(CharSequence[])}, which will create a
+     * {@link RemoteInputHistoryItem} for each of the provided text-only messages.
+     *
+     * The extra with this key is of type {@link RemoteInputHistoryItem[]} and contains the most
+     * recent entry at the 0 index, the second most recent at the 1 index, etc.
+     *
+     * @see Builder#setRemoteInputHistory(RemoteInputHistoryItem[])
+     * @hide
+     */
+    public static final String EXTRA_REMOTE_INPUT_HISTORY_ITEMS = "android.remoteInputHistoryItems";
+
+    /**
+     * {@link #extras} key: boolean as supplied to
+     * {@link Builder#setShowRemoteInputSpinner(boolean)}.
+     *
+     * If set to true, then the view displaying the remote input history from
+     * {@link Builder#setRemoteInputHistory(CharSequence[])} will have a progress spinner.
+     *
+     * @see Builder#setShowRemoteInputSpinner(boolean)
+     * @hide
+     */
+    public static final String EXTRA_SHOW_REMOTE_INPUT_SPINNER = "android.remoteInputSpinner";
+
+    /**
+     * {@link #extras} key: boolean as supplied to
+     * {@link Builder#setHideSmartReplies(boolean)}.
+     *
+     * If set to true, then any smart reply buttons will be hidden.
+     *
+     * @see Builder#setHideSmartReplies(boolean)
+     * @hide
+     */
+    public static final String EXTRA_HIDE_SMART_REPLIES = "android.hideSmartReplies";
+
+    /**
      * {@link #extras} key: this is a small piece of additional text as supplied to
      * {@link Builder#setContentInfo(CharSequence)}.
      */
@@ -750,14 +1079,20 @@ public class Notification implements Parcelable
     /**
      * {@link #extras} key: this is the resource ID of the notification's main small icon, as
      * supplied to {@link Builder#setSmallIcon(int)}.
+     *
+     * @deprecated Use {@link #getSmallIcon()}, which supports a wider variety of icon sources.
      */
+    @Deprecated
     public static final String EXTRA_SMALL_ICON = "android.icon";
 
     /**
      * {@link #extras} key: this is a bitmap to be used instead of the small icon when showing the
      * notification payload, as
      * supplied to {@link Builder#setLargeIcon(android.graphics.Bitmap)}.
+     *
+     * @deprecated Use {@link #getLargeIcon()}, which supports a wider variety of icon sources.
      */
+    @Deprecated
     public static final String EXTRA_LARGE_ICON = "android.largeIcon";
 
     /**
@@ -794,6 +1129,13 @@ public class Notification implements Parcelable
     public static final String EXTRA_SHOW_CHRONOMETER = "android.showChronometer";
 
     /**
+     * {@link #extras} key: whether the chronometer set on the notification should count down
+     * instead of counting up. Is only relevant if key {@link #EXTRA_SHOW_CHRONOMETER} is present.
+     * This extra is a boolean. The default is false.
+     */
+    public static final String EXTRA_CHRONOMETER_COUNT_DOWN = "android.chronometerCountDown";
+
+    /**
      * {@link #extras} key: whether {@link #when} should be shown,
      * as supplied to {@link Builder#setShowWhen(boolean)}.
      */
@@ -820,31 +1162,33 @@ public class Notification implements Parcelable
     /**
      * {@link #extras} key: A String array containing the people that this notification relates to,
      * each of which was supplied to {@link Builder#addPerson(String)}.
+     *
+     * @deprecated the actual objects are now in {@link #EXTRA_PEOPLE_LIST}
      */
     public static final String EXTRA_PEOPLE = "android.people";
 
     /**
-     * {@link #extras} key: used to provide hints about the appropriateness of
-     * displaying this notification as a heads-up notification.
-     * @hide
+     * {@link #extras} key: An arrayList of {@link Person} objects containing the people that
+     * this notification relates to.
      */
-    public static final String EXTRA_AS_HEADS_UP = "headsup";
+    public static final String EXTRA_PEOPLE_LIST = "android.people.list";
 
     /**
      * Allow certain system-generated notifications to appear before the device is provisioned.
      * Only available to notifications coming from the android package.
      * @hide
      */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.NOTIFICATION_DURING_SETUP)
     public static final String EXTRA_ALLOW_DURING_SETUP = "android.allowDuringSetup";
 
     /**
-     * {@link #extras} key: A
-     * {@link android.content.ContentUris content URI} pointing to an image that can be displayed
-     * in the background when the notification is selected. The URI must point to an image stream
-     * suitable for passing into
-     * {@link android.graphics.BitmapFactory#decodeStream(java.io.InputStream)
-     * BitmapFactory.decodeStream}; all other content types will be ignored. The content provider
-     * URI used for this purpose must require no permissions to read the image data.
+     * {@link #extras} key:
+     * flat {@link String} representation of a {@link android.content.ContentUris content URI}
+     * pointing to an image that can be displayed in the background when the notification is
+     * selected. Used on television platforms. The URI must point to an image stream suitable for
+     * passing into {@link android.graphics.BitmapFactory#decodeStream(java.io.InputStream)
+     * BitmapFactory.decodeStream}; all other content types will be ignored.
      */
     public static final String EXTRA_BACKGROUND_IMAGE_URI = "android.backgroundImageUri";
 
@@ -862,40 +1206,199 @@ public class Notification implements Parcelable
     public static final String EXTRA_COMPACT_ACTIONS = "android.compactActions";
 
     /**
-     * {@link #extras} key: the user that built the notification.
+     * {@link #extras} key: the username to be displayed for all messages sent by the user including
+     * direct replies
+     * {@link android.app.Notification.MessagingStyle} notification. This extra is a
+     * {@link CharSequence}
      *
-     * @hide
+     * @deprecated use {@link #EXTRA_MESSAGING_PERSON}
      */
-    public static final String EXTRA_ORIGINATING_USERID = "android.originatingUserId";
+    public static final String EXTRA_SELF_DISPLAY_NAME = "android.selfDisplayName";
 
     /**
-     * Value for {@link #EXTRA_AS_HEADS_UP} that indicates this notification should not be
-     * displayed in the heads up space.
+     * {@link #extras} key: the person to be displayed for all messages sent by the user including
+     * direct replies
+     * {@link android.app.Notification.MessagingStyle} notification. This extra is a
+     * {@link Person}
+     */
+    public static final String EXTRA_MESSAGING_PERSON = "android.messagingUser";
+
+    /**
+     * {@link #extras} key: a {@link CharSequence} to be displayed as the title to a conversation
+     * represented by a {@link android.app.Notification.MessagingStyle}
+     */
+    public static final String EXTRA_CONVERSATION_TITLE = "android.conversationTitle";
+
+    /** @hide */
+    public static final String EXTRA_CONVERSATION_ICON = "android.conversationIcon";
+
+    /** @hide */
+    public static final String EXTRA_CONVERSATION_UNREAD_MESSAGE_COUNT =
+            "android.conversationUnreadMessageCount";
+
+    /**
+     * {@link #extras} key: an array of {@link android.app.Notification.MessagingStyle.Message}
+     * bundles provided by a
+     * {@link android.app.Notification.MessagingStyle} notification. This extra is a parcelable
+     * array of bundles.
+     */
+    public static final String EXTRA_MESSAGES = "android.messages";
+
+    /**
+     * {@link #extras} key: an array of
+     * {@link android.app.Notification.MessagingStyle#addHistoricMessage historic}
+     * {@link android.app.Notification.MessagingStyle.Message} bundles provided by a
+     * {@link android.app.Notification.MessagingStyle} notification. This extra is a parcelable
+     * array of bundles.
+     */
+    public static final String EXTRA_HISTORIC_MESSAGES = "android.messages.historic";
+
+    /**
+     * {@link #extras} key: whether the {@link android.app.Notification.MessagingStyle} notification
+     * represents a group conversation.
+     */
+    public static final String EXTRA_IS_GROUP_CONVERSATION = "android.isGroupConversation";
+
+    /**
+     * {@link #extras} key: whether the notification should be colorized as
+     * supplied to {@link Builder#setColorized(boolean)}.
+     */
+    public static final String EXTRA_COLORIZED = "android.colorized";
+
+    /**
+     * @hide
+     */
+    public static final String EXTRA_BUILDER_APPLICATION_INFO = "android.appInfo";
+
+    /**
+     * @hide
+     */
+    public static final String EXTRA_CONTAINS_CUSTOM_VIEW = "android.contains.customView";
+
+    /**
+     * @hide
+     */
+    public static final String EXTRA_REDUCED_IMAGES = "android.reduced.images";
+
+    /**
+     * {@link #extras} key: the audio contents of this notification.
      *
-     * <p>
-     * If this notification has a {@link #fullScreenIntent}, then it will always launch the
-     * full-screen intent when posted.
-     * </p>
-     * @hide
+     * This is for use when rendering the notification on an audio-focused interface;
+     * the audio contents are a complete sound sample that contains the contents/body of the
+     * notification. This may be used in substitute of a Text-to-Speech reading of the
+     * notification. For example if the notification represents a voice message this should point
+     * to the audio of that message.
+     *
+     * The data stored under this key should be a String representation of a Uri that contains the
+     * audio contents in one of the following formats: WAV, PCM 16-bit, AMR-WB.
+     *
+     * This extra is unnecessary if you are using {@code MessagingStyle} since each {@code Message}
+     * has a field for holding data URI. That field can be used for audio.
+     * See {@code Message#setData}.
+     *
+     * Example usage:
+     * <pre>
+     * {@code
+     * Notification.Builder myBuilder = (build your Notification as normal);
+     * myBuilder.getExtras().putString(EXTRA_AUDIO_CONTENTS_URI, myAudioUri.toString());
+     * }
+     * </pre>
      */
-    public static final int HEADS_UP_NEVER = 0;
+    public static final String EXTRA_AUDIO_CONTENTS_URI = "android.audioContents";
+
+    /** @hide */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.SUBSTITUTE_NOTIFICATION_APP_NAME)
+    public static final String EXTRA_SUBSTITUTE_APP_NAME = "android.substName";
 
     /**
-     * Default value for {@link #EXTRA_AS_HEADS_UP} that indicates this notification may be
-     * displayed as a heads up.
+     * This is set on the notifications shown by system_server about apps running foreground
+     * services. It indicates that the notification should be shown
+     * only if any of the given apps do not already have a properly tagged
+     * {@link #FLAG_FOREGROUND_SERVICE} notification currently visible to the user.
+     * This is a string array of all package names of the apps.
      * @hide
      */
-    public static final int HEADS_UP_ALLOWED = 1;
+    public static final String EXTRA_FOREGROUND_APPS = "android.foregroundApps";
 
-    /**
-     * Value for {@link #EXTRA_AS_HEADS_UP} that indicates this notification is a
-     * good candidate for display as a heads up.
-     * @hide
-     */
-    public static final int HEADS_UP_REQUESTED = 2;
-
+    @UnsupportedAppUsage
     private Icon mSmallIcon;
+    @UnsupportedAppUsage
     private Icon mLargeIcon;
+
+    @UnsupportedAppUsage
+    private String mChannelId;
+    private long mTimeout;
+
+    private String mShortcutId;
+    private LocusId mLocusId;
+    private CharSequence mSettingsText;
+
+    private BubbleMetadata mBubbleMetadata;
+
+    /** @hide */
+    @IntDef(prefix = { "GROUP_ALERT_" }, value = {
+            GROUP_ALERT_ALL, GROUP_ALERT_CHILDREN, GROUP_ALERT_SUMMARY
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface GroupAlertBehavior {}
+
+    /**
+     * Constant for {@link Builder#setGroupAlertBehavior(int)}, meaning that all notifications in a
+     * group with sound or vibration ought to make sound or vibrate (respectively), so this
+     * notification will not be muted when it is in a group.
+     */
+    public static final int GROUP_ALERT_ALL = 0;
+
+    /**
+     * Constant for {@link Builder#setGroupAlertBehavior(int)}, meaning that all children
+     * notification in a group should be silenced (no sound or vibration) even if they are posted
+     * to a {@link NotificationChannel} that has sound and/or vibration. Use this constant to
+     * mute this notification if this notification is a group child. This must be applied to all
+     * children notifications you want to mute.
+     *
+     * <p> For example, you might want to use this constant if you post a number of children
+     * notifications at once (say, after a periodic sync), and only need to notify the user
+     * audibly once.
+     */
+    public static final int GROUP_ALERT_SUMMARY = 1;
+
+    /**
+     * Constant for {@link Builder#setGroupAlertBehavior(int)}, meaning that the summary
+     * notification in a group should be silenced (no sound or vibration) even if they are
+     * posted to a {@link NotificationChannel} that has sound and/or vibration. Use this constant
+     * to mute this notification if this notification is a group summary.
+     *
+     * <p>For example, you might want to use this constant if only the children notifications
+     * in your group have content and the summary is only used to visually group notifications
+     * rather than to alert the user that new information is available.
+     */
+    public static final int GROUP_ALERT_CHILDREN = 2;
+
+    private int mGroupAlertBehavior = GROUP_ALERT_ALL;
+
+    /**
+     * If this notification is being shown as a badge, always show as a number.
+     */
+    public static final int BADGE_ICON_NONE = 0;
+
+    /**
+     * If this notification is being shown as a badge, use the {@link #getSmallIcon()} to
+     * represent this notification.
+     */
+    public static final int BADGE_ICON_SMALL = 1;
+
+    /**
+     * If this notification is being shown as a badge, use the {@link #getLargeIcon()} to
+     * represent this notification.
+     */
+    public static final int BADGE_ICON_LARGE = 2;
+    private int mBadgeIcon = BADGE_ICON_NONE;
+
+    /**
+     * Determines whether the platform can generate contextual actions for a notification.
+     */
+    private boolean mAllowSystemGeneratedContextualActions = true;
 
     /**
      * Structure to encapsulate a named action that can be shown as part of this notification.
@@ -907,9 +1410,88 @@ public class Notification implements Parcelable
      * to attach actions.
      */
     public static class Action implements Parcelable {
+        /**
+         * {@link #extras} key: Keys to a {@link Parcelable} {@link ArrayList} of
+         * {@link RemoteInput}s.
+         *
+         * This is intended for {@link RemoteInput}s that only accept data, meaning
+         * {@link RemoteInput#getAllowFreeFormInput} is false, {@link RemoteInput#getChoices}
+         * is null or empty, and {@link RemoteInput#getAllowedDataTypes} is non-null and not
+         * empty. These {@link RemoteInput}s will be ignored by devices that do not
+         * support non-text-based {@link RemoteInput}s. See {@link Builder#build}.
+         *
+         * You can test if a RemoteInput matches these constraints using
+         * {@link RemoteInput#isDataOnly}.
+         */
+        private static final String EXTRA_DATA_ONLY_INPUTS = "android.extra.DATA_ONLY_INPUTS";
+
+        /**
+         * {@link }: No semantic action defined.
+         */
+        public static final int SEMANTIC_ACTION_NONE = 0;
+
+        /**
+         * {@code SemanticAction}: Reply to a conversation, chat, group, or wherever replies
+         * may be appropriate.
+         */
+        public static final int SEMANTIC_ACTION_REPLY = 1;
+
+        /**
+         * {@code SemanticAction}: Mark content as read.
+         */
+        public static final int SEMANTIC_ACTION_MARK_AS_READ = 2;
+
+        /**
+         * {@code SemanticAction}: Mark content as unread.
+         */
+        public static final int SEMANTIC_ACTION_MARK_AS_UNREAD = 3;
+
+        /**
+         * {@code SemanticAction}: Delete the content associated with the notification. This
+         * could mean deleting an email, message, etc.
+         */
+        public static final int SEMANTIC_ACTION_DELETE = 4;
+
+        /**
+         * {@code SemanticAction}: Archive the content associated with the notification. This
+         * could mean archiving an email, message, etc.
+         */
+        public static final int SEMANTIC_ACTION_ARCHIVE = 5;
+
+        /**
+         * {@code SemanticAction}: Mute the content associated with the notification. This could
+         * mean silencing a conversation or currently playing media.
+         */
+        public static final int SEMANTIC_ACTION_MUTE = 6;
+
+        /**
+         * {@code SemanticAction}: Unmute the content associated with the notification. This could
+         * mean un-silencing a conversation or currently playing media.
+         */
+        public static final int SEMANTIC_ACTION_UNMUTE = 7;
+
+        /**
+         * {@code SemanticAction}: Mark content with a thumbs up.
+         */
+        public static final int SEMANTIC_ACTION_THUMBS_UP = 8;
+
+        /**
+         * {@code SemanticAction}: Mark content with a thumbs down.
+         */
+        public static final int SEMANTIC_ACTION_THUMBS_DOWN = 9;
+
+        /**
+         * {@code SemanticAction}: Call a contact, group, etc.
+         */
+        public static final int SEMANTIC_ACTION_CALL = 10;
+
         private final Bundle mExtras;
+        @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
         private Icon mIcon;
         private final RemoteInput[] mRemoteInputs;
+        private boolean mAllowGeneratedReplies = true;
+        private final @SemanticAction int mSemanticAction;
+        private final boolean mIsContextual;
 
         /**
          * Small icon representing the action.
@@ -941,8 +1523,11 @@ public class Notification implements Parcelable
             if (in.readInt() == 1) {
                 actionIntent = PendingIntent.CREATOR.createFromParcel(in);
             }
-            mExtras = in.readBundle();
+            mExtras = Bundle.setDefusable(in.readBundle(), true);
             mRemoteInputs = in.createTypedArray(RemoteInput.CREATOR);
+            mAllowGeneratedReplies = in.readInt() == 1;
+            mSemanticAction = in.readInt();
+            mIsContextual = in.readInt() == 1;
         }
 
         /**
@@ -950,11 +1535,14 @@ public class Notification implements Parcelable
          */
         @Deprecated
         public Action(int icon, CharSequence title, PendingIntent intent) {
-            this(Icon.createWithResource("", icon), title, intent, new Bundle(), null);
+            this(Icon.createWithResource("", icon), title, intent, new Bundle(), null, true,
+                    SEMANTIC_ACTION_NONE, false /* isContextual */);
         }
 
+        /** Keep in sync with {@link Notification.Action.Builder#Builder(Action)}! */
         private Action(Icon icon, CharSequence title, PendingIntent intent, Bundle extras,
-                RemoteInput[] remoteInputs) {
+                RemoteInput[] remoteInputs, boolean allowGeneratedReplies,
+                       @SemanticAction int semanticAction, boolean isContextual) {
             this.mIcon = icon;
             if (icon != null && icon.getType() == Icon.TYPE_RESOURCE) {
                 this.icon = icon.getResId();
@@ -963,6 +1551,9 @@ public class Notification implements Parcelable
             this.actionIntent = intent;
             this.mExtras = extras != null ? extras : new Bundle();
             this.mRemoteInputs = remoteInputs;
+            this.mAllowGeneratedReplies = allowGeneratedReplies;
+            this.mSemanticAction = semanticAction;
+            this.mIsContextual = isContextual;
         }
 
         /**
@@ -984,22 +1575,66 @@ public class Notification implements Parcelable
         }
 
         /**
+         * Return whether the platform should automatically generate possible replies for this
+         * {@link Action}
+         */
+        public boolean getAllowGeneratedReplies() {
+            return mAllowGeneratedReplies;
+        }
+
+        /**
          * Get the list of inputs to be collected from the user when this action is sent.
-         * May return null if no remote inputs were added.
+         * May return null if no remote inputs were added. Only returns inputs which accept
+         * a text input. For inputs which only accept data use {@link #getDataOnlyRemoteInputs}.
          */
         public RemoteInput[] getRemoteInputs() {
             return mRemoteInputs;
         }
 
         /**
+         * Returns the {@code SemanticAction} associated with this {@link Action}. A
+         * {@code SemanticAction} denotes what an {@link Action}'s {@link PendingIntent} will do
+         * (eg. reply, mark as read, delete, etc).
+         */
+        public @SemanticAction int getSemanticAction() {
+            return mSemanticAction;
+        }
+
+        /**
+         * Returns whether this is a contextual Action, i.e. whether the action is dependent on the
+         * notification message body. An example of a contextual action could be an action opening a
+         * map application with an address shown in the notification.
+         */
+        public boolean isContextual() {
+            return mIsContextual;
+        }
+
+        /**
+         * Get the list of inputs to be collected from the user that ONLY accept data when this
+         * action is sent. These remote inputs are guaranteed to return true on a call to
+         * {@link RemoteInput#isDataOnly}.
+         *
+         * Returns null if there are no data-only remote inputs.
+         *
+         * This method exists so that legacy RemoteInput collectors that pre-date the addition
+         * of non-textual RemoteInputs do not access these remote inputs.
+         */
+        public RemoteInput[] getDataOnlyRemoteInputs() {
+            return getParcelableArrayFromBundle(mExtras, EXTRA_DATA_ONLY_INPUTS, RemoteInput.class);
+        }
+
+        /**
          * Builder class for {@link Action} objects.
          */
         public static final class Builder {
-            private final Icon mIcon;
-            private final CharSequence mTitle;
-            private final PendingIntent mIntent;
-            private final Bundle mExtras;
-            private ArrayList<RemoteInput> mRemoteInputs;
+            @Nullable private final Icon mIcon;
+            @Nullable private final CharSequence mTitle;
+            @Nullable private final PendingIntent mIntent;
+            private boolean mAllowGeneratedReplies = true;
+            @NonNull private final Bundle mExtras;
+            @Nullable private ArrayList<RemoteInput> mRemoteInputs;
+            private @SemanticAction int mSemanticAction;
+            private boolean mIsContextual;
 
             /**
              * Construct a new builder for {@link Action} object.
@@ -1009,7 +1644,7 @@ public class Notification implements Parcelable
              */
             @Deprecated
             public Builder(int icon, CharSequence title, PendingIntent intent) {
-                this(Icon.createWithResource("", icon), title, intent, new Bundle(), null);
+                this(Icon.createWithResource("", icon), title, intent);
             }
 
             /**
@@ -1019,7 +1654,7 @@ public class Notification implements Parcelable
              * @param intent the {@link PendingIntent} to fire when users trigger this action
              */
             public Builder(Icon icon, CharSequence title, PendingIntent intent) {
-                this(icon, title, intent, new Bundle(), null);
+                this(icon, title, intent, new Bundle(), null, true, SEMANTIC_ACTION_NONE);
             }
 
             /**
@@ -1028,12 +1663,15 @@ public class Notification implements Parcelable
              * @param action the action to read fields from.
              */
             public Builder(Action action) {
-                this(action.getIcon(), action.title, action.actionIntent, new Bundle(action.mExtras),
-                        action.getRemoteInputs());
+                this(action.getIcon(), action.title, action.actionIntent,
+                        new Bundle(action.mExtras), action.getRemoteInputs(),
+                        action.getAllowGeneratedReplies(), action.getSemanticAction());
             }
 
-            private Builder(Icon icon, CharSequence title, PendingIntent intent, Bundle extras,
-                    RemoteInput[] remoteInputs) {
+            private Builder(@Nullable Icon icon, @Nullable CharSequence title,
+                    @Nullable PendingIntent intent, @NonNull Bundle extras,
+                    @Nullable RemoteInput[] remoteInputs, boolean allowGeneratedReplies,
+                    @SemanticAction int semanticAction) {
                 mIcon = icon;
                 mTitle = title;
                 mIntent = intent;
@@ -1042,6 +1680,8 @@ public class Notification implements Parcelable
                     mRemoteInputs = new ArrayList<RemoteInput>(remoteInputs.length);
                     Collections.addAll(mRemoteInputs, remoteInputs);
                 }
+                mAllowGeneratedReplies = allowGeneratedReplies;
+                mSemanticAction = semanticAction;
             }
 
             /**
@@ -1051,6 +1691,7 @@ public class Notification implements Parcelable
              *
              * @see Notification.Action#extras
              */
+            @NonNull
             public Builder addExtras(Bundle extras) {
                 if (extras != null) {
                     mExtras.putAll(extras);
@@ -1063,6 +1704,7 @@ public class Notification implements Parcelable
              *
              * <p>The returned Bundle is shared with this Builder.
              */
+            @NonNull
             public Bundle getExtras() {
                 return mExtras;
             }
@@ -1074,6 +1716,7 @@ public class Notification implements Parcelable
              * @param remoteInput a {@link RemoteInput} to add to the action
              * @return this object for method chaining
              */
+            @NonNull
             public Builder addRemoteInput(RemoteInput remoteInput) {
                 if (mRemoteInputs == null) {
                     mRemoteInputs = new ArrayList<RemoteInput>();
@@ -1083,12 +1726,70 @@ public class Notification implements Parcelable
             }
 
             /**
+             * Set whether the platform should automatically generate possible replies to add to
+             * {@link RemoteInput#getChoices()}. If the {@link Action} doesn't have a
+             * {@link RemoteInput}, this has no effect.
+             * @param allowGeneratedReplies {@code true} to allow generated replies, {@code false}
+             * otherwise
+             * @return this object for method chaining
+             * The default value is {@code true}
+             */
+            @NonNull
+            public Builder setAllowGeneratedReplies(boolean allowGeneratedReplies) {
+                mAllowGeneratedReplies = allowGeneratedReplies;
+                return this;
+            }
+
+            /**
+             * Sets the {@code SemanticAction} for this {@link Action}. A
+             * {@code SemanticAction} denotes what an {@link Action}'s
+             * {@link PendingIntent} will do (eg. reply, mark as read, delete, etc).
+             * @param semanticAction a SemanticAction defined within {@link Action} with
+             * {@code SEMANTIC_ACTION_} prefixes
+             * @return this object for method chaining
+             */
+            @NonNull
+            public Builder setSemanticAction(@SemanticAction int semanticAction) {
+                mSemanticAction = semanticAction;
+                return this;
+            }
+
+            /**
+             * Sets whether this {@link Action} is a contextual action, i.e. whether the action is
+             * dependent on the notification message body. An example of a contextual action could
+             * be an action opening a map application with an address shown in the notification.
+             */
+            @NonNull
+            public Builder setContextual(boolean isContextual) {
+                mIsContextual = isContextual;
+                return this;
+            }
+
+            /**
              * Apply an extender to this action builder. Extenders may be used to add
              * metadata or change options on this builder.
              */
+            @NonNull
             public Builder extend(Extender extender) {
                 extender.extend(this);
                 return this;
+            }
+
+            /**
+             * Throws an NPE if we are building a contextual action missing one of the fields
+             * necessary to display the action.
+             */
+            private void checkContextualActionNullFields() {
+                if (!mIsContextual) return;
+
+                if (mIcon == null) {
+                    throw new NullPointerException("Contextual Actions must contain a valid icon");
+                }
+
+                if (mIntent == null) {
+                    throw new NullPointerException(
+                            "Contextual Actions must contain a valid PendingIntent");
+                }
             }
 
             /**
@@ -1096,10 +1797,37 @@ public class Notification implements Parcelable
              * object.
              * @return the built action
              */
+            @NonNull
             public Action build() {
-                RemoteInput[] remoteInputs = mRemoteInputs != null
-                        ? mRemoteInputs.toArray(new RemoteInput[mRemoteInputs.size()]) : null;
-                return new Action(mIcon, mTitle, mIntent, mExtras, remoteInputs);
+                checkContextualActionNullFields();
+
+                ArrayList<RemoteInput> dataOnlyInputs = new ArrayList<>();
+                RemoteInput[] previousDataInputs = getParcelableArrayFromBundle(
+                        mExtras, EXTRA_DATA_ONLY_INPUTS, RemoteInput.class);
+                if (previousDataInputs != null) {
+                    for (RemoteInput input : previousDataInputs) {
+                        dataOnlyInputs.add(input);
+                    }
+                }
+                List<RemoteInput> textInputs = new ArrayList<>();
+                if (mRemoteInputs != null) {
+                    for (RemoteInput input : mRemoteInputs) {
+                        if (input.isDataOnly()) {
+                            dataOnlyInputs.add(input);
+                        } else {
+                            textInputs.add(input);
+                        }
+                    }
+                }
+                if (!dataOnlyInputs.isEmpty()) {
+                    RemoteInput[] dataInputsArr =
+                            dataOnlyInputs.toArray(new RemoteInput[dataOnlyInputs.size()]);
+                    mExtras.putParcelableArray(EXTRA_DATA_ONLY_INPUTS, dataInputsArr);
+                }
+                RemoteInput[] textInputsArr = textInputs.isEmpty()
+                        ? null : textInputs.toArray(new RemoteInput[textInputs.size()]);
+                return new Action(mIcon, mTitle, mIntent, mExtras, textInputsArr,
+                        mAllowGeneratedReplies, mSemanticAction, mIsContextual);
             }
         }
 
@@ -1109,13 +1837,18 @@ public class Notification implements Parcelable
                     getIcon(),
                     title,
                     actionIntent, // safe to alias
-                    new Bundle(mExtras),
-                    getRemoteInputs());
+                    mExtras == null ? new Bundle() : new Bundle(mExtras),
+                    getRemoteInputs(),
+                    getAllowGeneratedReplies(),
+                    getSemanticAction(),
+                    isContextual());
         }
+
         @Override
         public int describeContents() {
             return 0;
         }
+
         @Override
         public void writeToParcel(Parcel out, int flags) {
             final Icon ic = getIcon();
@@ -1134,8 +1867,12 @@ public class Notification implements Parcelable
             }
             out.writeBundle(mExtras);
             out.writeTypedArray(mRemoteInputs, flags);
+            out.writeInt(mAllowGeneratedReplies ? 1 : 0);
+            out.writeInt(mSemanticAction);
+            out.writeInt(mIsContextual ? 1 : 0);
         }
-        public static final Parcelable.Creator<Action> CREATOR =
+
+        public static final @android.annotation.NonNull Parcelable.Creator<Action> CREATOR =
                 new Parcelable.Creator<Action>() {
             public Action createFromParcel(Parcel in) {
                 return new Action(in);
@@ -1184,6 +1921,8 @@ public class Notification implements Parcelable
 
             // Flags bitwise-ored to mFlags
             private static final int FLAG_AVAILABLE_OFFLINE = 0x1;
+            private static final int FLAG_HINT_LAUNCHES_ACTIVITY = 1 << 1;
+            private static final int FLAG_HINT_DISPLAY_INLINE = 1 << 2;
 
             // Default value for flags integer
             private static final int DEFAULT_FLAGS = FLAG_AVAILABLE_OFFLINE;
@@ -1288,6 +2027,7 @@ public class Notification implements Parcelable
              * @param label the label to display while the action is being prepared to execute
              * @return this object for method chaining
              */
+            @Deprecated
             public WearableExtender setInProgressLabel(CharSequence label) {
                 mInProgressLabel = label;
                 return this;
@@ -1299,6 +2039,7 @@ public class Notification implements Parcelable
              *
              * @return the label to display while the action is being prepared to execute
              */
+            @Deprecated
             public CharSequence getInProgressLabel() {
                 return mInProgressLabel;
             }
@@ -1310,6 +2051,7 @@ public class Notification implements Parcelable
              * @param label the label to confirm the action should be executed
              * @return this object for method chaining
              */
+            @Deprecated
             public WearableExtender setConfirmLabel(CharSequence label) {
                 mConfirmLabel = label;
                 return this;
@@ -1321,6 +2063,7 @@ public class Notification implements Parcelable
              *
              * @return the label to confirm the action should be executed
              */
+            @Deprecated
             public CharSequence getConfirmLabel() {
                 return mConfirmLabel;
             }
@@ -1332,6 +2075,7 @@ public class Notification implements Parcelable
              * @param label the label to display to cancel the action
              * @return this object for method chaining
              */
+            @Deprecated
             public WearableExtender setCancelLabel(CharSequence label) {
                 mCancelLabel = label;
                 return this;
@@ -1343,10 +2087,82 @@ public class Notification implements Parcelable
              *
              * @return the label to display to cancel the action
              */
+            @Deprecated
             public CharSequence getCancelLabel() {
                 return mCancelLabel;
             }
+
+            /**
+             * Set a hint that this Action will launch an {@link Activity} directly, telling the
+             * platform that it can generate the appropriate transitions.
+             * @param hintLaunchesActivity {@code true} if the content intent will launch
+             * an activity and transitions should be generated, false otherwise.
+             * @return this object for method chaining
+             */
+            public WearableExtender setHintLaunchesActivity(
+                    boolean hintLaunchesActivity) {
+                setFlag(FLAG_HINT_LAUNCHES_ACTIVITY, hintLaunchesActivity);
+                return this;
+            }
+
+            /**
+             * Get a hint that this Action will launch an {@link Activity} directly, telling the
+             * platform that it can generate the appropriate transitions
+             * @return {@code true} if the content intent will launch an activity and transitions
+             * should be generated, false otherwise. The default value is {@code false} if this was
+             * never set.
+             */
+            public boolean getHintLaunchesActivity() {
+                return (mFlags & FLAG_HINT_LAUNCHES_ACTIVITY) != 0;
+            }
+
+            /**
+             * Set a hint that this Action should be displayed inline.
+             *
+             * @param hintDisplayInline {@code true} if action should be displayed inline, false
+             *        otherwise
+             * @return this object for method chaining
+             */
+            public WearableExtender setHintDisplayActionInline(
+                    boolean hintDisplayInline) {
+                setFlag(FLAG_HINT_DISPLAY_INLINE, hintDisplayInline);
+                return this;
+            }
+
+            /**
+             * Get a hint that this Action should be displayed inline.
+             *
+             * @return {@code true} if the Action should be displayed inline, {@code false}
+             *         otherwise. The default value is {@code false} if this was never set.
+             */
+            public boolean getHintDisplayActionInline() {
+                return (mFlags & FLAG_HINT_DISPLAY_INLINE) != 0;
+            }
         }
+
+        /**
+         * Provides meaning to an {@link Action} that hints at what the associated
+         * {@link PendingIntent} will do. For example, an {@link Action} with a
+         * {@link PendingIntent} that replies to a text message notification may have the
+         * {@link #SEMANTIC_ACTION_REPLY} {@code SemanticAction} set within it.
+         *
+         * @hide
+         */
+        @IntDef(prefix = { "SEMANTIC_ACTION_" }, value = {
+                SEMANTIC_ACTION_NONE,
+                SEMANTIC_ACTION_REPLY,
+                SEMANTIC_ACTION_MARK_AS_READ,
+                SEMANTIC_ACTION_MARK_AS_UNREAD,
+                SEMANTIC_ACTION_DELETE,
+                SEMANTIC_ACTION_ARCHIVE,
+                SEMANTIC_ACTION_MUTE,
+                SEMANTIC_ACTION_UNMUTE,
+                SEMANTIC_ACTION_THUMBS_UP,
+                SEMANTIC_ACTION_THUMBS_DOWN,
+                SEMANTIC_ACTION_CALL
+        })
+        @Retention(RetentionPolicy.SOURCE)
+        public @interface SemanticAction {}
     }
 
     /**
@@ -1371,12 +2187,14 @@ public class Notification implements Parcelable
     public Notification()
     {
         this.when = System.currentTimeMillis();
+        this.creationTime = System.currentTimeMillis();
         this.priority = PRIORITY_DEFAULT;
     }
 
     /**
      * @hide
      */
+    @UnsupportedAppUsage
     public Notification(Context context, int icon, CharSequence tickerText, long when,
             CharSequence contentTitle, CharSequence contentText, Intent contentIntent)
     {
@@ -1408,16 +2226,34 @@ public class Notification implements Parcelable
         this.icon = icon;
         this.tickerText = tickerText;
         this.when = when;
+        this.creationTime = System.currentTimeMillis();
     }
 
     /**
      * Unflatten the notification from a parcel.
      */
-    public Notification(Parcel parcel)
+    @SuppressWarnings("unchecked")
+    public Notification(Parcel parcel) {
+        // IMPORTANT: Add unmarshaling code in readFromParcel as the pending
+        // intents in extras are always written as the last entry.
+        readFromParcelImpl(parcel);
+        // Must be read last!
+        allPendingIntents = (ArraySet<PendingIntent>) parcel.readArraySet(null);
+    }
+
+    private void readFromParcelImpl(Parcel parcel)
     {
         int version = parcel.readInt();
 
+        mAllowlistToken = parcel.readStrongBinder();
+        if (mAllowlistToken == null) {
+            mAllowlistToken = processAllowlistToken;
+        }
+        // Propagate this token to all pending intents that are unmarshalled from the parcel.
+        parcel.setClassCookie(PendingIntent.class, mAllowlistToken);
+
         when = parcel.readLong();
+        creationTime = parcel.readLong();
         if (parcel.readInt() != 0) {
             mSmallIcon = Icon.CREATOR.createFromParcel(parcel);
             if (mSmallIcon.getType() == Icon.TYPE_RESOURCE) {
@@ -1465,13 +2301,14 @@ public class Notification implements Parcelable
 
         priority = parcel.readInt();
 
-        category = parcel.readString();
+        category = parcel.readString8();
 
-        mGroupKey = parcel.readString();
+        mGroupKey = parcel.readString8();
 
-        mSortKey = parcel.readString();
+        mSortKey = parcel.readString8();
 
-        extras = parcel.readBundle(); // may be null
+        extras = Bundle.setDefusable(parcel.readBundle(), true); // may be null
+        fixDuplicateExtras();
 
         actions = parcel.createTypedArray(Action.CREATOR); // may be null
 
@@ -1490,6 +2327,32 @@ public class Notification implements Parcelable
         }
 
         color = parcel.readInt();
+
+        if (parcel.readInt() != 0) {
+            mChannelId = parcel.readString8();
+        }
+        mTimeout = parcel.readLong();
+
+        if (parcel.readInt() != 0) {
+            mShortcutId = parcel.readString8();
+        }
+
+        if (parcel.readInt() != 0) {
+            mLocusId = LocusId.CREATOR.createFromParcel(parcel);
+        }
+
+        mBadgeIcon = parcel.readInt();
+
+        if (parcel.readInt() != 0) {
+            mSettingsText = TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel(parcel);
+        }
+
+        mGroupAlertBehavior = parcel.readInt();
+        if (parcel.readInt() != 0) {
+            mBubbleMetadata = BubbleMetadata.CREATOR.createFromParcel(parcel);
+        }
+
+        mAllowSystemGeneratedContextualActions = parcel.readBoolean();
     }
 
     @Override
@@ -1505,7 +2368,9 @@ public class Notification implements Parcelable
      * @hide
      */
     public void cloneInto(Notification that, boolean heavy) {
+        that.mAllowlistToken = this.mAllowlistToken;
         that.when = this.when;
+        that.creationTime = this.creationTime;
         that.mSmallIcon = this.mSmallIcon;
         that.number = this.number;
 
@@ -1566,10 +2431,16 @@ public class Notification implements Parcelable
             }
         }
 
+        if (!ArrayUtils.isEmpty(allPendingIntents)) {
+            that.allPendingIntents = new ArraySet<>(allPendingIntents);
+        }
+
         if (this.actions != null) {
             that.actions = new Action[this.actions.length];
             for(int i=0; i<this.actions.length; i++) {
-                that.actions[i] = this.actions[i].clone();
+                if ( this.actions[i] != null) {
+                    that.actions[i] = this.actions[i].clone();
+                }
             }
         }
 
@@ -1590,8 +2461,91 @@ public class Notification implements Parcelable
 
         that.color = this.color;
 
+        that.mChannelId = this.mChannelId;
+        that.mTimeout = this.mTimeout;
+        that.mShortcutId = this.mShortcutId;
+        that.mLocusId = this.mLocusId;
+        that.mBadgeIcon = this.mBadgeIcon;
+        that.mSettingsText = this.mSettingsText;
+        that.mGroupAlertBehavior = this.mGroupAlertBehavior;
+        that.mBubbleMetadata = this.mBubbleMetadata;
+        that.mAllowSystemGeneratedContextualActions = this.mAllowSystemGeneratedContextualActions;
+
         if (!heavy) {
             that.lightenPayload(); // will clean out extras
+        }
+    }
+
+    /**
+     * Note all {@link Uri} that are referenced internally, with the expectation
+     * that Uri permission grants will need to be issued to ensure the recipient
+     * of this object is able to render its contents.
+     *
+     * @hide
+     */
+    public void visitUris(@NonNull Consumer<Uri> visitor) {
+        visitor.accept(sound);
+
+        if (tickerView != null) tickerView.visitUris(visitor);
+        if (contentView != null) contentView.visitUris(visitor);
+        if (bigContentView != null) bigContentView.visitUris(visitor);
+        if (headsUpContentView != null) headsUpContentView.visitUris(visitor);
+
+        if (extras != null) {
+            visitor.accept(extras.getParcelable(EXTRA_AUDIO_CONTENTS_URI));
+            if (extras.containsKey(EXTRA_BACKGROUND_IMAGE_URI)) {
+                visitor.accept(Uri.parse(extras.getString(EXTRA_BACKGROUND_IMAGE_URI)));
+            }
+
+            ArrayList<Person> people = extras.getParcelableArrayList(EXTRA_PEOPLE_LIST);
+            if (people != null && !people.isEmpty()) {
+                for (Person p : people) {
+                    if (p.getIconUri() != null) {
+                        visitor.accept(p.getIconUri());
+                    }
+                }
+            }
+
+            final Person person = extras.getParcelable(EXTRA_MESSAGING_PERSON);
+            if (person != null && person.getIconUri() != null) {
+                visitor.accept(person.getIconUri());
+            }
+        }
+
+        if (MessagingStyle.class.equals(getNotificationStyle()) && extras != null) {
+            final Parcelable[] messages = extras.getParcelableArray(EXTRA_MESSAGES);
+            if (!ArrayUtils.isEmpty(messages)) {
+                for (MessagingStyle.Message message : MessagingStyle.Message
+                        .getMessagesFromBundleArray(messages)) {
+                    visitor.accept(message.getDataUri());
+
+                    Person senderPerson = message.getSenderPerson();
+                    if (senderPerson != null && senderPerson.getIconUri() != null) {
+                        visitor.accept(senderPerson.getIconUri());
+                    }
+                }
+            }
+
+            final Parcelable[] historic = extras.getParcelableArray(EXTRA_HISTORIC_MESSAGES);
+            if (!ArrayUtils.isEmpty(historic)) {
+                for (MessagingStyle.Message message : MessagingStyle.Message
+                        .getMessagesFromBundleArray(historic)) {
+                    visitor.accept(message.getDataUri());
+
+                    Person senderPerson = message.getSenderPerson();
+                    if (senderPerson != null && senderPerson.getIconUri() != null) {
+                        visitor.accept(senderPerson.getIconUri());
+                    }
+                }
+            }
+        }
+
+        if (mBubbleMetadata != null && mBubbleMetadata.getIcon() != null) {
+            final Icon icon = mBubbleMetadata.getIcon();
+            final int iconType = icon.getType();
+            if (iconType == TYPE_URI_ADAPTIVE_BITMAP || iconType == TYPE_URI) {
+                visitor.accept(icon.getUri());
+            }
         }
     }
 
@@ -1607,13 +2561,14 @@ public class Notification implements Parcelable
         headsUpContentView = null;
         mLargeIcon = null;
         if (extras != null && !extras.isEmpty()) {
-            // Prevent light notifications from being rebuilt.
-            extras.remove(Builder.EXTRA_NEEDS_REBUILD);
             final Set<String> keyset = extras.keySet();
             final int N = keyset.size();
             final String[] keys = keyset.toArray(new String[N]);
             for (int i=0; i<N; i++) {
                 final String key = keys[i];
+                if (TvExtender.EXTRA_TV_EXTENDER.equals(key)) {
+                    continue;
+                }
                 final Object obj = extras.get(key);
                 if (obj != null &&
                     (  obj instanceof Parcelable
@@ -1641,8 +2596,39 @@ public class Notification implements Parcelable
                     + " instance is a custom Parcelable and not allowed in Notification");
             return cs.toString();
         }
+        return removeTextSizeSpans(cs);
+    }
 
-        return cs;
+    private static CharSequence removeTextSizeSpans(CharSequence charSequence) {
+        if (charSequence instanceof Spanned) {
+            Spanned ss = (Spanned) charSequence;
+            Object[] spans = ss.getSpans(0, ss.length(), Object.class);
+            SpannableStringBuilder builder = new SpannableStringBuilder(ss.toString());
+            for (Object span : spans) {
+                Object resultSpan = span;
+                if (resultSpan instanceof CharacterStyle) {
+                    resultSpan = ((CharacterStyle) span).getUnderlying();
+                }
+                if (resultSpan instanceof TextAppearanceSpan) {
+                    TextAppearanceSpan originalSpan = (TextAppearanceSpan) resultSpan;
+                    resultSpan = new TextAppearanceSpan(
+                            originalSpan.getFamily(),
+                            originalSpan.getTextStyle(),
+                            -1,
+                            originalSpan.getTextColor(),
+                            originalSpan.getLinkTextColor());
+                } else if (resultSpan instanceof RelativeSizeSpan
+                        || resultSpan instanceof AbsoluteSizeSpan) {
+                    continue;
+                } else {
+                    resultSpan = span;
+                }
+                builder.setSpan(resultSpan, ss.getSpanStart(span), ss.getSpanEnd(span),
+                        ss.getSpanFlags(span));
+            }
+            return builder;
+        }
+        return charSequence;
     }
 
     public int describeContents() {
@@ -1652,11 +2638,49 @@ public class Notification implements Parcelable
     /**
      * Flatten this notification into a parcel.
      */
-    public void writeToParcel(Parcel parcel, int flags)
-    {
+    public void writeToParcel(Parcel parcel, int flags) {
+        // We need to mark all pending intents getting into the notification
+        // system as being put there to later allow the notification ranker
+        // to launch them and by doing so add the app to the battery saver white
+        // list for a short period of time. The problem is that the system
+        // cannot look into the extras as there may be parcelables there that
+        // the platform does not know how to handle. To go around that we have
+        // an explicit list of the pending intents in the extras bundle.
+        final boolean collectPendingIntents = (allPendingIntents == null);
+        if (collectPendingIntents) {
+            PendingIntent.setOnMarshaledListener(
+                    (PendingIntent intent, Parcel out, int outFlags) -> {
+                if (parcel == out) {
+                    synchronized (this) {
+                        if (allPendingIntents == null) {
+                            allPendingIntents = new ArraySet<>();
+                        }
+                        allPendingIntents.add(intent);
+                    }
+                }
+            });
+        }
+        try {
+            // IMPORTANT: Add marshaling code in writeToParcelImpl as we
+            // want to intercept all pending events written to the parcel.
+            writeToParcelImpl(parcel, flags);
+            synchronized (this) {
+                // Must be written last!
+                parcel.writeArraySet(allPendingIntents);
+            }
+        } finally {
+            if (collectPendingIntents) {
+                PendingIntent.setOnMarshaledListener(null);
+            }
+        }
+    }
+
+    private void writeToParcelImpl(Parcel parcel, int flags) {
         parcel.writeInt(1);
 
+        parcel.writeStrongBinder(mAllowlistToken);
         parcel.writeLong(when);
+        parcel.writeLong(creationTime);
         if (mSmallIcon == null && icon != 0) {
             // you snuck an icon in here without using the builder; let's try to keep it
             mSmallIcon = Icon.createWithResource("", icon);
@@ -1698,6 +2722,10 @@ public class Notification implements Parcelable
         } else {
             parcel.writeInt(0);
         }
+        if (mLargeIcon == null && largeIcon != null) {
+            // you snuck an icon in here without using the builder; let's try to keep it
+            mLargeIcon = Icon.createWithBitmap(largeIcon);
+        }
         if (mLargeIcon != null) {
             parcel.writeInt(1);
             mLargeIcon.writeToParcel(parcel, 0);
@@ -1738,11 +2766,11 @@ public class Notification implements Parcelable
 
         parcel.writeInt(priority);
 
-        parcel.writeString(category);
+        parcel.writeString8(category);
 
-        parcel.writeString(mGroupKey);
+        parcel.writeString8(mGroupKey);
 
-        parcel.writeString(mSortKey);
+        parcel.writeString8(mSortKey);
 
         parcel.writeBundle(extras); // null ok
 
@@ -1772,12 +2800,56 @@ public class Notification implements Parcelable
         }
 
         parcel.writeInt(color);
+
+        if (mChannelId != null) {
+            parcel.writeInt(1);
+            parcel.writeString8(mChannelId);
+        } else {
+            parcel.writeInt(0);
+        }
+        parcel.writeLong(mTimeout);
+
+        if (mShortcutId != null) {
+            parcel.writeInt(1);
+            parcel.writeString8(mShortcutId);
+        } else {
+            parcel.writeInt(0);
+        }
+
+        if (mLocusId != null) {
+            parcel.writeInt(1);
+            mLocusId.writeToParcel(parcel, 0);
+        } else {
+            parcel.writeInt(0);
+        }
+
+        parcel.writeInt(mBadgeIcon);
+
+        if (mSettingsText != null) {
+            parcel.writeInt(1);
+            TextUtils.writeToParcel(mSettingsText, parcel, flags);
+        } else {
+            parcel.writeInt(0);
+        }
+
+        parcel.writeInt(mGroupAlertBehavior);
+
+        if (mBubbleMetadata != null) {
+            parcel.writeInt(1);
+            mBubbleMetadata.writeToParcel(parcel, 0);
+        } else {
+            parcel.writeInt(0);
+        }
+
+        parcel.writeBoolean(mAllowSystemGeneratedContextualActions);
+
+        // mUsesStandardHeader is not written because it should be recomputed in listeners
     }
 
     /**
      * Parcelable.Creator that instantiates Notification objects
      */
-    public static final Parcelable.Creator<Notification> CREATOR
+    public static final @android.annotation.NonNull Parcelable.Creator<Notification> CREATOR
             = new Parcelable.Creator<Notification>()
     {
         public Notification createFromParcel(Parcel parcel)
@@ -1790,6 +2862,125 @@ public class Notification implements Parcelable
             return new Notification[size];
         }
     };
+
+    /**
+     * @hide
+     */
+    public static boolean areActionsVisiblyDifferent(Notification first, Notification second) {
+        Notification.Action[] firstAs = first.actions;
+        Notification.Action[] secondAs = second.actions;
+        if (firstAs == null && secondAs != null || firstAs != null && secondAs == null) {
+            return true;
+        }
+        if (firstAs != null && secondAs != null) {
+            if (firstAs.length != secondAs.length) {
+                return true;
+            }
+            for (int i = 0; i < firstAs.length; i++) {
+                if (!Objects.equals(String.valueOf(firstAs[i].title),
+                        String.valueOf(secondAs[i].title))) {
+                    return true;
+                }
+                RemoteInput[] firstRs = firstAs[i].getRemoteInputs();
+                RemoteInput[] secondRs = secondAs[i].getRemoteInputs();
+                if (firstRs == null) {
+                    firstRs = new RemoteInput[0];
+                }
+                if (secondRs == null) {
+                    secondRs = new RemoteInput[0];
+                }
+                if (firstRs.length != secondRs.length) {
+                    return true;
+                }
+                for (int j = 0; j < firstRs.length; j++) {
+                    if (!Objects.equals(String.valueOf(firstRs[j].getLabel()),
+                            String.valueOf(secondRs[j].getLabel()))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @hide
+     */
+    public static boolean areStyledNotificationsVisiblyDifferent(Builder first, Builder second) {
+        if (first.getStyle() == null) {
+            return second.getStyle() != null;
+        }
+        if (second.getStyle() == null) {
+            return true;
+        }
+        return first.getStyle().areNotificationsVisiblyDifferent(second.getStyle());
+    }
+
+    /**
+     * @hide
+     */
+    public static boolean areRemoteViewsChanged(Builder first, Builder second) {
+        if (!Objects.equals(first.usesStandardHeader(), second.usesStandardHeader())) {
+            return true;
+        }
+
+        if (areRemoteViewsChanged(first.mN.contentView, second.mN.contentView)) {
+            return true;
+        }
+        if (areRemoteViewsChanged(first.mN.bigContentView, second.mN.bigContentView)) {
+            return true;
+        }
+        if (areRemoteViewsChanged(first.mN.headsUpContentView, second.mN.headsUpContentView)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static boolean areRemoteViewsChanged(RemoteViews first, RemoteViews second) {
+        if (first == null && second == null) {
+            return false;
+        }
+        if (first == null && second != null || first != null && second == null) {
+            return true;
+        }
+
+        if (!Objects.equals(first.getLayoutId(), second.getLayoutId())) {
+            return true;
+        }
+
+        if (!Objects.equals(first.getSequenceNumber(), second.getSequenceNumber())) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Parcelling creates multiple copies of objects in {@code extras}. Fix them.
+     * <p>
+     * For backwards compatibility {@code extras} holds some references to "real" member data such
+     * as {@link getLargeIcon()} which is mirrored by {@link #EXTRA_LARGE_ICON}. This is mostly
+     * fine as long as the object stays in one process.
+     * <p>
+     * However, once the notification goes into a parcel each reference gets marshalled separately,
+     * wasting memory. Especially with large images on Auto and TV, this is worth fixing.
+     */
+    private void fixDuplicateExtras() {
+        if (extras != null) {
+            fixDuplicateExtra(mLargeIcon, EXTRA_LARGE_ICON);
+        }
+    }
+
+    /**
+     * If we find an extra that's exactly the same as one of the "real" fields but refers to a
+     * separate object, replace it with the field's version to avoid holding duplicate copies.
+     */
+    private void fixDuplicateExtra(@Nullable Parcelable original, @NonNull String extraName) {
+        if (original != null && extras.getParcelable(extraName) != null) {
+            extras.putParcelable(extraName, original);
+        }
+    }
 
     /**
      * Sets the {@link #contentView} field to be a view with the standard "Latest Event"
@@ -1813,21 +3004,17 @@ public class Notification implements Parcelable
     @Deprecated
     public void setLatestEventInfo(Context context,
             CharSequence contentTitle, CharSequence contentText, PendingIntent contentIntent) {
-        Notification.Builder builder = new Notification.Builder(context);
+        if (context.getApplicationInfo().targetSdkVersion > Build.VERSION_CODES.LOLLIPOP_MR1){
+            Log.e(TAG, "setLatestEventInfo() is deprecated and you should feel deprecated.",
+                    new Throwable());
+        }
 
-        // First, ensure that key pieces of information that may have been set directly
-        // are preserved
-        builder.setWhen(this.when);
-        builder.setSmallIcon(this.icon);
-        builder.setPriority(this.priority);
-        builder.setTicker(this.tickerText);
-        builder.setNumber(this.number);
-        builder.setColor(this.color);
-        builder.mFlags = this.flags;
-        builder.setSound(this.sound, this.audioStreamType);
-        builder.setDefaults(this.defaults);
-        builder.setVibrate(this.vibrate);
-        builder.setDeleteIntent(this.deleteIntent);
+        if (context.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N) {
+            extras.putBoolean(EXTRA_SHOW_WHEN, true);
+        }
+
+        // ensure that any information already set directly is preserved
+        final Notification.Builder builder = new Notification.Builder(context, this);
 
         // now apply the latestEventInfo fields
         if (contentTitle != null) {
@@ -1837,14 +3024,55 @@ public class Notification implements Parcelable
             builder.setContentText(contentText);
         }
         builder.setContentIntent(contentIntent);
-        builder.buildInto(this);
+
+        builder.build(); // callers expect this notification to be ready to use
+    }
+
+    /**
+     * @hide
+     */
+    public static void addFieldsFromContext(Context context, Notification notification) {
+        addFieldsFromContext(context.getApplicationInfo(), notification);
+    }
+
+    /**
+     * @hide
+     */
+    public static void addFieldsFromContext(ApplicationInfo ai, Notification notification) {
+        notification.extras.putParcelable(EXTRA_BUILDER_APPLICATION_INFO, ai);
+    }
+
+    /**
+     * @hide
+     */
+    public void dumpDebug(ProtoOutputStream proto, long fieldId) {
+        long token = proto.start(fieldId);
+        proto.write(NotificationProto.CHANNEL_ID, getChannelId());
+        proto.write(NotificationProto.HAS_TICKER_TEXT, this.tickerText != null);
+        proto.write(NotificationProto.FLAGS, this.flags);
+        proto.write(NotificationProto.COLOR, this.color);
+        proto.write(NotificationProto.CATEGORY, this.category);
+        proto.write(NotificationProto.GROUP_KEY, this.mGroupKey);
+        proto.write(NotificationProto.SORT_KEY, this.mSortKey);
+        if (this.actions != null) {
+            proto.write(NotificationProto.ACTION_LENGTH, this.actions.length);
+        }
+        if (this.visibility >= VISIBILITY_SECRET && this.visibility <= VISIBILITY_PUBLIC) {
+            proto.write(NotificationProto.VISIBILITY, this.visibility);
+        }
+        if (publicVersion != null) {
+            publicVersion.dumpDebug(proto, NotificationProto.PUBLIC_VERSION);
+        }
+        proto.end(token);
     }
 
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append("Notification(pri=");
-        sb.append(priority);
+        sb.append("Notification(channel=");
+        sb.append(getChannelId());
+        sb.append(" shortcut=");
+        sb.append(getShortcutId());
         sb.append(" contentView=");
         if (contentView != null) {
             sb.append(contentView.getPackage());
@@ -1908,6 +3136,10 @@ public class Notification implements Parcelable
             sb.append(" publicVersion=");
             sb.append(publicVersion.toString());
         }
+        if (this.mLocusId != null) {
+            sb.append(" locusId=");
+            sb.append(this.mLocusId); // LocusId.toString() is PII safe.
+        }
         sb.append(")");
         return sb.toString();
     }
@@ -1949,6 +3181,120 @@ public class Notification implements Parcelable
     }
 
     /**
+     * @hide
+     */
+    public boolean hasCompletedProgress() {
+        // not a progress notification; can't be complete
+        if (!extras.containsKey(EXTRA_PROGRESS)
+                || !extras.containsKey(EXTRA_PROGRESS_MAX)) {
+            return false;
+        }
+        // many apps use max 0 for 'indeterminate'; not complete
+        if (extras.getInt(EXTRA_PROGRESS_MAX) == 0) {
+            return false;
+        }
+        return extras.getInt(EXTRA_PROGRESS) == extras.getInt(EXTRA_PROGRESS_MAX);
+    }
+
+    /** @removed */
+    @Deprecated
+    public String getChannel() {
+        return mChannelId;
+    }
+
+    /**
+     * Returns the id of the channel this notification posts to.
+     */
+    public String getChannelId() {
+        return mChannelId;
+    }
+
+    /** @removed */
+    @Deprecated
+    public long getTimeout() {
+        return mTimeout;
+    }
+
+    /**
+     * Returns the duration from posting after which this notification should be canceled by the
+     * system, if it's not canceled already.
+     */
+    public long getTimeoutAfter() {
+        return mTimeout;
+    }
+
+    /**
+     * Returns what icon should be shown for this notification if it is being displayed in a
+     * Launcher that supports badging. Will be one of {@link #BADGE_ICON_NONE},
+     * {@link #BADGE_ICON_SMALL}, or {@link #BADGE_ICON_LARGE}.
+     */
+    public int getBadgeIconType() {
+        return mBadgeIcon;
+    }
+
+    /**
+     * Returns the {@link ShortcutInfo#getId() id} that this notification supersedes, if any.
+     *
+     * <p>Used by some Launchers that display notification content to hide shortcuts that duplicate
+     * notifications.
+     */
+    public String getShortcutId() {
+        return mShortcutId;
+    }
+
+    /**
+     * Gets the {@link LocusId} associated with this notification.
+     *
+     * <p>Used by the device's intelligence services to correlate objects (such as
+     * {@link ShortcutInfo} and {@link ContentCaptureContext}) that are correlated.
+     */
+    @Nullable
+    public LocusId getLocusId() {
+        return mLocusId;
+    }
+
+    /**
+     * Returns the settings text provided to {@link Builder#setSettingsText(CharSequence)}.
+     */
+    public CharSequence getSettingsText() {
+        return mSettingsText;
+    }
+
+    /**
+     * Returns which type of notifications in a group are responsible for audibly alerting the
+     * user. See {@link #GROUP_ALERT_ALL}, {@link #GROUP_ALERT_CHILDREN},
+     * {@link #GROUP_ALERT_SUMMARY}.
+     */
+    public @GroupAlertBehavior int getGroupAlertBehavior() {
+        return mGroupAlertBehavior;
+    }
+
+    /**
+     * Returns the bubble metadata that will be used to display app content in a floating window
+     * over the existing foreground activity.
+     */
+    @Nullable
+    public BubbleMetadata getBubbleMetadata() {
+        return mBubbleMetadata;
+    }
+
+    /**
+     * Sets the {@link BubbleMetadata} for this notification.
+     * @hide
+     */
+    public void setBubbleMetadata(BubbleMetadata data) {
+        mBubbleMetadata = data;
+    }
+
+    /**
+     * Returns whether the platform is allowed (by the app developer) to generate contextual actions
+     * for this notification.
+     */
+    public boolean getAllowSystemGeneratedContextualActions() {
+        return mAllowSystemGeneratedContextualActions;
+    }
+
+    /**
      * The small icon representing this notification in the status bar and content view.
      *
      * @return the small icon representing this notification.
@@ -1964,6 +3310,7 @@ public class Notification implements Parcelable
      * Used when notifying to clean up legacy small icons.
      * @hide
      */
+    @UnsupportedAppUsage
     public void setSmallIcon(Icon icon) {
         mSmallIcon = icon;
     }
@@ -1980,15 +3327,7 @@ public class Notification implements Parcelable
     /**
      * @hide
      */
-    public boolean isValid() {
-        // Would like to check for icon!=0 here, too, but NotificationManagerService accepts that
-        // for legacy reasons.
-        return contentView != null || extras.getBoolean(Builder.EXTRA_REBUILD_CONTENT_VIEW);
-    }
-
-    /**
-     * @hide
-     */
+    @UnsupportedAppUsage
     public boolean isGroupSummary() {
         return mGroupKey != null && (flags & FLAG_GROUP_SUMMARY) != 0;
     }
@@ -1996,8 +3335,68 @@ public class Notification implements Parcelable
     /**
      * @hide
      */
+    @UnsupportedAppUsage
     public boolean isGroupChild() {
         return mGroupKey != null && (flags & FLAG_GROUP_SUMMARY) == 0;
+    }
+
+    /**
+     * @hide
+     */
+    public boolean suppressAlertingDueToGrouping() {
+        if (isGroupSummary()
+                && getGroupAlertBehavior() == Notification.GROUP_ALERT_CHILDREN) {
+            return true;
+        } else if (isGroupChild()
+                && getGroupAlertBehavior() == Notification.GROUP_ALERT_SUMMARY) {
+            return true;
+        }
+        return false;
+    }
+
+
+    /**
+     * Finds and returns a remote input and its corresponding action.
+     *
+     * @param requiresFreeform requires the remoteinput to allow freeform or not.
+     * @return the result pair, {@code null} if no result is found.
+     */
+    @Nullable
+    public Pair<RemoteInput, Action> findRemoteInputActionPair(boolean requiresFreeform) {
+        if (actions == null) {
+            return null;
+        }
+        for (Notification.Action action : actions) {
+            if (action.getRemoteInputs() == null) {
+                continue;
+            }
+            RemoteInput resultRemoteInput = null;
+            for (RemoteInput remoteInput : action.getRemoteInputs()) {
+                if (remoteInput.getAllowFreeFormInput() || !requiresFreeform) {
+                    resultRemoteInput = remoteInput;
+                }
+            }
+            if (resultRemoteInput != null) {
+                return Pair.create(resultRemoteInput, action);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the actions that are contextual (that is, suggested because of the content of the
+     * notification) out of the actions in this notification.
+     */
+    public @NonNull List<Notification.Action> getContextualActions() {
+        if (actions == null) return Collections.emptyList();
+
+        List<Notification.Action> contextualActions = new ArrayList<>();
+        for (Notification.Action action : actions) {
+            if (action.isContextual()) {
+                contextualActions.add(action);
+            }
+        }
+        return contextualActions;
     }
 
     /**
@@ -2022,22 +3421,6 @@ public class Notification implements Parcelable
      * </pre>
      */
     public static class Builder {
-        private static final int MAX_ACTION_BUTTONS = 3;
-        private static final float LARGE_TEXT_SCALE = 1.3f;
-
-        /**
-         * @hide
-         */
-        public static final String EXTRA_NEEDS_REBUILD = "android.rebuild";
-
-        /**
-         * @hide
-         */
-        public static final String EXTRA_REBUILD_LARGE_ICON = "android.rebuild.largeIcon";
-        /**
-         * @hide
-         */
-        public static final String EXTRA_REBUILD_CONTENT_VIEW = "android.rebuild.contentView";
         /**
          * @hide
          */
@@ -2046,198 +3429,334 @@ public class Notification implements Parcelable
         /**
          * @hide
          */
-        public static final String EXTRA_REBUILD_BIG_CONTENT_VIEW
-                = "android.rebuild.bigView";
-        /**
-         * @hide
-         */
         public static final String EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT
                 = "android.rebuild.bigViewActionCount";
-        /**
-         * @hide
-         */
-        public static final String EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW
-                = "android.rebuild.hudView";
         /**
          * @hide
          */
         public static final String EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT
                 = "android.rebuild.hudViewActionCount";
 
-        /**
-         * The ApplicationInfo of the package that created the notification, used to create
-         * a context to rebuild the notification via a Builder.
-         * @hide
-         */
-        private static final String EXTRA_REBUILD_CONTEXT_APPLICATION_INFO =
-                "android.rebuild.applicationInfo";
+        private static final boolean USE_ONLY_TITLE_IN_LOW_PRIORITY_SUMMARY =
+                SystemProperties.getBoolean("notifications.only_title", true);
 
-        // Whether to enable stripping (at post time) & rebuilding (at listener receive time) of
-        // memory intensive resources.
-        private static final boolean STRIP_AND_REBUILD = true;
+        /**
+         * The lightness difference that has to be added to the primary text color to obtain the
+         * secondary text color when the background is light.
+         */
+        private static final int LIGHTNESS_TEXT_DIFFERENCE_LIGHT = 20;
+
+        /**
+         * The lightness difference that has to be added to the primary text color to obtain the
+         * secondary text color when the background is dark.
+         * A bit less then the above value, since it looks better on dark backgrounds.
+         */
+        private static final int LIGHTNESS_TEXT_DIFFERENCE_DARK = -10;
 
         private Context mContext;
-
-        private long mWhen;
-        private Icon mSmallIcon, mLargeIcon;
-        private int mSmallIconLevel;
-        private int mNumber;
-        private CharSequence mContentTitle;
-        private CharSequence mContentText;
-        private CharSequence mContentInfo;
-        private CharSequence mSubText;
-        private PendingIntent mContentIntent;
-        private RemoteViews mContentView;
-        private PendingIntent mDeleteIntent;
-        private PendingIntent mFullScreenIntent;
-        private CharSequence mTickerText;
-        private RemoteViews mTickerView;
-        private Uri mSound;
-        private int mAudioStreamType;
-        private AudioAttributes mAudioAttributes;
-        private long[] mVibrate;
-        private int mLedArgb;
-        private int mLedOnMs;
-        private int mLedOffMs;
-        private int mDefaults;
-        private int mFlags;
-        private int mProgressMax;
-        private int mProgress;
-        private boolean mProgressIndeterminate;
-        private String mCategory;
-        private String mGroupKey;
-        private String mSortKey;
-        private Bundle mExtras;
-        private int mPriority;
-        private ArrayList<Action> mActions = new ArrayList<Action>(MAX_ACTION_BUTTONS);
-        private boolean mUseChronometer;
+        private Notification mN;
+        private Bundle mUserExtras = new Bundle();
         private Style mStyle;
-        private boolean mShowWhen = true;
-        private int mVisibility = VISIBILITY_PRIVATE;
-        private Notification mPublicVersion = null;
-        private final NotificationColorUtil mColorUtil;
-        private ArrayList<String> mPeople;
-        private int mColor = COLOR_DEFAULT;
+        @UnsupportedAppUsage
+        private ArrayList<Action> mActions = new ArrayList<Action>(MAX_ACTION_BUTTONS);
+        private ArrayList<Person> mPersonList = new ArrayList<>();
+        private ContrastColorUtil mColorUtil;
+        private boolean mIsLegacy;
+        private boolean mIsLegacyInitialized;
 
         /**
-         * The user that built the notification originally.
+         * Caches a contrast-enhanced version of {@link #mCachedContrastColorIsFor}.
          */
-        private int mOriginatingUserId;
+        private int mCachedContrastColor = COLOR_INVALID;
+        private int mCachedContrastColorIsFor = COLOR_INVALID;
 
         /**
-         * Contains extras related to rebuilding during the build phase.
+         * A neutral color color that can be used for icons.
          */
-        private Bundle mRebuildBundle = new Bundle();
-        /**
-         * Contains the notification to rebuild when this Builder is in "rebuild" mode.
-         * Null otherwise.
-         */
-        private Notification mRebuildNotification = null;
+        private int mNeutralColor = COLOR_INVALID;
 
         /**
-         * Whether the build notification has three lines. This is used to make the top padding for
-         * both the contracted and expanded layout consistent.
-         *
-         * <p>
-         * This field is only valid during the build phase.
+         * Caches an instance of StandardTemplateParams. Note that this may have been used before,
+         * so make sure to call {@link StandardTemplateParams#reset()} before using it.
          */
-        private boolean mHasThreeLines;
+        StandardTemplateParams mParams = new StandardTemplateParams();
+        private int mTextColorsAreForBackground = COLOR_INVALID;
+        private int mPrimaryTextColor = COLOR_INVALID;
+        private int mSecondaryTextColor = COLOR_INVALID;
+        private int mBackgroundColor = COLOR_INVALID;
+        private int mForegroundColor = COLOR_INVALID;
+        /**
+         * A temporary location where actions are stored. If != null the view originally has action
+         * but doesn't have any for this inflation.
+         */
+        private ArrayList<Action> mOriginalActions;
+        private boolean mRebuildStyledRemoteViews;
+
+        private boolean mTintActionButtons;
+        private boolean mInNightMode;
 
         /**
          * Constructs a new Builder with the defaults:
          *
-
-         * <table>
-         * <tr><th align=right>priority</th>
-         *     <td>{@link #PRIORITY_DEFAULT}</td></tr>
-         * <tr><th align=right>when</th>
-         *     <td>now ({@link System#currentTimeMillis()})</td></tr>
-         * <tr><th align=right>audio stream</th>
-         *     <td>{@link #STREAM_DEFAULT}</td></tr>
-         * </table>
-         *
-
          * @param context
          *            A {@link Context} that will be used by the Builder to construct the
          *            RemoteViews. The Context will not be held past the lifetime of this Builder
          *            object.
+         * @param channelId
+         *            The constructed Notification will be posted on this
+         *            {@link NotificationChannel}. To use a NotificationChannel, it must first be
+         *            created using {@link NotificationManager#createNotificationChannel}.
          */
-        public Builder(Context context) {
-            /*
-             * Important compatibility note!
-             * Some apps out in the wild create a Notification.Builder in their Activity subclass
-             * constructor for later use. At this point Activities - themselves subclasses of
-             * ContextWrapper - do not have their inner Context populated yet. This means that
-             * any calls to Context methods from within this constructor can cause NPEs in existing
-             * apps. Any data populated from mContext should therefore be populated lazily to
-             * preserve compatibility.
-             */
-            mContext = context;
-
-            // Set defaults to match the defaults of a Notification
-            mWhen = System.currentTimeMillis();
-            mAudioStreamType = STREAM_DEFAULT;
-            mAudioAttributes = AUDIO_ATTRIBUTES_DEFAULT;
-            mPriority = PRIORITY_DEFAULT;
-            mPeople = new ArrayList<String>();
-
-            mColorUtil = context.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.LOLLIPOP ?
-                    NotificationColorUtil.getInstance(mContext) : null;
+        public Builder(Context context, String channelId) {
+            this(context, (Notification) null);
+            mN.mChannelId = channelId;
         }
 
         /**
-         * Creates a Builder for rebuilding the given Notification.
-         * <p>
-         * Call {@link #rebuild()} to retrieve the rebuilt version of 'n'.
+         * @deprecated use {@link #Builder(Context, String)}
+         * instead. All posted Notifications must specify a NotificationChannel Id.
          */
-        private Builder(Context context, Notification n) {
-            this(context);
-            mRebuildNotification = n;
-            restoreFromNotification(n);
+        @Deprecated
+        public Builder(Context context) {
+            this(context, (Notification) null);
+        }
 
-            Style style = null;
-            Bundle extras = n.extras;
-            String templateClass = extras.getString(EXTRA_TEMPLATE);
-            if (!TextUtils.isEmpty(templateClass)) {
-                Class<? extends Style> styleClass = getNotificationStyleClass(templateClass);
-                if (styleClass == null) {
-                    Log.d(TAG, "Unknown style class: " + styleClass);
-                    return;
+        /**
+         * @hide
+         */
+        public Builder(Context context, Notification toAdopt) {
+            mContext = context;
+            Resources res = mContext.getResources();
+            mTintActionButtons = res.getBoolean(R.bool.config_tintNotificationActionButtons);
+
+            if (res.getBoolean(R.bool.config_enableNightMode)) {
+                Configuration currentConfig = res.getConfiguration();
+                mInNightMode = (currentConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                        == Configuration.UI_MODE_NIGHT_YES;
+            }
+
+            if (toAdopt == null) {
+                mN = new Notification();
+                if (context.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N) {
+                    mN.extras.putBoolean(EXTRA_SHOW_WHEN, true);
+                }
+                mN.priority = PRIORITY_DEFAULT;
+                mN.visibility = VISIBILITY_PRIVATE;
+            } else {
+                mN = toAdopt;
+                if (mN.actions != null) {
+                    Collections.addAll(mActions, mN.actions);
                 }
 
-                try {
-                    Constructor<? extends Style> constructor = styleClass.getConstructor();
-                    constructor.setAccessible(true);
-                    style = constructor.newInstance();
-                    style.restoreFromExtras(extras);
-                } catch (Throwable t) {
-                    Log.e(TAG, "Could not create Style", t);
-                    return;
+                if (mN.extras.containsKey(EXTRA_PEOPLE_LIST)) {
+                    ArrayList<Person> people = mN.extras.getParcelableArrayList(EXTRA_PEOPLE_LIST);
+                    mPersonList.addAll(people);
+                }
+
+                if (mN.getSmallIcon() == null && mN.icon != 0) {
+                    setSmallIcon(mN.icon);
+                }
+
+                if (mN.getLargeIcon() == null && mN.largeIcon != null) {
+                    setLargeIcon(mN.largeIcon);
+                }
+
+                String templateClass = mN.extras.getString(EXTRA_TEMPLATE);
+                if (!TextUtils.isEmpty(templateClass)) {
+                    final Class<? extends Style> styleClass
+                            = getNotificationStyleClass(templateClass);
+                    if (styleClass == null) {
+                        Log.d(TAG, "Unknown style class: " + templateClass);
+                    } else {
+                        try {
+                            final Constructor<? extends Style> ctor =
+                                    styleClass.getDeclaredConstructor();
+                            ctor.setAccessible(true);
+                            final Style style = ctor.newInstance();
+                            style.restoreFromExtras(mN.extras);
+
+                            if (style != null) {
+                                setStyle(style);
+                            }
+                        } catch (Throwable t) {
+                            Log.e(TAG, "Could not create Style", t);
+                        }
+                    }
                 }
             }
-            if (style != null) {
-                setStyle(style);
+        }
+
+        private ContrastColorUtil getColorUtil() {
+            if (mColorUtil == null) {
+                mColorUtil = ContrastColorUtil.getInstance(mContext);
             }
+            return mColorUtil;
+        }
+
+        /**
+         * From Android 11, messaging notifications (those that use {@link MessagingStyle}) that
+         * use this method to link to a published long-lived sharing shortcut may appear in a
+         * dedicated Conversation section of the shade and may show configuration options that
+         * are unique to conversations. This behavior should be reserved for person to person(s)
+         * conversations where there is a likely social obligation for an individual to respond.
+         * <p>
+         * For example, the following are some examples of notifications that belong in the
+         * conversation space:
+         * <ul>
+         * <li>1:1 conversations between two individuals</li>
+         * <li>Group conversations between individuals where everyone can contribute</li>
+         * </ul>
+         * And the following are some examples of notifications that do not belong in the
+         * conversation space:
+         * <ul>
+         * <li>Advertisements from a bot (even if personal and contextualized)</li>
+         * <li>Engagement notifications from a bot</li>
+         * <li>Directional conversations where there is an active speaker and many passive
+         * individuals</li>
+         * <li>Stream / posting updates from other individuals</li>
+         * <li>Email, document comments, or other conversation types that are not real-time</li>
+         * </ul>
+         * </p>
+         *
+         * <p>
+         * Additionally, this method can be used for all types of notifications to mark this
+         * notification as duplicative of a Launcher shortcut. Launchers that show badges or
+         * notification content may then suppress the shortcut in favor of the content of this
+         * notification.
+         * <p>
+         * If this notification has {@link BubbleMetadata} attached that was created with
+         * a shortcutId a check will be performed to ensure the shortcutId supplied to bubble
+         * metadata matches the shortcutId set here, if one was set. If the shortcutId's were
+         * specified but do not match, an exception is thrown.
+         *
+         * @param shortcutId the {@link ShortcutInfo#getId() id} of the shortcut this notification
+         *                   is linked to
+         *
+         * @see BubbleMetadata.Builder#Builder(String)
+         */
+        @NonNull
+        public Builder setShortcutId(String shortcutId) {
+            mN.mShortcutId = shortcutId;
+            return this;
+        }
+
+        /**
+         * Sets the {@link LocusId} associated with this notification.
+         *
+         * <p>This method should be called when the {@link LocusId} is used in other places (such
+         * as {@link ShortcutInfo} and {@link ContentCaptureContext}) so the device's intelligence
+         * services can correlate them.
+         */
+        @NonNull
+        public Builder setLocusId(@Nullable LocusId locusId) {
+            mN.mLocusId = locusId;
+            return this;
+        }
+
+        /**
+         * Sets which icon to display as a badge for this notification.
+         *
+         * Must be one of {@link #BADGE_ICON_NONE}, {@link #BADGE_ICON_SMALL},
+         * {@link #BADGE_ICON_LARGE}.
+         *
+         * Note: This value might be ignored, for launchers that don't support badge icons.
+         */
+        @NonNull
+        public Builder setBadgeIconType(int icon) {
+            mN.mBadgeIcon = icon;
+            return this;
+        }
+
+        /**
+         * Sets the group alert behavior for this notification. Use this method to mute this
+         * notification if alerts for this notification's group should be handled by a different
+         * notification. This is only applicable for notifications that belong to a
+         * {@link #setGroup(String) group}. This must be called on all notifications you want to
+         * mute. For example, if you want only the summary of your group to make noise, all
+         * children in the group should have the group alert behavior {@link #GROUP_ALERT_SUMMARY}.
+         *
+         * <p> The default value is {@link #GROUP_ALERT_ALL}.</p>
+         */
+        @NonNull
+        public Builder setGroupAlertBehavior(@GroupAlertBehavior int groupAlertBehavior) {
+            mN.mGroupAlertBehavior = groupAlertBehavior;
+            return this;
+        }
+
+        /**
+         * Sets the {@link BubbleMetadata} that will be used to display app content in a floating
+         * window over the existing foreground activity.
+         *
+         * <p>This data will be ignored unless the notification is posted to a channel that
+         * allows {@link NotificationChannel#canBubble() bubbles}.</p>
+         *
+         * <p>Notifications allowed to bubble that have valid bubble metadata will display in
+         * collapsed state outside of the notification shade on unlocked devices. When a user
+         * interacts with the collapsed state, the bubble intent will be invoked and displayed.</p>
+         */
+        @NonNull
+        public Builder setBubbleMetadata(@Nullable BubbleMetadata data) {
+            mN.mBubbleMetadata = data;
+            return this;
+        }
+
+        /** @removed */
+        @Deprecated
+        public Builder setChannel(String channelId) {
+            mN.mChannelId = channelId;
+            return this;
+        }
+
+        /**
+         * Specifies the channel the notification should be delivered on.
+         */
+        @NonNull
+        public Builder setChannelId(String channelId) {
+            mN.mChannelId = channelId;
+            return this;
+        }
+
+        /** @removed */
+        @Deprecated
+        public Builder setTimeout(long durationMs) {
+            mN.mTimeout = durationMs;
+            return this;
+        }
+
+        /**
+         * Specifies a duration in milliseconds after which this notification should be canceled,
+         * if it is not already canceled.
+         */
+        @NonNull
+        public Builder setTimeoutAfter(long durationMs) {
+            mN.mTimeout = durationMs;
+            return this;
         }
 
         /**
          * Add a timestamp pertaining to the notification (usually the time the event occurred).
-         * It will be shown in the notification content view by default; use
-         * {@link #setShowWhen(boolean) setShowWhen} to control this.
+         *
+         * For apps targeting {@link android.os.Build.VERSION_CODES#N} and above, this time is not
+         * shown anymore by default and must be opted into by using
+         * {@link android.app.Notification.Builder#setShowWhen(boolean)}
          *
          * @see Notification#when
          */
+        @NonNull
         public Builder setWhen(long when) {
-            mWhen = when;
+            mN.when = when;
             return this;
         }
 
         /**
          * Control whether the timestamp set with {@link #setWhen(long) setWhen} is shown
          * in the content view.
+         * For apps targeting {@link android.os.Build.VERSION_CODES#N} and above, this defaults to
+         * {@code false}. For earlier apps, the default is {@code true}.
          */
+        @NonNull
         public Builder setShowWhen(boolean show) {
-            mShowWhen = show;
+            mN.extras.putBoolean(EXTRA_SHOW_WHEN, show);
             return this;
         }
 
@@ -2249,11 +3768,30 @@ public class Notification implements Parcelable
          *
          * Useful when showing an elapsed time (like an ongoing phone call).
          *
+         * The counter can also be set to count down to <code>when</code> when using
+         * {@link #setChronometerCountDown(boolean)}.
+         *
          * @see android.widget.Chronometer
          * @see Notification#when
+         * @see #setChronometerCountDown(boolean)
          */
+        @NonNull
         public Builder setUsesChronometer(boolean b) {
-            mUseChronometer = b;
+            mN.extras.putBoolean(EXTRA_SHOW_CHRONOMETER, b);
+            return this;
+        }
+
+        /**
+         * Sets the Chronometer to count down instead of counting up.
+         *
+         * <p>This is only relevant if {@link #setUsesChronometer(boolean)} has been set to true.
+         * If it isn't set the chronometer will count up.
+         *
+         * @see #setUsesChronometer(boolean)
+         */
+        @NonNull
+        public Builder setChronometerCountDown(boolean countDown) {
+            mN.extras.putBoolean(EXTRA_CHRONOMETER_COUNT_DOWN, countDown);
             return this;
         }
 
@@ -2271,6 +3809,7 @@ public class Notification implements Parcelable
          *            A resource ID in the application's package of the drawable to use.
          * @see Notification#icon
          */
+        @NonNull
         public Builder setSmallIcon(@DrawableRes int icon) {
             return setSmallIcon(icon != 0
                     ? Icon.createWithResource(mContext, icon)
@@ -2288,57 +3827,171 @@ public class Notification implements Parcelable
          * @see Notification#icon
          * @see Notification#iconLevel
          */
+        @NonNull
         public Builder setSmallIcon(@DrawableRes int icon, int level) {
-            mSmallIconLevel = level;
+            mN.iconLevel = level;
             return setSmallIcon(icon);
         }
 
         /**
          * Set the small icon, which will be used to represent the notification in the
-         * status bar and content view (unless overriden there by a
+         * status bar and content view (unless overridden there by a
          * {@link #setLargeIcon(Bitmap) large icon}).
          *
          * @param icon An Icon object to use.
          * @see Notification#icon
          */
+        @NonNull
         public Builder setSmallIcon(Icon icon) {
-            mSmallIcon = icon;
+            mN.setSmallIcon(icon);
+            if (icon != null && icon.getType() == Icon.TYPE_RESOURCE) {
+                mN.icon = icon.getResId();
+            }
             return this;
         }
 
         /**
          * Set the first line of text in the platform notification template.
          */
+        @NonNull
         public Builder setContentTitle(CharSequence title) {
-            mContentTitle = safeCharSequence(title);
+            mN.extras.putCharSequence(EXTRA_TITLE, safeCharSequence(title));
             return this;
         }
 
         /**
          * Set the second line of text in the platform notification template.
          */
+        @NonNull
         public Builder setContentText(CharSequence text) {
-            mContentText = safeCharSequence(text);
+            mN.extras.putCharSequence(EXTRA_TEXT, safeCharSequence(text));
             return this;
         }
 
         /**
-         * Set the third line of text in the platform notification template.
-         * Don't use if you're also using {@link #setProgress(int, int, boolean)}; they occupy the
-         * same location in the standard template.
+         * This provides some additional information that is displayed in the notification. No
+         * guarantees are given where exactly it is displayed.
+         *
+         * <p>This information should only be provided if it provides an essential
+         * benefit to the understanding of the notification. The more text you provide the
+         * less readable it becomes. For example, an email client should only provide the account
+         * name here if more than one email account has been added.</p>
+         *
+         * <p>As of {@link android.os.Build.VERSION_CODES#N} this information is displayed in the
+         * notification header area.
+         *
+         * On Android versions before {@link android.os.Build.VERSION_CODES#N}
+         * this will be shown in the third line of text in the platform notification template.
+         * You should not be using {@link #setProgress(int, int, boolean)} at the
+         * same time on those versions; they occupy the same place.
+         * </p>
          */
+        @NonNull
         public Builder setSubText(CharSequence text) {
-            mSubText = safeCharSequence(text);
+            mN.extras.putCharSequence(EXTRA_SUB_TEXT, safeCharSequence(text));
             return this;
         }
 
         /**
-         * Set the large number at the right-hand side of the notification.  This is
-         * equivalent to setContentInfo, although it might show the number in a different
-         * font size for readability.
+         * Provides text that will appear as a link to your application's settings.
+         *
+         * <p>This text does not appear within notification {@link Style templates} but may
+         * appear when the user uses an affordance to learn more about the notification.
+         * Additionally, this text will not appear unless you provide a valid link target by
+         * handling {@link #INTENT_CATEGORY_NOTIFICATION_PREFERENCES}.
+         *
+         * <p>This text is meant to be concise description about what the user can customize
+         * when they click on this link. The recommended maximum length is 40 characters.
+         * @param text
+         * @return
          */
+        @NonNull
+        public Builder setSettingsText(CharSequence text) {
+            mN.mSettingsText = safeCharSequence(text);
+            return this;
+        }
+
+        /**
+         * Set the remote input history.
+         *
+         * This should be set to the most recent inputs that have been sent
+         * through a {@link RemoteInput} of this Notification and cleared once the it is no
+         * longer relevant (e.g. for chat notifications once the other party has responded).
+         *
+         * The most recent input must be stored at the 0 index, the second most recent at the
+         * 1 index, etc. Note that the system will limit both how far back the inputs will be shown
+         * and how much of each individual input is shown.
+         *
+         * <p>Note: The reply text will only be shown on notifications that have least one action
+         * with a {@code RemoteInput}.</p>
+         */
+        @NonNull
+        public Builder setRemoteInputHistory(CharSequence[] text) {
+            if (text == null) {
+                mN.extras.putCharSequenceArray(EXTRA_REMOTE_INPUT_HISTORY, null);
+            } else {
+                final int itemCount = Math.min(MAX_REPLY_HISTORY, text.length);
+                CharSequence[] safe = new CharSequence[itemCount];
+                RemoteInputHistoryItem[] items = new RemoteInputHistoryItem[itemCount];
+                for (int i = 0; i < itemCount; i++) {
+                    safe[i] = safeCharSequence(text[i]);
+                    items[i] = new RemoteInputHistoryItem(text[i]);
+                }
+                mN.extras.putCharSequenceArray(EXTRA_REMOTE_INPUT_HISTORY, safe);
+
+                // Also add these messages as structured history items.
+                mN.extras.putParcelableArray(EXTRA_REMOTE_INPUT_HISTORY_ITEMS, items);
+            }
+            return this;
+        }
+
+        /**
+         * Set the remote input history, with support for embedding URIs and mime types for
+         * images and other media.
+         * @hide
+         */
+        @NonNull
+        public Builder setRemoteInputHistory(RemoteInputHistoryItem[] items) {
+            if (items == null) {
+                mN.extras.putParcelableArray(EXTRA_REMOTE_INPUT_HISTORY_ITEMS, null);
+            } else {
+                final int itemCount = Math.min(MAX_REPLY_HISTORY, items.length);
+                RemoteInputHistoryItem[] history = new RemoteInputHistoryItem[itemCount];
+                for (int i = 0; i < itemCount; i++) {
+                    history[i] = items[i];
+                }
+                mN.extras.putParcelableArray(EXTRA_REMOTE_INPUT_HISTORY_ITEMS, history);
+            }
+            return this;
+        }
+
+        /**
+         * Sets whether remote history entries view should have a spinner.
+         * @hide
+         */
+        @NonNull
+        public Builder setShowRemoteInputSpinner(boolean showSpinner) {
+            mN.extras.putBoolean(EXTRA_SHOW_REMOTE_INPUT_SPINNER, showSpinner);
+            return this;
+        }
+
+        /**
+         * Sets whether smart reply buttons should be hidden.
+         * @hide
+         */
+        @NonNull
+        public Builder setHideSmartReplies(boolean hideSmartReplies) {
+            mN.extras.putBoolean(EXTRA_HIDE_SMART_REPLIES, hideSmartReplies);
+            return this;
+        }
+
+        /**
+         * Sets the number of items this notification represents. May be displayed as a badge count
+         * for Launchers that support badging.
+         */
+        @NonNull
         public Builder setNumber(int number) {
-            mNumber = number;
+            mN.number = number;
             return this;
         }
 
@@ -2347,9 +4000,14 @@ public class Notification implements Parcelable
          *
          * The platform template will draw this on the last line of the notification, at the far
          * right (to the right of a smallIcon if it has been placed there).
+         *
+         * @deprecated use {@link #setSubText(CharSequence)} instead to set a text in the header.
+         * For legacy apps targeting a version below {@link android.os.Build.VERSION_CODES#N} this
+         * field will still show up, but the subtext will take precedence.
          */
+        @Deprecated
         public Builder setContentInfo(CharSequence info) {
-            mContentInfo = safeCharSequence(info);
+            mN.extras.putCharSequence(EXTRA_INFO_TEXT, safeCharSequence(info));
             return this;
         }
 
@@ -2358,20 +4016,57 @@ public class Notification implements Parcelable
          *
          * The platform template will represent this using a {@link ProgressBar}.
          */
+        @NonNull
         public Builder setProgress(int max, int progress, boolean indeterminate) {
-            mProgressMax = max;
-            mProgress = progress;
-            mProgressIndeterminate = indeterminate;
+            mN.extras.putInt(EXTRA_PROGRESS, progress);
+            mN.extras.putInt(EXTRA_PROGRESS_MAX, max);
+            mN.extras.putBoolean(EXTRA_PROGRESS_INDETERMINATE, indeterminate);
             return this;
         }
 
         /**
          * Supply a custom RemoteViews to use instead of the platform template.
          *
-         * @see Notification#contentView
+         * Use {@link #setCustomContentView(RemoteViews)} instead.
          */
+        @Deprecated
         public Builder setContent(RemoteViews views) {
-            mContentView = views;
+            return setCustomContentView(views);
+        }
+
+        /**
+         * Supply custom RemoteViews to use instead of the platform template.
+         *
+         * This will override the layout that would otherwise be constructed by this Builder
+         * object.
+         */
+        @NonNull
+        public Builder setCustomContentView(RemoteViews contentView) {
+            mN.contentView = contentView;
+            return this;
+        }
+
+        /**
+         * Supply custom RemoteViews to use instead of the platform template in the expanded form.
+         *
+         * This will override the expanded layout that would otherwise be constructed by this
+         * Builder object.
+         */
+        @NonNull
+        public Builder setCustomBigContentView(RemoteViews contentView) {
+            mN.bigContentView = contentView;
+            return this;
+        }
+
+        /**
+         * Supply custom RemoteViews to use instead of the platform template in the heads up dialog.
+         *
+         * This will override the heads-up layout that would otherwise be constructed by this
+         * Builder object.
+         */
+        @NonNull
+        public Builder setCustomHeadsUpContentView(RemoteViews contentView) {
+            mN.headsUpContentView = contentView;
             return this;
         }
 
@@ -2386,8 +4081,9 @@ public class Notification implements Parcelable
          *
          * @see Notification#contentIntent Notification.contentIntent
          */
+        @NonNull
         public Builder setContentIntent(PendingIntent intent) {
-            mContentIntent = intent;
+            mN.contentIntent = intent;
             return this;
         }
 
@@ -2396,8 +4092,9 @@ public class Notification implements Parcelable
          *
          * @see Notification#deleteIntent
          */
+        @NonNull
         public Builder setDeleteIntent(PendingIntent intent) {
-            mDeleteIntent = intent;
+            mN.deleteIntent = intent;
             return this;
         }
 
@@ -2414,6 +4111,9 @@ public class Notification implements Parcelable
          * The system UI may choose to display a heads-up notification, instead of
          * launching this intent, while the user is using the device.
          * </p>
+         * <p>Apps targeting {@link Build.VERSION_CODES#Q} and above will have to request
+         * a permission ({@link android.Manifest.permission#USE_FULL_SCREEN_INTENT}) in order to
+         * use full screen intents.</p>
          *
          * @param intent The pending intent to launch.
          * @param highPriority Passing true will cause this notification to be sent
@@ -2421,8 +4121,9 @@ public class Notification implements Parcelable
          *
          * @see Notification#fullScreenIntent
          */
+        @NonNull
         public Builder setFullScreenIntent(PendingIntent intent, boolean highPriority) {
-            mFullScreenIntent = intent;
+            mN.fullScreenIntent = intent;
             setFlag(FLAG_HIGH_PRIORITY, highPriority);
             return this;
         }
@@ -2432,8 +4133,9 @@ public class Notification implements Parcelable
          *
          * @see Notification#tickerText
          */
+        @NonNull
         public Builder setTicker(CharSequence tickerText) {
-            mTickerText = safeCharSequence(tickerText);
+            mN.tickerText = safeCharSequence(tickerText);
             return this;
         }
 
@@ -2443,8 +4145,8 @@ public class Notification implements Parcelable
          */
         @Deprecated
         public Builder setTicker(CharSequence tickerText, RemoteViews views) {
-            mTickerText = safeCharSequence(tickerText);
-            mTickerView = views; // we'll save it for you anyway
+            setTicker(tickerText);
+            // views is ignored
             return this;
         }
 
@@ -2455,6 +4157,7 @@ public class Notification implements Parcelable
          * in place of the {@link #setSmallIcon(Icon) small icon} (which will be placed in a small
          * badge atop the large icon).
          */
+        @NonNull
         public Builder setLargeIcon(Bitmap b) {
             return setLargeIcon(b != null ? Icon.createWithBitmap(b) : null);
         }
@@ -2466,8 +4169,10 @@ public class Notification implements Parcelable
          * in place of the {@link #setSmallIcon(Icon) small icon} (which will be placed in a small
          * badge atop the large icon).
          */
+        @NonNull
         public Builder setLargeIcon(Icon icon) {
-            mLargeIcon = icon;
+            mN.mLargeIcon = icon;
+            mN.extras.putParcelable(EXTRA_LARGE_ICON, icon);
             return this;
         }
 
@@ -2477,15 +4182,12 @@ public class Notification implements Parcelable
          * It will be played using the {@link #AUDIO_ATTRIBUTES_DEFAULT default audio attributes}
          * for notifications.
          *
-         * <p>
-         * A notification that is noisy is more likely to be presented as a heads-up notification.
-         * </p>
-         *
-         * @see Notification#sound
+         * @deprecated use {@link NotificationChannel#setSound(Uri, AudioAttributes)} instead.
          */
+        @Deprecated
         public Builder setSound(Uri sound) {
-            mSound = sound;
-            mAudioAttributes = AUDIO_ATTRIBUTES_DEFAULT;
+            mN.sound = sound;
+            mN.audioAttributes = AUDIO_ATTRIBUTES_DEFAULT;
             return this;
         }
 
@@ -2494,16 +4196,13 @@ public class Notification implements Parcelable
          *
          * See {@link android.media.AudioManager} for the <code>STREAM_</code> constants.
          *
-         * <p>
-         * A notification that is noisy is more likely to be presented as a heads-up notification.
-         * </p>
-         * @deprecated use {@link #setSound(Uri, AudioAttributes)} instead.
-         * @see Notification#sound
+         * @deprecated use {@link NotificationChannel#setSound(Uri, AudioAttributes)}.
          */
         @Deprecated
         public Builder setSound(Uri sound, int streamType) {
-            mSound = sound;
-            mAudioStreamType = streamType;
+            PlayerBase.deprecateStreamTypeForPlayback(streamType, "Notification", "setSound()");
+            mN.sound = sound;
+            mN.audioStreamType = streamType;
             return this;
         }
 
@@ -2511,15 +4210,13 @@ public class Notification implements Parcelable
          * Set the sound to play, along with specific {@link AudioAttributes audio attributes} to
          * use during playback.
          *
-         * <p>
-         * A notification that is noisy is more likely to be presented as a heads-up notification.
-         * </p>
-         *
+         * @deprecated use {@link NotificationChannel#setSound(Uri, AudioAttributes)} instead.
          * @see Notification#sound
          */
+        @Deprecated
         public Builder setSound(Uri sound, AudioAttributes audioAttributes) {
-            mSound = sound;
-            mAudioAttributes = audioAttributes;
+            mN.sound = sound;
+            mN.audioAttributes = audioAttributes;
             return this;
         }
 
@@ -2533,10 +4230,12 @@ public class Notification implements Parcelable
          * A notification that vibrates is more likely to be presented as a heads-up notification.
          * </p>
          *
+         * @deprecated use {@link NotificationChannel#setVibrationPattern(long[])} instead.
          * @see Notification#vibrate
          */
+        @Deprecated
         public Builder setVibrate(long[] pattern) {
-            mVibrate = pattern;
+            mN.vibrate = pattern;
             return this;
         }
 
@@ -2547,15 +4246,19 @@ public class Notification implements Parcelable
 
          * Not all devices will honor all (or even any) of these values.
          *
-
+         * @deprecated use {@link NotificationChannel#enableLights(boolean)} instead.
          * @see Notification#ledARGB
          * @see Notification#ledOnMS
          * @see Notification#ledOffMS
          */
+        @Deprecated
         public Builder setLights(@ColorInt int argb, int onMs, int offMs) {
-            mLedArgb = argb;
-            mLedOnMs = onMs;
-            mLedOffMs = offMs;
+            mN.ledARGB = argb;
+            mN.ledOnMS = onMs;
+            mN.ledOffMS = offMs;
+            if (onMs != 0 || offMs != 0) {
+                mN.flags |= FLAG_SHOW_LIGHTS;
+            }
             return this;
         }
 
@@ -2573,10 +4276,31 @@ public class Notification implements Parcelable
          *
 
          * @see Notification#FLAG_ONGOING_EVENT
-         * @see Service#setForeground(boolean)
          */
+        @NonNull
         public Builder setOngoing(boolean ongoing) {
             setFlag(FLAG_ONGOING_EVENT, ongoing);
+            return this;
+        }
+
+        /**
+         * Set whether this notification should be colorized. When set, the color set with
+         * {@link #setColor(int)} will be used as the background color of this notification.
+         * <p>
+         * This should only be used for high priority ongoing tasks like navigation, an ongoing
+         * call, or other similarly high-priority events for the user.
+         * <p>
+         * For most styles, the coloring will only be applied if the notification is for a
+         * foreground service notification.
+         * However, for {@link MediaStyle} and {@link DecoratedMediaCustomViewStyle} notifications
+         * that have a media session attached there is no such requirement.
+         *
+         * @see #setColor(int)
+         * @see MediaStyle#setMediaSession(MediaSession.Token)
+         */
+        @NonNull
+        public Builder setColorized(boolean colorize) {
+            mN.extras.putBoolean(EXTRA_COLORIZED, colorize);
             return this;
         }
 
@@ -2586,17 +4310,18 @@ public class Notification implements Parcelable
          *
          * @see Notification#FLAG_ONLY_ALERT_ONCE
          */
+        @NonNull
         public Builder setOnlyAlertOnce(boolean onlyAlertOnce) {
             setFlag(FLAG_ONLY_ALERT_ONCE, onlyAlertOnce);
             return this;
         }
 
         /**
-         * Make this notification automatically dismissed when the user touches it. The
-         * PendingIntent set with {@link #setDeleteIntent} will be sent when this happens.
+         * Make this notification automatically dismissed when the user touches it.
          *
          * @see Notification#FLAG_AUTO_CANCEL
          */
+        @NonNull
         public Builder setAutoCancel(boolean autoCancel) {
             setFlag(FLAG_AUTO_CANCEL, autoCancel);
             return this;
@@ -2608,6 +4333,7 @@ public class Notification implements Parcelable
          * <p>Some notifications can be bridged to other devices for remote display.
          * This hint can be set to recommend this notification not be bridged.
          */
+        @NonNull
         public Builder setLocalOnly(boolean localOnly) {
             setFlag(FLAG_LOCAL_ONLY, localOnly);
             return this;
@@ -2621,9 +4347,14 @@ public class Notification implements Parcelable
          * {@link #DEFAULT_SOUND}, {@link #DEFAULT_VIBRATE}, {@link #DEFAULT_LIGHTS}.
          * <p>
          * For all default values, use {@link #DEFAULT_ALL}.
+         *
+         * @deprecated use {@link NotificationChannel#enableVibration(boolean)} and
+         * {@link NotificationChannel#enableLights(boolean)} and
+         * {@link NotificationChannel#setSound(Uri, AudioAttributes)} instead.
          */
+        @Deprecated
         public Builder setDefaults(int defaults) {
-            mDefaults = defaults;
+            mN.defaults = defaults;
             return this;
         }
 
@@ -2631,9 +4362,11 @@ public class Notification implements Parcelable
          * Set the priority of this notification.
          *
          * @see Notification#priority
+         * @deprecated use {@link NotificationChannel#setImportance(int)} instead.
          */
+        @Deprecated
         public Builder setPriority(@Priority int pri) {
-            mPriority = pri;
+            mN.priority = pri;
             return this;
         }
 
@@ -2642,8 +4375,9 @@ public class Notification implements Parcelable
          *
          * @see Notification#category
          */
+        @NonNull
         public Builder setCategory(String category) {
-            mCategory = category;
+            mN.category = category;
             return this;
         }
 
@@ -2652,7 +4386,9 @@ public class Notification implements Parcelable
          *
          * <P>
          * Depending on user preferences, this annotation may allow the notification to pass
-         * through interruption filters, and to appear more prominently in the user interface.
+         * through interruption filters, if this notification is of category {@link #CATEGORY_CALL}
+         * or {@link #CATEGORY_MESSAGE}. The addition of people may also cause this notification to
+         * appear more prominently in the user interface.
          * </P>
          *
          * <P>
@@ -2664,13 +4400,42 @@ public class Notification implements Parcelable
          * URIs.  The path part of these URIs must exist in the contacts database, in the
          * appropriate column, or the reference will be discarded as invalid. Telephone schema
          * URIs will be resolved by {@link android.provider.ContactsContract.PhoneLookup}.
+         * It is also possible to provide a URI with the schema {@code name:} in order to uniquely
+         * identify a person without an entry in the contacts database.
          * </P>
          *
          * @param uri A URI for the person.
          * @see Notification#EXTRA_PEOPLE
+         * @deprecated use {@link #addPerson(Person)}
          */
         public Builder addPerson(String uri) {
-            mPeople.add(uri);
+            addPerson(new Person.Builder().setUri(uri).build());
+            return this;
+        }
+
+        /**
+         * Add a person that is relevant to this notification.
+         *
+         * <P>
+         * Depending on user preferences, this annotation may allow the notification to pass
+         * through interruption filters, if this notification is of category {@link #CATEGORY_CALL}
+         * or {@link #CATEGORY_MESSAGE}. The addition of people may also cause this notification to
+         * appear more prominently in the user interface.
+         * </P>
+         *
+         * <P>
+         * A person should usually contain a uri in order to benefit from the ranking boost.
+         * However, even if no uri is provided, it's beneficial to provide other people in the
+         * notification, such that listeners and voice only devices can announce and handle them
+         * properly.
+         * </P>
+         *
+         * @param person the person to add.
+         * @see Notification#EXTRA_PEOPLE_LIST
+         */
+        @NonNull
+        public Builder addPerson(Person person) {
+            mPersonList.add(person);
             return this;
         }
 
@@ -2685,18 +4450,21 @@ public class Notification implements Parcelable
          * @param groupKey The group key of the group.
          * @return this object for method chaining
          */
+        @NonNull
         public Builder setGroup(String groupKey) {
-            mGroupKey = groupKey;
+            mN.mGroupKey = groupKey;
             return this;
         }
 
         /**
          * Set this notification to be the group summary for a group of notifications.
          * Grouped notifications may display in a cluster or stack on devices which
-         * support such rendering. Requires a group key also be set using {@link #setGroup}.
+         * support such rendering. If thereRequires a group key also be set using {@link #setGroup}.
+         * The group summary may be suppressed if too few notifications are included in the group.
          * @param isGroupSummary Whether this notification should be a group summary.
          * @return this object for method chaining
          */
+        @NonNull
         public Builder setGroupSummary(boolean isGroupSummary) {
             setFlag(FLAG_GROUP_SUMMARY, isGroupSummary);
             return this;
@@ -2714,8 +4482,9 @@ public class Notification implements Parcelable
          *
          * @see String#compareTo(String)
          */
+        @NonNull
         public Builder setSortKey(String sortKey) {
-            mSortKey = sortKey;
+            mN.mSortKey = sortKey;
             return this;
         }
 
@@ -2726,13 +4495,10 @@ public class Notification implements Parcelable
          *
          * @see Notification#extras
          */
+        @NonNull
         public Builder addExtras(Bundle extras) {
             if (extras != null) {
-                if (mExtras == null) {
-                    mExtras = new Bundle(extras);
-                } else {
-                    mExtras.putAll(extras);
-                }
+                mUserExtras.putAll(extras);
             }
             return this;
         }
@@ -2749,8 +4515,11 @@ public class Notification implements Parcelable
          *
          * @see Notification#extras
          */
+        @NonNull
         public Builder setExtras(Bundle extras) {
-            mExtras = extras;
+            if (extras != null) {
+                mUserExtras = extras;
+            }
             return this;
         }
 
@@ -2765,10 +4534,13 @@ public class Notification implements Parcelable
          * @see Notification#extras
          */
         public Bundle getExtras() {
-            if (mExtras == null) {
-                mExtras = new Bundle();
-            }
-            return mExtras;
+            return mUserExtras;
+        }
+
+        private Bundle getAllExtras() {
+            final Bundle saveExtras = (Bundle) mUserExtras.clone();
+            saveExtras.putAll(mN.extras);
+            return saveExtras;
         }
 
         /**
@@ -2811,8 +4583,29 @@ public class Notification implements Parcelable
          *
          * @param action The action to add.
          */
+        @NonNull
         public Builder addAction(Action action) {
-            mActions.add(action);
+            if (action != null) {
+                mActions.add(action);
+            }
+            return this;
+        }
+
+        /**
+         * Alter the complete list of actions attached to this notification.
+         * @see #addAction(Action).
+         *
+         * @param actions
+         * @return
+         */
+        @NonNull
+        public Builder setActions(Action... actions) {
+            mActions.clear();
+            for (int i = 0; i < actions.length; i++) {
+                if (actions[i] != null) {
+                    mActions.add(actions[i]);
+                }
+            }
             return this;
         }
 
@@ -2821,26 +4614,35 @@ public class Notification implements Parcelable
          *
          * @param style Object responsible for modifying the notification style.
          */
+        @NonNull
         public Builder setStyle(Style style) {
             if (mStyle != style) {
                 mStyle = style;
                 if (mStyle != null) {
                     mStyle.setBuilder(this);
+                    mN.extras.putString(EXTRA_TEMPLATE, style.getClass().getName());
+                }  else {
+                    mN.extras.remove(EXTRA_TEMPLATE);
                 }
             }
             return this;
         }
 
         /**
+         * Returns the style set by {@link #setStyle(Style)}.
+         */
+        public Style getStyle() {
+            return mStyle;
+        }
+
+        /**
          * Specify the value of {@link #visibility}.
-         *
-         * @param visibility One of {@link #VISIBILITY_PRIVATE} (the default),
-         * {@link #VISIBILITY_SECRET}, or {@link #VISIBILITY_PUBLIC}.
          *
          * @return The same Builder.
          */
-        public Builder setVisibility(int visibility) {
-            mVisibility = visibility;
+        @NonNull
+        public Builder setVisibility(@Visibility int visibility) {
+            mN.visibility = visibility;
             return this;
         }
 
@@ -2850,8 +4652,14 @@ public class Notification implements Parcelable
          * @param n A replacement notification, presumably with some or all info redacted.
          * @return The same Builder.
          */
+        @NonNull
         public Builder setPublicVersion(Notification n) {
-            mPublicVersion = n;
+            if (n != null) {
+                mN.publicVersion = new Notification();
+                n.cloneInto(mN.publicVersion, /*heavy=*/ true);
+            } else {
+                mN.publicVersion = null;
+            }
             return this;
         }
 
@@ -2859,20 +4667,28 @@ public class Notification implements Parcelable
          * Apply an extender to this notification builder. Extenders may be used to add
          * metadata or change options on this builder.
          */
+        @NonNull
         public Builder extend(Extender extender) {
             extender.extend(this);
             return this;
         }
 
         /**
-         * @hide
+         * Set the value for a notification flag
+         *
+         * @param mask Bit mask of the flag
+         * @param value Status (on/off) of the flag
+         *
+         * @return The same Builder.
          */
-        public void setFlag(int mask, boolean value) {
+        @NonNull
+        public Builder setFlag(@NotificationFlags int mask, boolean value) {
             if (value) {
-                mFlags |= mask;
+                mN.flags |= mask;
             } else {
-                mFlags &= ~mask;
+                mN.flags &= ~mask;
             }
+            return this;
         }
 
         /**
@@ -2882,16 +4698,23 @@ public class Notification implements Parcelable
          *
          * @return The same Builder.
          */
+        @NonNull
         public Builder setColor(@ColorInt int argb) {
-            mColor = argb;
+            mN.color = argb;
+            sanitizeColor();
             return this;
         }
 
         private Drawable getProfileBadgeDrawable() {
+            if (mContext.getUserId() == UserHandle.USER_SYSTEM) {
+                // This user can never be a badged profile,
+                // and also includes USER_ALL system notifications.
+                return null;
+            }
             // Note: This assumes that the current user can read the profile badge of the
             // originating user.
-            return mContext.getPackageManager().getUserBadgeForDensity(
-                    new UserHandle(mOriginatingUserId), 0);
+            return mContext.getPackageManager().getUserBadgeForDensityNoBackground(
+                    new UserHandle(mContext.getUserId()), 0);
         }
 
         private Bitmap getProfileBadge() {
@@ -2908,182 +4731,559 @@ public class Notification implements Parcelable
             return bitmap;
         }
 
-        private boolean addProfileBadge(RemoteViews contentView, int resId) {
+        private void bindProfileBadge(RemoteViews contentView, StandardTemplateParams p) {
             Bitmap profileBadge = getProfileBadge();
 
-            contentView.setViewVisibility(R.id.profile_badge_large_template, View.GONE);
-            contentView.setViewVisibility(R.id.profile_badge_line2, View.GONE);
-            contentView.setViewVisibility(R.id.profile_badge_line3, View.GONE);
-
             if (profileBadge != null) {
-                contentView.setImageViewBitmap(resId, profileBadge);
-                contentView.setViewVisibility(resId, View.VISIBLE);
-
-                // Make sure Line 3 is visible. As badge will be here if there
-                // is no text to display.
-                if (resId == R.id.profile_badge_line3) {
-                    contentView.setViewVisibility(R.id.line3, View.VISIBLE);
+                contentView.setImageViewBitmap(R.id.profile_badge, profileBadge);
+                contentView.setViewVisibility(R.id.profile_badge, View.VISIBLE);
+                if (isColorized(p)) {
+                    contentView.setDrawableTint(R.id.profile_badge, false,
+                            getPrimaryTextColor(p), PorterDuff.Mode.SRC_ATOP);
                 }
-                return true;
             }
-            return false;
         }
 
-        private void shrinkLine3Text(RemoteViews contentView) {
-            float subTextSize = mContext.getResources().getDimensionPixelSize(
-                    R.dimen.notification_subtext_size);
-            contentView.setTextViewTextSize(R.id.text, TypedValue.COMPLEX_UNIT_PX, subTextSize);
-        }
-
-        private void unshrinkLine3Text(RemoteViews contentView) {
-            float regularTextSize = mContext.getResources().getDimensionPixelSize(
-                    com.android.internal.R.dimen.notification_text_size);
-            contentView.setTextViewTextSize(R.id.text, TypedValue.COMPLEX_UNIT_PX, regularTextSize);
-        }
-
-        private void resetStandardTemplate(RemoteViews contentView) {
-            removeLargeIconBackground(contentView);
-            contentView.setViewPadding(R.id.icon, 0, 0, 0, 0);
-            contentView.setImageViewResource(R.id.icon, 0);
-            contentView.setInt(R.id.icon, "setBackgroundResource", 0);
-            contentView.setViewVisibility(R.id.right_icon, View.GONE);
-            contentView.setInt(R.id.right_icon, "setBackgroundResource", 0);
-            contentView.setImageViewResource(R.id.right_icon, 0);
-            contentView.setImageViewResource(R.id.icon, 0);
-            contentView.setTextViewText(R.id.title, null);
-            contentView.setTextViewText(R.id.text, null);
-            unshrinkLine3Text(contentView);
-            contentView.setTextViewText(R.id.text2, null);
-            contentView.setViewVisibility(R.id.text2, View.GONE);
-            contentView.setViewVisibility(R.id.info, View.GONE);
-            contentView.setViewVisibility(R.id.time, View.GONE);
-            contentView.setViewVisibility(R.id.line3, View.GONE);
-            contentView.setViewVisibility(R.id.overflow_divider, View.GONE);
-            contentView.setViewVisibility(R.id.progress, View.GONE);
-            contentView.setViewVisibility(R.id.chronometer, View.GONE);
-            contentView.setViewVisibility(R.id.time, View.GONE);
-        }
-
-        private RemoteViews applyStandardTemplate(int resId) {
-            return applyStandardTemplate(resId, true /* hasProgress */);
+        private void bindAlertedIcon(RemoteViews contentView, StandardTemplateParams p) {
+            contentView.setDrawableTint(
+                    R.id.alerted_icon,
+                    false /* targetBackground */,
+                    getNeutralColor(p),
+                    PorterDuff.Mode.SRC_ATOP);
         }
 
         /**
-         * @param hasProgress whether the progress bar should be shown and set
+         * @hide
          */
-        private RemoteViews applyStandardTemplate(int resId, boolean hasProgress) {
+        public boolean usesStandardHeader() {
+            if (mN.mUsesStandardHeader) {
+                return true;
+            }
+            if (mContext.getApplicationInfo().targetSdkVersion >= Build.VERSION_CODES.N) {
+                if (mN.contentView == null && mN.bigContentView == null) {
+                    return true;
+                }
+            }
+            boolean contentViewUsesHeader = mN.contentView == null
+                    || STANDARD_LAYOUTS.contains(mN.contentView.getLayoutId());
+            boolean bigContentViewUsesHeader = mN.bigContentView == null
+                    || STANDARD_LAYOUTS.contains(mN.bigContentView.getLayoutId());
+            return contentViewUsesHeader && bigContentViewUsesHeader;
+        }
+
+        private void resetStandardTemplate(RemoteViews contentView) {
+            resetNotificationHeader(contentView);
+            contentView.setViewVisibility(R.id.right_icon, View.GONE);
+            contentView.setViewVisibility(R.id.title, View.GONE);
+            contentView.setTextViewText(R.id.title, null);
+            contentView.setViewVisibility(R.id.text, View.GONE);
+            contentView.setTextViewText(R.id.text, null);
+            contentView.setViewVisibility(R.id.text_line_1, View.GONE);
+            contentView.setTextViewText(R.id.text_line_1, null);
+        }
+
+        /**
+         * Resets the notification header to its original state
+         */
+        private void resetNotificationHeader(RemoteViews contentView) {
+            // Small icon doesn't need to be reset, as it's always set. Resetting would prevent
+            // re-using the drawable when the notification is updated.
+            contentView.setBoolean(R.id.notification_header, "setExpanded", false);
+            contentView.setTextViewText(R.id.app_name_text, null);
+            contentView.setViewVisibility(R.id.chronometer, View.GONE);
+            contentView.setViewVisibility(R.id.header_text, View.GONE);
+            contentView.setTextViewText(R.id.header_text, null);
+            contentView.setViewVisibility(R.id.header_text_secondary, View.GONE);
+            contentView.setTextViewText(R.id.header_text_secondary, null);
+            contentView.setViewVisibility(R.id.header_text_divider, View.GONE);
+            contentView.setViewVisibility(R.id.header_text_secondary_divider, View.GONE);
+            contentView.setViewVisibility(R.id.time_divider, View.GONE);
+            contentView.setViewVisibility(R.id.time, View.GONE);
+            contentView.setImageViewIcon(R.id.profile_badge, null);
+            contentView.setViewVisibility(R.id.profile_badge, View.GONE);
+            contentView.setViewVisibility(R.id.alerted_icon, View.GONE);
+            mN.mUsesStandardHeader = false;
+        }
+
+        private RemoteViews applyStandardTemplate(int resId, TemplateBindResult result) {
+            return applyStandardTemplate(resId, mParams.reset().fillTextsFrom(this),
+                    result);
+        }
+
+        private RemoteViews applyStandardTemplate(int resId, StandardTemplateParams p,
+                TemplateBindResult result) {
             RemoteViews contentView = new BuilderRemoteViews(mContext.getApplicationInfo(), resId);
 
             resetStandardTemplate(contentView);
 
-            boolean showLine3 = false;
-            boolean showLine2 = false;
-            boolean contentTextInLine2 = false;
-
-            if (mLargeIcon != null) {
-                contentView.setImageViewIcon(R.id.icon, mLargeIcon);
-                processLargeLegacyIcon(mLargeIcon, contentView);
-                contentView.setImageViewIcon(R.id.right_icon, mSmallIcon);
-                contentView.setViewVisibility(R.id.right_icon, View.VISIBLE);
-                processSmallRightIcon(mSmallIcon, contentView);
-            } else { // small icon at left
-                contentView.setImageViewIcon(R.id.icon, mSmallIcon);
-                contentView.setViewVisibility(R.id.icon, View.VISIBLE);
-                processSmallIconAsLarge(mSmallIcon, contentView);
+            final Bundle ex = mN.extras;
+            updateBackgroundColor(contentView, p);
+            bindNotificationHeader(contentView, p);
+            bindLargeIconAndReply(contentView, p, result);
+            boolean showProgress = handleProgressBar(contentView, ex, p);
+            if (p.title != null) {
+                contentView.setViewVisibility(R.id.title, View.VISIBLE);
+                contentView.setTextViewText(R.id.title, processTextSpans(p.title));
+                setTextViewColorPrimary(contentView, R.id.title, p);
+                contentView.setViewLayoutWidth(R.id.title, showProgress
+                        ? ViewGroup.LayoutParams.WRAP_CONTENT
+                        : ViewGroup.LayoutParams.MATCH_PARENT);
             }
-            if (mContentTitle != null) {
-                contentView.setTextViewText(R.id.title, processLegacyText(mContentTitle));
-            }
-            if (mContentText != null) {
-                contentView.setTextViewText(R.id.text, processLegacyText(mContentText));
-                showLine3 = true;
-            }
-            if (mContentInfo != null) {
-                contentView.setTextViewText(R.id.info, processLegacyText(mContentInfo));
-                contentView.setViewVisibility(R.id.info, View.VISIBLE);
-                showLine3 = true;
-            } else if (mNumber > 0) {
-                final int tooBig = mContext.getResources().getInteger(
-                        R.integer.status_bar_notification_info_maxnum);
-                if (mNumber > tooBig) {
-                    contentView.setTextViewText(R.id.info, processLegacyText(
-                            mContext.getResources().getString(
-                                    R.string.status_bar_notification_info_overflow)));
-                } else {
-                    NumberFormat f = NumberFormat.getIntegerInstance();
-                    contentView.setTextViewText(R.id.info, processLegacyText(f.format(mNumber)));
-                }
-                contentView.setViewVisibility(R.id.info, View.VISIBLE);
-                showLine3 = true;
-            } else {
-                contentView.setViewVisibility(R.id.info, View.GONE);
+            if (p.text != null) {
+                int textId = showProgress ? com.android.internal.R.id.text_line_1
+                        : com.android.internal.R.id.text;
+                contentView.setTextViewText(textId, processTextSpans(p.text));
+                setTextViewColorSecondary(contentView, textId, p);
+                contentView.setViewVisibility(textId, View.VISIBLE);
             }
 
-            // Need to show three lines?
-            if (mSubText != null) {
-                contentView.setTextViewText(R.id.text, processLegacyText(mSubText));
-                if (mContentText != null) {
-                    contentView.setTextViewText(R.id.text2, processLegacyText(mContentText));
-                    contentView.setViewVisibility(R.id.text2, View.VISIBLE);
-                    showLine2 = true;
-                    contentTextInLine2 = true;
-                } else {
-                    contentView.setViewVisibility(R.id.text2, View.GONE);
-                }
-            } else {
-                contentView.setViewVisibility(R.id.text2, View.GONE);
-                if (hasProgress && (mProgressMax != 0 || mProgressIndeterminate)) {
-                    contentView.setViewVisibility(R.id.progress, View.VISIBLE);
-                    contentView.setProgressBar(
-                            R.id.progress, mProgressMax, mProgress, mProgressIndeterminate);
-                    contentView.setProgressBackgroundTintList(
-                            R.id.progress, ColorStateList.valueOf(mContext.getColor(
-                                    R.color.notification_progress_background_color)));
-                    if (mColor != COLOR_DEFAULT) {
-                        ColorStateList colorStateList = ColorStateList.valueOf(mColor);
-                        contentView.setProgressTintList(R.id.progress, colorStateList);
-                        contentView.setProgressIndeterminateTintList(R.id.progress, colorStateList);
+            setContentMinHeight(contentView, showProgress || mN.hasLargeIcon());
+
+            return contentView;
+        }
+
+        private CharSequence processTextSpans(CharSequence text) {
+            if (hasForegroundColor() || mInNightMode) {
+                return ContrastColorUtil.clearColorSpans(text);
+            }
+            return text;
+        }
+
+        private void setTextViewColorPrimary(RemoteViews contentView, int id,
+                StandardTemplateParams p) {
+            ensureColors(p);
+            contentView.setTextColor(id, mPrimaryTextColor);
+        }
+
+        private boolean hasForegroundColor() {
+            return mForegroundColor != COLOR_INVALID;
+        }
+
+        /**
+         * Return the primary text color using the existing template params
+         * @hide
+         */
+        @VisibleForTesting
+        public int getPrimaryTextColor() {
+            return getPrimaryTextColor(mParams);
+        }
+
+        /**
+         * @param p the template params to inflate this with
+         * @return the primary text color
+         * @hide
+         */
+        @VisibleForTesting
+        public int getPrimaryTextColor(StandardTemplateParams p) {
+            ensureColors(p);
+            return mPrimaryTextColor;
+        }
+
+        /**
+         * Return the secondary text color using the existing template params
+         * @hide
+         */
+        @VisibleForTesting
+        public int getSecondaryTextColor() {
+            return getSecondaryTextColor(mParams);
+        }
+
+        /**
+         * @param p the template params to inflate this with
+         * @return the secondary text color
+         * @hide
+         */
+        @VisibleForTesting
+        public int getSecondaryTextColor(StandardTemplateParams p) {
+            ensureColors(p);
+            return mSecondaryTextColor;
+        }
+
+        private void setTextViewColorSecondary(RemoteViews contentView, int id,
+                StandardTemplateParams p) {
+            ensureColors(p);
+            contentView.setTextColor(id, mSecondaryTextColor);
+        }
+
+        private void ensureColors(StandardTemplateParams p) {
+            int backgroundColor = getBackgroundColor(p);
+            if (mPrimaryTextColor == COLOR_INVALID
+                    || mSecondaryTextColor == COLOR_INVALID
+                    || mTextColorsAreForBackground != backgroundColor) {
+                mTextColorsAreForBackground = backgroundColor;
+                if (!hasForegroundColor() || !isColorized(p)) {
+                    mPrimaryTextColor = ContrastColorUtil.resolvePrimaryColor(mContext,
+                            backgroundColor, mInNightMode);
+                    mSecondaryTextColor = ContrastColorUtil.resolveSecondaryColor(mContext,
+                            backgroundColor, mInNightMode);
+                    if (backgroundColor != COLOR_DEFAULT && isColorized(p)) {
+                        mPrimaryTextColor = ContrastColorUtil.findAlphaToMeetContrast(
+                                mPrimaryTextColor, backgroundColor, 4.5);
+                        mSecondaryTextColor = ContrastColorUtil.findAlphaToMeetContrast(
+                                mSecondaryTextColor, backgroundColor, 4.5);
                     }
-                    showLine2 = true;
                 } else {
-                    contentView.setViewVisibility(R.id.progress, View.GONE);
+                    double backLum = ContrastColorUtil.calculateLuminance(backgroundColor);
+                    double textLum = ContrastColorUtil.calculateLuminance(mForegroundColor);
+                    double contrast = ContrastColorUtil.calculateContrast(mForegroundColor,
+                            backgroundColor);
+                    // We only respect the given colors if worst case Black or White still has
+                    // contrast
+                    boolean backgroundLight = backLum > textLum
+                                    && satisfiesTextContrast(backgroundColor, Color.BLACK)
+                            || backLum <= textLum
+                                    && !satisfiesTextContrast(backgroundColor, Color.WHITE);
+                    if (contrast < 4.5f) {
+                        if (backgroundLight) {
+                            mSecondaryTextColor = ContrastColorUtil.findContrastColor(
+                                    mForegroundColor,
+                                    backgroundColor,
+                                    true /* findFG */,
+                                    4.5f);
+                            mPrimaryTextColor = ContrastColorUtil.changeColorLightness(
+                                    mSecondaryTextColor, -LIGHTNESS_TEXT_DIFFERENCE_LIGHT);
+                        } else {
+                            mSecondaryTextColor =
+                                    ContrastColorUtil.findContrastColorAgainstDark(
+                                    mForegroundColor,
+                                    backgroundColor,
+                                    true /* findFG */,
+                                    4.5f);
+                            mPrimaryTextColor = ContrastColorUtil.changeColorLightness(
+                                    mSecondaryTextColor, -LIGHTNESS_TEXT_DIFFERENCE_DARK);
+                        }
+                    } else {
+                        mPrimaryTextColor = mForegroundColor;
+                        mSecondaryTextColor = ContrastColorUtil.changeColorLightness(
+                                mPrimaryTextColor, backgroundLight ? LIGHTNESS_TEXT_DIFFERENCE_LIGHT
+                                        : LIGHTNESS_TEXT_DIFFERENCE_DARK);
+                        if (ContrastColorUtil.calculateContrast(mSecondaryTextColor,
+                                backgroundColor) < 4.5f) {
+                            // oh well the secondary is not good enough
+                            if (backgroundLight) {
+                                mSecondaryTextColor = ContrastColorUtil.findContrastColor(
+                                        mSecondaryTextColor,
+                                        backgroundColor,
+                                        true /* findFG */,
+                                        4.5f);
+                            } else {
+                                mSecondaryTextColor
+                                        = ContrastColorUtil.findContrastColorAgainstDark(
+                                        mSecondaryTextColor,
+                                        backgroundColor,
+                                        true /* findFG */,
+                                        4.5f);
+                            }
+                            mPrimaryTextColor = ContrastColorUtil.changeColorLightness(
+                                    mSecondaryTextColor, backgroundLight
+                                            ? -LIGHTNESS_TEXT_DIFFERENCE_LIGHT
+                                            : -LIGHTNESS_TEXT_DIFFERENCE_DARK);
+                        }
+                    }
                 }
             }
-            if (showLine2) {
+        }
 
-                // need to shrink all the type to make sure everything fits
-                shrinkLine3Text(contentView);
+        private void updateBackgroundColor(RemoteViews contentView,
+                StandardTemplateParams p) {
+            if (isColorized(p)) {
+                contentView.setInt(R.id.status_bar_latest_event_content, "setBackgroundColor",
+                        getBackgroundColor(p));
+            } else {
+                // Clear it!
+                contentView.setInt(R.id.status_bar_latest_event_content, "setBackgroundResource",
+                        0);
             }
+        }
 
+        /**
+         * @param remoteView the remote view to update the minheight in
+         * @param hasMinHeight does it have a mimHeight
+         * @hide
+         */
+        void setContentMinHeight(RemoteViews remoteView, boolean hasMinHeight) {
+            int minHeight = 0;
+            if (hasMinHeight) {
+                // we need to set the minHeight of the notification
+                minHeight = mContext.getResources().getDimensionPixelSize(
+                        com.android.internal.R.dimen.notification_min_content_height);
+            }
+            remoteView.setInt(R.id.notification_main_column, "setMinimumHeight", minHeight);
+        }
+
+        private boolean handleProgressBar(RemoteViews contentView, Bundle ex,
+                StandardTemplateParams p) {
+            final int max = ex.getInt(EXTRA_PROGRESS_MAX, 0);
+            final int progress = ex.getInt(EXTRA_PROGRESS, 0);
+            final boolean ind = ex.getBoolean(EXTRA_PROGRESS_INDETERMINATE);
+            if (p.hasProgress && (max != 0 || ind)) {
+                contentView.setViewVisibility(com.android.internal.R.id.progress, View.VISIBLE);
+                contentView.setProgressBar(
+                        R.id.progress, max, progress, ind);
+                contentView.setProgressBackgroundTintList(
+                        R.id.progress, ColorStateList.valueOf(mContext.getColor(
+                                R.color.notification_progress_background_color)));
+                if (getRawColor(p) != COLOR_DEFAULT) {
+                    int color = isColorized(p) ? getPrimaryTextColor(p) : resolveContrastColor(p);
+                    ColorStateList colorStateList = ColorStateList.valueOf(color);
+                    contentView.setProgressTintList(R.id.progress, colorStateList);
+                    contentView.setProgressIndeterminateTintList(R.id.progress, colorStateList);
+                }
+                return true;
+            } else {
+                contentView.setViewVisibility(R.id.progress, View.GONE);
+                return false;
+            }
+        }
+
+        private void bindLargeIconAndReply(RemoteViews contentView, StandardTemplateParams p,
+                TemplateBindResult result) {
+            boolean largeIconShown = bindLargeIcon(contentView, p);
+            boolean replyIconShown = bindReplyIcon(contentView, p);
+            boolean iconContainerVisible = largeIconShown || replyIconShown;
+            contentView.setViewVisibility(R.id.right_icon_container,
+                    iconContainerVisible ? View.VISIBLE : View.GONE);
+            int marginEnd = calculateMarginEnd(largeIconShown, replyIconShown);
+            contentView.setViewLayoutMarginEnd(R.id.line1, marginEnd);
+            contentView.setViewLayoutMarginEnd(R.id.text, marginEnd);
+            contentView.setViewLayoutMarginEnd(R.id.progress, marginEnd);
+            if (result != null) {
+                result.setIconMarginEnd(marginEnd);
+                result.setRightIconContainerVisible(iconContainerVisible);
+            }
+        }
+
+        private int calculateMarginEnd(boolean largeIconShown, boolean replyIconShown) {
+            int marginEnd = 0;
+            int contentMargin = mContext.getResources().getDimensionPixelSize(
+                    R.dimen.notification_content_margin_end);
+            int iconSize = mContext.getResources().getDimensionPixelSize(
+                    R.dimen.notification_right_icon_size);
+            if (replyIconShown) {
+                // The size of the reply icon
+                marginEnd += iconSize;
+
+                int replyInset = mContext.getResources().getDimensionPixelSize(
+                        R.dimen.notification_reply_inset);
+                // We're subtracting the inset of the reply icon to make sure it's
+                // aligned nicely on the right, and remove it from the following padding
+                marginEnd -= replyInset * 2;
+            }
+            if (largeIconShown) {
+                // adding size of the right icon
+                marginEnd += iconSize;
+
+                if (replyIconShown) {
+                    // We also add some padding to the reply icon if it's around
+                    marginEnd += contentMargin;
+                }
+            }
+            if (replyIconShown || largeIconShown) {
+                // The padding to the content
+                marginEnd += contentMargin;
+            }
+            return marginEnd;
+        }
+
+        /**
+         * Bind the large icon.
+         * @return if the largeIcon is visible
+         */
+        private boolean bindLargeIcon(RemoteViews contentView, StandardTemplateParams p) {
+            if (mN.mLargeIcon == null && mN.largeIcon != null) {
+                mN.mLargeIcon = Icon.createWithBitmap(mN.largeIcon);
+            }
+            boolean showLargeIcon = mN.mLargeIcon != null && !p.hideLargeIcon;
+            if (showLargeIcon) {
+                contentView.setViewVisibility(R.id.right_icon, View.VISIBLE);
+                contentView.setImageViewIcon(R.id.right_icon, mN.mLargeIcon);
+                processLargeLegacyIcon(mN.mLargeIcon, contentView, p);
+            }
+            return showLargeIcon;
+        }
+
+        /**
+         * Bind the reply icon.
+         * @return if the reply icon is visible
+         */
+        private boolean bindReplyIcon(RemoteViews contentView, StandardTemplateParams p) {
+            boolean actionVisible = !p.hideReplyIcon;
+            Action action = null;
+            if (actionVisible) {
+                action = findReplyAction();
+                actionVisible = action != null;
+            }
+            if (actionVisible) {
+                contentView.setViewVisibility(R.id.reply_icon_action, View.VISIBLE);
+                contentView.setDrawableTint(R.id.reply_icon_action,
+                        false /* targetBackground */,
+                        getNeutralColor(p),
+                        PorterDuff.Mode.SRC_ATOP);
+                contentView.setOnClickPendingIntent(R.id.reply_icon_action, action.actionIntent);
+                contentView.setRemoteInputs(R.id.reply_icon_action, action.mRemoteInputs);
+            } else {
+                contentView.setRemoteInputs(R.id.reply_icon_action, null);
+            }
+            contentView.setViewVisibility(R.id.reply_icon_action,
+                    actionVisible ? View.VISIBLE : View.GONE);
+            return actionVisible;
+        }
+
+        private Action findReplyAction() {
+            ArrayList<Action> actions = mActions;
+            if (mOriginalActions != null) {
+                actions = mOriginalActions;
+            }
+            int numActions = actions.size();
+            for (int i = 0; i < numActions; i++) {
+                Action action = actions.get(i);
+                if (hasValidRemoteInput(action)) {
+                    return action;
+                }
+            }
+            return null;
+        }
+
+        private void bindNotificationHeader(RemoteViews contentView, StandardTemplateParams p) {
+            bindSmallIcon(contentView, p);
+            bindHeaderAppName(contentView, p);
+            bindHeaderText(contentView, p);
+            bindHeaderTextSecondary(contentView, p);
+            bindHeaderChronometerAndTime(contentView, p);
+            bindProfileBadge(contentView, p);
+            bindAlertedIcon(contentView, p);
+            bindActivePermissions(contentView, p);
+            bindExpandButton(contentView, p);
+            mN.mUsesStandardHeader = true;
+        }
+
+        private void bindActivePermissions(RemoteViews contentView, StandardTemplateParams p) {
+            int color = getNeutralColor(p);
+            contentView.setDrawableTint(R.id.camera, false, color, PorterDuff.Mode.SRC_ATOP);
+            contentView.setDrawableTint(R.id.mic, false, color, PorterDuff.Mode.SRC_ATOP);
+            contentView.setDrawableTint(R.id.overlay, false, color, PorterDuff.Mode.SRC_ATOP);
+        }
+
+        private void bindExpandButton(RemoteViews contentView, StandardTemplateParams p) {
+            int color = isColorized(p) ? getPrimaryTextColor(p) : getSecondaryTextColor(p);
+            contentView.setDrawableTint(R.id.expand_button, false, color,
+                    PorterDuff.Mode.SRC_ATOP);
+            contentView.setInt(R.id.expand_button, "setOriginalNotificationColor",
+                    color);
+        }
+
+        private void bindHeaderChronometerAndTime(RemoteViews contentView,
+                StandardTemplateParams p) {
             if (showsTimeOrChronometer()) {
-                if (mUseChronometer) {
+                contentView.setViewVisibility(R.id.time_divider, View.VISIBLE);
+                setTextViewColorSecondary(contentView, R.id.time_divider, p);
+                if (mN.extras.getBoolean(EXTRA_SHOW_CHRONOMETER)) {
                     contentView.setViewVisibility(R.id.chronometer, View.VISIBLE);
                     contentView.setLong(R.id.chronometer, "setBase",
-                            mWhen + (SystemClock.elapsedRealtime() - System.currentTimeMillis()));
+                            mN.when + (SystemClock.elapsedRealtime() - System.currentTimeMillis()));
                     contentView.setBoolean(R.id.chronometer, "setStarted", true);
+                    boolean countsDown = mN.extras.getBoolean(EXTRA_CHRONOMETER_COUNT_DOWN);
+                    contentView.setChronometerCountDown(R.id.chronometer, countsDown);
+                    setTextViewColorSecondary(contentView, R.id.chronometer, p);
                 } else {
                     contentView.setViewVisibility(R.id.time, View.VISIBLE);
-                    contentView.setLong(R.id.time, "setTime", mWhen);
+                    contentView.setLong(R.id.time, "setTime", mN.when);
+                    setTextViewColorSecondary(contentView, R.id.time, p);
+                }
+            } else {
+                // We still want a time to be set but gone, such that we can show and hide it
+                // on demand in case it's a child notification without anything in the header
+                contentView.setLong(R.id.time, "setTime", mN.when != 0 ? mN.when : mN.creationTime);
+            }
+        }
+
+        private void bindHeaderText(RemoteViews contentView, StandardTemplateParams p) {
+            CharSequence summaryText = p.summaryText;
+            if (summaryText == null && mStyle != null && mStyle.mSummaryTextSet
+                    && mStyle.hasSummaryInHeader()) {
+                summaryText = mStyle.mSummaryText;
+            }
+            if (summaryText == null
+                    && mContext.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N
+                    && mN.extras.getCharSequence(EXTRA_INFO_TEXT) != null) {
+                summaryText = mN.extras.getCharSequence(EXTRA_INFO_TEXT);
+            }
+            if (summaryText != null) {
+                // TODO: Remove the span entirely to only have the string with propper formating.
+                contentView.setTextViewText(R.id.header_text, processTextSpans(
+                        processLegacyText(summaryText)));
+                setTextViewColorSecondary(contentView, R.id.header_text, p);
+                contentView.setViewVisibility(R.id.header_text, View.VISIBLE);
+                contentView.setViewVisibility(R.id.header_text_divider, View.VISIBLE);
+                setTextViewColorSecondary(contentView, R.id.header_text_divider, p);
+            }
+        }
+
+        private void bindHeaderTextSecondary(RemoteViews contentView, StandardTemplateParams p) {
+            if (!TextUtils.isEmpty(p.headerTextSecondary)) {
+                contentView.setTextViewText(R.id.header_text_secondary, processTextSpans(
+                        processLegacyText(p.headerTextSecondary)));
+                setTextViewColorSecondary(contentView, R.id.header_text_secondary, p);
+                contentView.setViewVisibility(R.id.header_text_secondary, View.VISIBLE);
+                contentView.setViewVisibility(R.id.header_text_secondary_divider, View.VISIBLE);
+                setTextViewColorSecondary(contentView, R.id.header_text_secondary_divider, p);
+            }
+        }
+
+        /**
+         * @hide
+         */
+        @UnsupportedAppUsage
+        public String loadHeaderAppName() {
+            CharSequence name = null;
+            final PackageManager pm = mContext.getPackageManager();
+            if (mN.extras.containsKey(EXTRA_SUBSTITUTE_APP_NAME)) {
+                // only system packages which lump together a bunch of unrelated stuff
+                // may substitute a different name to make the purpose of the
+                // notification more clear. the correct package label should always
+                // be accessible via SystemUI.
+                final String pkg = mContext.getPackageName();
+                final String subName = mN.extras.getString(EXTRA_SUBSTITUTE_APP_NAME);
+                if (PackageManager.PERMISSION_GRANTED == pm.checkPermission(
+                        android.Manifest.permission.SUBSTITUTE_NOTIFICATION_APP_NAME, pkg)) {
+                    name = subName;
+                } else {
+                    Log.w(TAG, "warning: pkg "
+                            + pkg + " attempting to substitute app name '" + subName
+                            + "' without holding perm "
+                            + android.Manifest.permission.SUBSTITUTE_NOTIFICATION_APP_NAME);
                 }
             }
-
-            // Adjust padding depending on line count and font size.
-            contentView.setViewPadding(R.id.line1, 0, calculateTopPadding(mContext,
-                    mHasThreeLines, mContext.getResources().getConfiguration().fontScale),
-                    0, 0);
-
-            // We want to add badge to first line of text.
-            boolean addedBadge = addProfileBadge(contentView,
-                    contentTextInLine2 ? R.id.profile_badge_line2 : R.id.profile_badge_line3);
-            // If we added the badge to line 3 then we should show line 3.
-            if (addedBadge && !contentTextInLine2) {
-                showLine3 = true;
+            if (TextUtils.isEmpty(name)) {
+                name = pm.getApplicationLabel(mContext.getApplicationInfo());
+            }
+            if (TextUtils.isEmpty(name)) {
+                // still nothing?
+                return null;
             }
 
-            // Note getStandardView may hide line 3 again.
-            contentView.setViewVisibility(R.id.line3, showLine3 ? View.VISIBLE : View.GONE);
-            contentView.setViewVisibility(R.id.overflow_divider, showLine3 ? View.VISIBLE : View.GONE);
-            return contentView;
+            return String.valueOf(name);
+        }
+        private void bindHeaderAppName(RemoteViews contentView, StandardTemplateParams p) {
+            contentView.setTextViewText(R.id.app_name_text, loadHeaderAppName());
+            if (isColorized(p)) {
+                setTextViewColorPrimary(contentView, R.id.app_name_text, p);
+            } else {
+                contentView.setTextColor(R.id.app_name_text, getSecondaryTextColor(p));
+            }
+        }
+
+        private boolean isColorized(StandardTemplateParams p) {
+            return p.allowColorization && mN.isColorized();
+        }
+
+        private void bindSmallIcon(RemoteViews contentView, StandardTemplateParams p) {
+            if (mN.mSmallIcon == null && mN.icon != 0) {
+                mN.mSmallIcon = Icon.createWithResource(mContext, mN.icon);
+            }
+            contentView.setImageViewIcon(R.id.icon, mN.mSmallIcon);
+            contentView.setInt(R.id.icon, "setImageLevel", mN.iconLevel);
+            processSmallIconColor(mN.mSmallIcon, contentView, p);
         }
 
         /**
@@ -3091,114 +5291,518 @@ public class Notification implements Parcelable
          *         otherwise
          */
         private boolean showsTimeOrChronometer() {
-            return mWhen != 0 && mShowWhen;
-        }
-
-        /**
-         * Logic to find out whether the notification is going to have three lines in the contracted
-         * layout. This is used to adjust the top padding.
-         *
-         * @return true if the notification is going to have three lines; false if the notification
-         *         is going to have one or two lines
-         */
-        private boolean hasThreeLines() {
-            boolean contentTextInLine2 = mSubText != null && mContentText != null;
-            boolean hasProgress = mStyle == null || mStyle.hasProgress();
-            // If we have content text in line 2, badge goes into line 2, or line 3 otherwise
-            boolean badgeInLine3 = getProfileBadgeDrawable() != null && !contentTextInLine2;
-            boolean hasLine3 = mContentText != null || mContentInfo != null || mNumber > 0
-                    || badgeInLine3;
-            boolean hasLine2 = (mSubText != null && mContentText != null) ||
-                    (hasProgress && mSubText == null
-                            && (mProgressMax != 0 || mProgressIndeterminate));
-            return hasLine2 && hasLine3;
-        }
-
-        /**
-         * @hide
-         */
-        public static int calculateTopPadding(Context ctx, boolean hasThreeLines,
-                float fontScale) {
-            int padding = ctx.getResources().getDimensionPixelSize(hasThreeLines
-                    ? R.dimen.notification_top_pad_narrow
-                    : R.dimen.notification_top_pad);
-            int largePadding = ctx.getResources().getDimensionPixelSize(hasThreeLines
-                    ? R.dimen.notification_top_pad_large_text_narrow
-                    : R.dimen.notification_top_pad_large_text);
-            float largeFactor = (MathUtils.constrain(fontScale, 1.0f, LARGE_TEXT_SCALE) - 1f)
-                    / (LARGE_TEXT_SCALE - 1f);
-
-            // Linearly interpolate the padding between large and normal with the font scale ranging
-            // from 1f to LARGE_TEXT_SCALE
-            return Math.round((1 - largeFactor) * padding + largeFactor * largePadding);
+            return mN.showsTime() || mN.showsChronometer();
         }
 
         private void resetStandardTemplateWithActions(RemoteViews big) {
+            // actions_container is only reset when there are no actions to avoid focus issues with
+            // remote inputs.
             big.setViewVisibility(R.id.actions, View.GONE);
-            big.setViewVisibility(R.id.action_divider, View.GONE);
             big.removeAllViews(R.id.actions);
+
+            big.setViewVisibility(R.id.notification_material_reply_container, View.GONE);
+            big.setTextViewText(R.id.notification_material_reply_text_1, null);
+            big.setViewVisibility(R.id.notification_material_reply_text_1_container, View.GONE);
+            big.setViewVisibility(R.id.notification_material_reply_progress, View.GONE);
+
+            big.setViewVisibility(R.id.notification_material_reply_text_2, View.GONE);
+            big.setTextViewText(R.id.notification_material_reply_text_2, null);
+            big.setViewVisibility(R.id.notification_material_reply_text_3, View.GONE);
+            big.setTextViewText(R.id.notification_material_reply_text_3, null);
+
+            big.setViewLayoutMarginBottomDimen(R.id.notification_action_list_margin_target,
+                    R.dimen.notification_content_margin);
         }
 
-        private RemoteViews applyStandardTemplateWithActions(int layoutId) {
-            RemoteViews big = applyStandardTemplate(layoutId);
+        private RemoteViews applyStandardTemplateWithActions(int layoutId,
+                TemplateBindResult result) {
+            return applyStandardTemplateWithActions(layoutId, mParams.reset().fillTextsFrom(this),
+                    result);
+        }
+
+        private static List<Notification.Action> filterOutContextualActions(
+                List<Notification.Action> actions) {
+            List<Notification.Action> nonContextualActions = new ArrayList<>();
+            for (Notification.Action action : actions) {
+                if (!action.isContextual()) {
+                    nonContextualActions.add(action);
+                }
+            }
+            return nonContextualActions;
+        }
+
+        private RemoteViews applyStandardTemplateWithActions(int layoutId,
+                StandardTemplateParams p, TemplateBindResult result) {
+            RemoteViews big = applyStandardTemplate(layoutId, p, result);
 
             resetStandardTemplateWithActions(big);
 
-            int N = mActions.size();
+            boolean validRemoteInput = false;
+
+            // In the UI contextual actions appear separately from the standard actions, so we
+            // filter them out here.
+            List<Notification.Action> nonContextualActions = filterOutContextualActions(mActions);
+
+            int N = nonContextualActions.size();
+            boolean emphazisedMode = mN.fullScreenIntent != null;
+            big.setBoolean(R.id.actions, "setEmphasizedMode", emphazisedMode);
             if (N > 0) {
+                big.setViewVisibility(R.id.actions_container, View.VISIBLE);
                 big.setViewVisibility(R.id.actions, View.VISIBLE);
-                big.setViewVisibility(R.id.action_divider, View.VISIBLE);
+                big.setViewLayoutMarginBottomDimen(R.id.notification_action_list_margin_target, 0);
                 if (N>MAX_ACTION_BUTTONS) N=MAX_ACTION_BUTTONS;
                 for (int i=0; i<N; i++) {
-                    final RemoteViews button = generateActionButton(mActions.get(i));
+                    Action action = nonContextualActions.get(i);
+
+                    boolean actionHasValidInput = hasValidRemoteInput(action);
+                    validRemoteInput |= actionHasValidInput;
+
+                    final RemoteViews button = generateActionButton(action, emphazisedMode, p);
+                    if (actionHasValidInput && !emphazisedMode) {
+                        // Clear the drawable
+                        button.setInt(R.id.action0, "setBackgroundResource", 0);
+                    }
                     big.addView(R.id.actions, button);
                 }
+            } else {
+                big.setViewVisibility(R.id.actions_container, View.GONE);
             }
+
+            RemoteInputHistoryItem[] replyText = getParcelableArrayFromBundle(
+                    mN.extras, EXTRA_REMOTE_INPUT_HISTORY_ITEMS, RemoteInputHistoryItem.class);
+            if (validRemoteInput && replyText != null && replyText.length > 0
+                    && !TextUtils.isEmpty(replyText[0].getText())
+                    && p.maxRemoteInputHistory > 0) {
+                boolean showSpinner = mN.extras.getBoolean(EXTRA_SHOW_REMOTE_INPUT_SPINNER);
+                big.setViewVisibility(R.id.notification_material_reply_container, View.VISIBLE);
+                big.setViewVisibility(R.id.notification_material_reply_text_1_container,
+                        View.VISIBLE);
+                big.setTextViewText(R.id.notification_material_reply_text_1,
+                        processTextSpans(replyText[0].getText()));
+                setTextViewColorSecondary(big, R.id.notification_material_reply_text_1, p);
+                big.setViewVisibility(R.id.notification_material_reply_progress,
+                        showSpinner ? View.VISIBLE : View.GONE);
+                big.setProgressIndeterminateTintList(
+                        R.id.notification_material_reply_progress,
+                        ColorStateList.valueOf(
+                                isColorized(p) ? getPrimaryTextColor(p) : resolveContrastColor(p)));
+
+                if (replyText.length > 1 && !TextUtils.isEmpty(replyText[1].getText())
+                        && p.maxRemoteInputHistory > 1) {
+                    big.setViewVisibility(R.id.notification_material_reply_text_2, View.VISIBLE);
+                    big.setTextViewText(R.id.notification_material_reply_text_2,
+                            processTextSpans(replyText[1].getText()));
+                    setTextViewColorSecondary(big, R.id.notification_material_reply_text_2, p);
+
+                    if (replyText.length > 2 && !TextUtils.isEmpty(replyText[2].getText())
+                            && p.maxRemoteInputHistory > 2) {
+                        big.setViewVisibility(
+                                R.id.notification_material_reply_text_3, View.VISIBLE);
+                        big.setTextViewText(R.id.notification_material_reply_text_3,
+                                processTextSpans(replyText[2].getText()));
+                        setTextViewColorSecondary(big, R.id.notification_material_reply_text_3, p);
+                    }
+                }
+            }
+
             return big;
         }
 
-        private RemoteViews makeContentView() {
-            if (mContentView != null) {
-                return mContentView;
-            } else {
-                return applyStandardTemplate(getBaseLayoutResource());
+        private boolean hasValidRemoteInput(Action action) {
+            if (TextUtils.isEmpty(action.title) || action.actionIntent == null) {
+                // Weird actions
+                return false;
+            }
+
+            RemoteInput[] remoteInputs = action.getRemoteInputs();
+            if (remoteInputs == null) {
+                return false;
+            }
+
+            for (RemoteInput r : remoteInputs) {
+                CharSequence[] choices = r.getChoices();
+                if (r.getAllowFreeFormInput() || (choices != null && choices.length != 0)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Construct a RemoteViews for the final 1U notification layout. In order:
+         *   1. Custom contentView from the caller
+         *   2. Style's proposed content view
+         *   3. Standard template view
+         */
+        public RemoteViews createContentView() {
+            return createContentView(false /* increasedheight */ );
+        }
+
+        /**
+         * Construct a RemoteViews for the smaller content view.
+         *
+         *   @param increasedHeight true if this layout be created with an increased height. Some
+         *   styles may support showing more then just that basic 1U size
+         *   and the system may decide to render important notifications
+         *   slightly bigger even when collapsed.
+         *
+         *   @hide
+         */
+        public RemoteViews createContentView(boolean increasedHeight) {
+            if (mN.contentView != null && useExistingRemoteView()) {
+                return mN.contentView;
+            } else if (mStyle != null) {
+                final RemoteViews styleView = mStyle.makeContentView(increasedHeight);
+                if (styleView != null) {
+                    return styleView;
+                }
+            }
+            return applyStandardTemplate(getBaseLayoutResource(), null /* result */);
+        }
+
+        private boolean useExistingRemoteView() {
+            return mStyle == null || (!mStyle.displayCustomViewInline()
+                    && !mRebuildStyledRemoteViews);
+        }
+
+        /**
+         * Construct a RemoteViews for the final big notification layout.
+         */
+        public RemoteViews createBigContentView() {
+            RemoteViews result = null;
+            if (mN.bigContentView != null && useExistingRemoteView()) {
+                return mN.bigContentView;
+            } else if (mStyle != null) {
+                result = mStyle.makeBigContentView();
+                hideLine1Text(result);
+            } else if (mActions.size() != 0) {
+                result = applyStandardTemplateWithActions(getBigBaseLayoutResource(),
+                        null /* result */);
+            }
+            makeHeaderExpanded(result);
+            return result;
+        }
+
+        /**
+         * Construct a RemoteViews for the final notification header only. This will not be
+         * colorized.
+         *
+         * @hide
+         */
+        public RemoteViews makeNotificationHeader() {
+            return makeNotificationHeader(mParams.reset().fillTextsFrom(this));
+        }
+
+        /**
+         * Construct a RemoteViews for the final notification header only. This will not be
+         * colorized.
+         *
+         * @param p the template params to inflate this with
+         */
+        private RemoteViews makeNotificationHeader(StandardTemplateParams p) {
+            // Headers on their own are never colorized
+            p.disallowColorization();
+            RemoteViews header = new BuilderRemoteViews(mContext.getApplicationInfo(),
+                    R.layout.notification_template_header);
+            resetNotificationHeader(header);
+            bindNotificationHeader(header, p);
+            return header;
+        }
+
+        /**
+         * Construct a RemoteViews for the ambient version of the notification.
+         *
+         * @hide
+         */
+        public RemoteViews makeAmbientNotification() {
+            RemoteViews headsUpContentView = createHeadsUpContentView(false /* increasedHeight */);
+            if (headsUpContentView != null) {
+                return headsUpContentView;
+            }
+            return createContentView();
+        }
+
+        private void hideLine1Text(RemoteViews result) {
+            if (result != null) {
+                result.setViewVisibility(R.id.text_line_1, View.GONE);
             }
         }
 
-        private RemoteViews makeTickerView() {
-            if (mTickerView != null) {
-                return mTickerView;
+        /**
+         * Adapt the Notification header if this view is used as an expanded view.
+         *
+         * @hide
+         */
+        public static void makeHeaderExpanded(RemoteViews result) {
+            if (result != null) {
+                result.setBoolean(R.id.notification_header, "setExpanded", true);
             }
-            return null; // tickers are not created by default anymore
         }
 
-        private RemoteViews makeBigContentView() {
-            if (mActions.size() == 0) return null;
+        /**
+         * Construct a RemoteViews for the final heads-up notification layout.
+         *
+         * @param increasedHeight true if this layout be created with an increased height. Some
+         * styles may support showing more then just that basic 1U size
+         * and the system may decide to render important notifications
+         * slightly bigger even when collapsed.
+         *
+         * @hide
+         */
+        public RemoteViews createHeadsUpContentView(boolean increasedHeight) {
+            if (mN.headsUpContentView != null && useExistingRemoteView()) {
+                return mN.headsUpContentView;
+            } else if (mStyle != null) {
+                final RemoteViews styleView = mStyle.makeHeadsUpContentView(increasedHeight);
+                if (styleView != null) {
+                    return styleView;
+                }
+            } else if (mActions.size() == 0) {
+                return null;
+            }
 
-            return applyStandardTemplateWithActions(getBigBaseLayoutResource());
+            // We only want at most a single remote input history to be shown here, otherwise
+            // the content would become squished.
+            StandardTemplateParams p = mParams.reset().fillTextsFrom(this)
+                    .setMaxRemoteInputHistory(1);
+            return applyStandardTemplateWithActions(getBigBaseLayoutResource(),
+                    p,
+                    null /* result */);
         }
 
-        private RemoteViews makeHeadsUpContentView() {
-            if (mActions.size() == 0) return null;
-
-            return applyStandardTemplateWithActions(getBigBaseLayoutResource());
+        /**
+         * Construct a RemoteViews for the final heads-up notification layout.
+         */
+        public RemoteViews createHeadsUpContentView() {
+            return createHeadsUpContentView(false /* useIncreasedHeight */);
         }
 
+        /**
+         * Construct a RemoteViews for the display in public contexts like on the lockscreen.
+         *
+         * @param isLowPriority is this notification low priority
+         * @hide
+         */
+        @UnsupportedAppUsage
+        public RemoteViews makePublicContentView(boolean isLowPriority) {
+            if (mN.publicVersion != null) {
+                final Builder builder = recoverBuilder(mContext, mN.publicVersion);
+                return builder.createContentView();
+            }
+            Bundle savedBundle = mN.extras;
+            Style style = mStyle;
+            mStyle = null;
+            Icon largeIcon = mN.mLargeIcon;
+            mN.mLargeIcon = null;
+            Bitmap largeIconLegacy = mN.largeIcon;
+            mN.largeIcon = null;
+            ArrayList<Action> actions = mActions;
+            mActions = new ArrayList<>();
+            Bundle publicExtras = new Bundle();
+            publicExtras.putBoolean(EXTRA_SHOW_WHEN,
+                    savedBundle.getBoolean(EXTRA_SHOW_WHEN));
+            publicExtras.putBoolean(EXTRA_SHOW_CHRONOMETER,
+                    savedBundle.getBoolean(EXTRA_SHOW_CHRONOMETER));
+            publicExtras.putBoolean(EXTRA_CHRONOMETER_COUNT_DOWN,
+                    savedBundle.getBoolean(EXTRA_CHRONOMETER_COUNT_DOWN));
+            String appName = savedBundle.getString(EXTRA_SUBSTITUTE_APP_NAME);
+            if (appName != null) {
+                publicExtras.putString(EXTRA_SUBSTITUTE_APP_NAME, appName);
+            }
+            mN.extras = publicExtras;
+            RemoteViews view;
+            StandardTemplateParams params = mParams.reset().fillTextsFrom(this);
+            if (isLowPriority) {
+                params.forceDefaultColor();
+            }
+            view = makeNotificationHeader(params);
+            view.setBoolean(R.id.notification_header, "setExpandOnlyOnButton", true);
+            mN.extras = savedBundle;
+            mN.mLargeIcon = largeIcon;
+            mN.largeIcon = largeIconLegacy;
+            mActions = actions;
+            mStyle = style;
+            return view;
+        }
 
-        private RemoteViews generateActionButton(Action action) {
+        /**
+         * Construct a content view for the display when low - priority
+         *
+         * @param useRegularSubtext uses the normal subtext set if there is one available. Otherwise
+         *                          a new subtext is created consisting of the content of the
+         *                          notification.
+         * @hide
+         */
+        public RemoteViews makeLowPriorityContentView(boolean useRegularSubtext) {
+            StandardTemplateParams p = mParams.reset()
+                    .forceDefaultColor()
+                    .fillTextsFrom(this);
+            if (!useRegularSubtext || TextUtils.isEmpty(mParams.summaryText)) {
+                p.summaryText(createSummaryText());
+            }
+            RemoteViews header = makeNotificationHeader(p);
+            header.setBoolean(R.id.notification_header, "setAcceptAllTouches", true);
+            return header;
+        }
+
+        private CharSequence createSummaryText() {
+            CharSequence titleText = mN.extras.getCharSequence(Notification.EXTRA_TITLE);
+            if (USE_ONLY_TITLE_IN_LOW_PRIORITY_SUMMARY) {
+                return titleText;
+            }
+            SpannableStringBuilder summary = new SpannableStringBuilder();
+            if (titleText == null) {
+                titleText = mN.extras.getCharSequence(Notification.EXTRA_TITLE_BIG);
+            }
+            BidiFormatter bidi = BidiFormatter.getInstance();
+            if (titleText != null) {
+                summary.append(bidi.unicodeWrap(titleText));
+            }
+            CharSequence contentText = mN.extras.getCharSequence(Notification.EXTRA_TEXT);
+            if (titleText != null && contentText != null) {
+                summary.append(bidi.unicodeWrap(mContext.getText(
+                        R.string.notification_header_divider_symbol_with_spaces)));
+            }
+            if (contentText != null) {
+                summary.append(bidi.unicodeWrap(contentText));
+            }
+            return summary;
+        }
+
+        private RemoteViews generateActionButton(Action action, boolean emphazisedMode,
+                StandardTemplateParams p) {
             final boolean tombstone = (action.actionIntent == null);
             RemoteViews button = new BuilderRemoteViews(mContext.getApplicationInfo(),
-                    tombstone ? getActionTombstoneLayoutResource()
-                              : getActionLayoutResource());
-            final Icon ai = action.getIcon();
-            button.setTextViewCompoundDrawablesRelative(R.id.action0, ai, null, null, null);
-            button.setTextViewText(R.id.action0, processLegacyText(action.title));
+                    emphazisedMode ? getEmphasizedActionLayoutResource()
+                            : tombstone ? getActionTombstoneLayoutResource()
+                                    : getActionLayoutResource());
             if (!tombstone) {
                 button.setOnClickPendingIntent(R.id.action0, action.actionIntent);
             }
             button.setContentDescription(R.id.action0, action.title);
-            processLegacyAction(action, button);
+            if (action.mRemoteInputs != null) {
+                button.setRemoteInputs(R.id.action0, action.mRemoteInputs);
+            }
+            if (emphazisedMode) {
+                // change the background bgColor
+                CharSequence title = action.title;
+                ColorStateList[] outResultColor = null;
+                int background = resolveBackgroundColor(p);
+                if (isLegacy()) {
+                    title = ContrastColorUtil.clearColorSpans(title);
+                } else {
+                    outResultColor = new ColorStateList[1];
+                    title = ensureColorSpanContrast(title, background, outResultColor);
+                }
+                button.setTextViewText(R.id.action0, processTextSpans(title));
+                setTextViewColorPrimary(button, R.id.action0, p);
+                int rippleColor;
+                boolean hasColorOverride = outResultColor != null && outResultColor[0] != null;
+                if (hasColorOverride) {
+                    // There's a span spanning the full text, let's take it and use it as the
+                    // background color
+                    background = outResultColor[0].getDefaultColor();
+                    int textColor = ContrastColorUtil.resolvePrimaryColor(mContext,
+                            background, mInNightMode);
+                    button.setTextColor(R.id.action0, textColor);
+                    rippleColor = textColor;
+                } else if (getRawColor(p) != COLOR_DEFAULT && !isColorized(p)
+                        && mTintActionButtons && !mInNightMode) {
+                    rippleColor = resolveContrastColor(p);
+                    button.setTextColor(R.id.action0, rippleColor);
+                } else {
+                    rippleColor = getPrimaryTextColor(p);
+                }
+                // We only want about 20% alpha for the ripple
+                rippleColor = (rippleColor & 0x00ffffff) | 0x33000000;
+                button.setColorStateList(R.id.action0, "setRippleColor",
+                        ColorStateList.valueOf(rippleColor));
+                button.setColorStateList(R.id.action0, "setButtonBackground",
+                        ColorStateList.valueOf(background));
+                button.setBoolean(R.id.action0, "setHasStroke", !hasColorOverride);
+            } else {
+                button.setTextViewText(R.id.action0, processTextSpans(
+                        processLegacyText(action.title)));
+                if (isColorized(p)) {
+                    setTextViewColorPrimary(button, R.id.action0, p);
+                } else if (getRawColor(p) != COLOR_DEFAULT && mTintActionButtons) {
+                    button.setTextColor(R.id.action0, resolveContrastColor(p));
+                }
+            }
+            button.setIntTag(R.id.action0, R.id.notification_action_index_tag,
+                    mActions.indexOf(action));
             return button;
+        }
+
+        /**
+         * Ensures contrast on color spans against a background color. also returns the color of the
+         * text if a span was found that spans over the whole text.
+         *
+         * @param charSequence the charSequence on which the spans are
+         * @param background the background color to ensure the contrast against
+         * @param outResultColor an array in which a color will be returned as the first element if
+         *                    there exists a full length color span.
+         * @return the contrasted charSequence
+         */
+        private CharSequence ensureColorSpanContrast(CharSequence charSequence, int background,
+                ColorStateList[] outResultColor) {
+            if (charSequence instanceof Spanned) {
+                Spanned ss = (Spanned) charSequence;
+                Object[] spans = ss.getSpans(0, ss.length(), Object.class);
+                SpannableStringBuilder builder = new SpannableStringBuilder(ss.toString());
+                for (Object span : spans) {
+                    Object resultSpan = span;
+                    int spanStart = ss.getSpanStart(span);
+                    int spanEnd = ss.getSpanEnd(span);
+                    boolean fullLength = (spanEnd - spanStart) == charSequence.length();
+                    if (resultSpan instanceof CharacterStyle) {
+                        resultSpan = ((CharacterStyle) span).getUnderlying();
+                    }
+                    if (resultSpan instanceof TextAppearanceSpan) {
+                        TextAppearanceSpan originalSpan = (TextAppearanceSpan) resultSpan;
+                        ColorStateList textColor = originalSpan.getTextColor();
+                        if (textColor != null) {
+                            int[] colors = textColor.getColors();
+                            int[] newColors = new int[colors.length];
+                            for (int i = 0; i < newColors.length; i++) {
+                                newColors[i] = ContrastColorUtil.ensureLargeTextContrast(
+                                        colors[i], background, mInNightMode);
+                            }
+                            textColor = new ColorStateList(textColor.getStates().clone(),
+                                    newColors);
+                            if (fullLength) {
+                                outResultColor[0] = textColor;
+                                // Let's drop the color from the span
+                                textColor = null;
+                            }
+                            resultSpan = new TextAppearanceSpan(
+                                    originalSpan.getFamily(),
+                                    originalSpan.getTextStyle(),
+                                    originalSpan.getTextSize(),
+                                    textColor,
+                                    originalSpan.getLinkTextColor());
+                        }
+                    } else if (resultSpan instanceof ForegroundColorSpan) {
+                        ForegroundColorSpan originalSpan = (ForegroundColorSpan) resultSpan;
+                        int foregroundColor = originalSpan.getForegroundColor();
+                        foregroundColor = ContrastColorUtil.ensureLargeTextContrast(
+                                foregroundColor, background, mInNightMode);
+                        if (fullLength) {
+                            outResultColor[0] = ColorStateList.valueOf(foregroundColor);
+                            resultSpan = null;
+                        } else {
+                            resultSpan = new ForegroundColorSpan(foregroundColor);
+                        }
+                    } else {
+                        resultSpan = span;
+                    }
+                    if (resultSpan != null) {
+                        builder.setSpan(resultSpan, spanStart, spanEnd, ss.getSpanFlags(span));
+                    }
+                }
+                return builder;
+            }
+            return charSequence;
         }
 
         /**
@@ -3206,437 +5810,171 @@ public class Notification implements Parcelable
          *         doesn't create material notifications by itself) app.
          */
         private boolean isLegacy() {
-            return mColorUtil != null;
-        }
-
-        private void processLegacyAction(Action action, RemoteViews button) {
-            if (!isLegacy() || mColorUtil.isGrayscaleIcon(mContext, action.getIcon())) {
-                button.setTextViewCompoundDrawablesRelativeColorFilter(R.id.action0, 0,
-                        mContext.getColor(R.color.notification_action_color_filter),
-                        PorterDuff.Mode.MULTIPLY);
+            if (!mIsLegacyInitialized) {
+                mIsLegacy = mContext.getApplicationInfo().targetSdkVersion
+                        < Build.VERSION_CODES.LOLLIPOP;
+                mIsLegacyInitialized = true;
             }
+            return mIsLegacy;
         }
 
         private CharSequence processLegacyText(CharSequence charSequence) {
-            if (isLegacy()) {
-                return mColorUtil.invertCharSequenceColors(charSequence);
+            boolean isAlreadyLightText = isLegacy() || textColorsNeedInversion();
+            if (isAlreadyLightText) {
+                return getColorUtil().invertCharSequenceColors(charSequence);
             } else {
                 return charSequence;
             }
         }
 
         /**
-         * Apply any necessary background to smallIcons being used in the largeIcon spot.
+         * Apply any necessariy colors to the small icon
          */
-        private void processSmallIconAsLarge(Icon largeIcon, RemoteViews contentView) {
-            if (!isLegacy()) {
-                contentView.setDrawableParameters(R.id.icon, false, -1,
-                        0xFFFFFFFF,
-                        PorterDuff.Mode.SRC_ATOP, -1);
-                applyLargeIconBackground(contentView);
+        private void processSmallIconColor(Icon smallIcon, RemoteViews contentView,
+                StandardTemplateParams p) {
+            boolean colorable = !isLegacy() || getColorUtil().isGrayscaleIcon(mContext, smallIcon);
+            int color;
+            if (isColorized(p)) {
+                color = getPrimaryTextColor(p);
             } else {
-                if (mColorUtil.isGrayscaleIcon(mContext, largeIcon)) {
-                    applyLargeIconBackground(contentView);
-                }
+                color = resolveContrastColor(p);
             }
+            if (colorable) {
+                contentView.setDrawableTint(R.id.icon, false, color,
+                        PorterDuff.Mode.SRC_ATOP);
+
+            }
+            contentView.setInt(R.id.icon, "setOriginalIconColor",
+                    colorable ? color : NotificationHeaderView.NO_COLOR);
         }
 
         /**
-         * Apply any necessary background to a largeIcon if it's a fake smallIcon (that is,
+         * Make the largeIcon dark if it's a fake smallIcon (that is,
          * if it's grayscale).
          */
         // TODO: also check bounds, transparency, that sort of thing.
-        private void processLargeLegacyIcon(Icon largeIcon, RemoteViews contentView) {
+        private void processLargeLegacyIcon(Icon largeIcon, RemoteViews contentView,
+                StandardTemplateParams p) {
             if (largeIcon != null && isLegacy()
-                    && mColorUtil.isGrayscaleIcon(mContext, largeIcon)) {
-                applyLargeIconBackground(contentView);
+                    && getColorUtil().isGrayscaleIcon(mContext, largeIcon)) {
+                // resolve color will fall back to the default when legacy
+                contentView.setDrawableTint(R.id.icon, false, resolveContrastColor(p),
+                        PorterDuff.Mode.SRC_ATOP);
+            }
+        }
+
+        private void sanitizeColor() {
+            if (mN.color != COLOR_DEFAULT) {
+                mN.color |= 0xFF000000; // no alpha for custom colors
+            }
+        }
+
+        int resolveContrastColor(StandardTemplateParams p) {
+            int rawColor = getRawColor(p);
+            if (mCachedContrastColorIsFor == rawColor && mCachedContrastColor != COLOR_INVALID) {
+                return mCachedContrastColor;
+            }
+
+            int color;
+            int background = mContext.getColor(
+                    com.android.internal.R.color.notification_material_background_color);
+            if (rawColor == COLOR_DEFAULT) {
+                ensureColors(p);
+                color = ContrastColorUtil.resolveDefaultColor(mContext, background, mInNightMode);
             } else {
-                removeLargeIconBackground(contentView);
+                color = ContrastColorUtil.resolveContrastColor(mContext, rawColor,
+                        background, mInNightMode);
             }
+            if (Color.alpha(color) < 255) {
+                // alpha doesn't go well for color filters, so let's blend it manually
+                color = ContrastColorUtil.compositeColors(color, background);
+            }
+            mCachedContrastColorIsFor = rawColor;
+            return mCachedContrastColor = color;
         }
 
         /**
-         * Add a colored circle behind the largeIcon slot.
+         * Return the raw color of this Notification, which doesn't necessarily satisfy contrast.
+         *
+         * @see #resolveContrastColor(StandardTemplateParams) for the contrasted color
+         * @param p the template params to inflate this with
          */
-        private void applyLargeIconBackground(RemoteViews contentView) {
-            contentView.setInt(R.id.icon, "setBackgroundResource",
-                    R.drawable.notification_icon_legacy_bg);
-
-            contentView.setDrawableParameters(
-                    R.id.icon,
-                    true,
-                    -1,
-                    resolveColor(),
-                    PorterDuff.Mode.SRC_ATOP,
-                    -1);
-
-            int padding = mContext.getResources().getDimensionPixelSize(
-                    R.dimen.notification_large_icon_circle_padding);
-            contentView.setViewPadding(R.id.icon, padding, padding, padding, padding);
+        private int getRawColor(StandardTemplateParams p) {
+            if (p.forceDefaultColor) {
+                return COLOR_DEFAULT;
+            }
+            return mN.color;
         }
 
-        private void removeLargeIconBackground(RemoteViews contentView) {
-            contentView.setInt(R.id.icon, "setBackgroundResource", 0);
-        }
-
-        /**
-         * Recolor small icons when used in the R.id.right_icon slot.
-         */
-        private void processSmallRightIcon(Icon smallIcon, RemoteViews contentView) {
-            if (!isLegacy()) {
-                contentView.setDrawableParameters(R.id.right_icon, false, -1,
-                        0xFFFFFFFF,
-                        PorterDuff.Mode.SRC_ATOP, -1);
+        int resolveNeutralColor() {
+            if (mNeutralColor != COLOR_INVALID) {
+                return mNeutralColor;
             }
-            final boolean gray = isLegacy()
-                    && smallIcon.getType() == Icon.TYPE_RESOURCE
-                    && mColorUtil.isGrayscaleIcon(mContext, smallIcon.getResId());
-            if (!isLegacy() || gray) {
-                contentView.setInt(R.id.right_icon,
-                        "setBackgroundResource",
-                        R.drawable.notification_icon_legacy_bg);
-
-                contentView.setDrawableParameters(
-                        R.id.right_icon,
-                        true,
-                        -1,
-                        resolveColor(),
-                        PorterDuff.Mode.SRC_ATOP,
-                        -1);
+            int background = mContext.getColor(
+                    com.android.internal.R.color.notification_material_background_color);
+            mNeutralColor = ContrastColorUtil.resolveDefaultColor(mContext, background,
+                    mInNightMode);
+            if (Color.alpha(mNeutralColor) < 255) {
+                // alpha doesn't go well for color filters, so let's blend it manually
+                mNeutralColor = ContrastColorUtil.compositeColors(mNeutralColor, background);
             }
-        }
-
-        private int sanitizeColor() {
-            if (mColor != COLOR_DEFAULT) {
-                mColor |= 0xFF000000; // no alpha for custom colors
-            }
-            return mColor;
-        }
-
-        private int resolveColor() {
-            if (mColor == COLOR_DEFAULT) {
-                return mContext.getColor(R.color.notification_icon_bg_color);
-            }
-            return mColor;
+            return mNeutralColor;
         }
 
         /**
          * Apply the unstyled operations and return a new {@link Notification} object.
          * @hide
          */
+        @NonNull
         public Notification buildUnstyled() {
-            Notification n = new Notification();
-            n.when = mWhen;
-            n.mSmallIcon = mSmallIcon;
-            if (mSmallIcon != null && mSmallIcon.getType() == Icon.TYPE_RESOURCE) {
-                n.icon = mSmallIcon.getResId();
-            }
-            n.iconLevel = mSmallIconLevel;
-            n.number = mNumber;
-
-            n.color = sanitizeColor();
-
-            setBuilderContentView(n, makeContentView());
-            n.contentIntent = mContentIntent;
-            n.deleteIntent = mDeleteIntent;
-            n.fullScreenIntent = mFullScreenIntent;
-            n.tickerText = mTickerText;
-            n.tickerView = makeTickerView();
-            n.mLargeIcon = mLargeIcon;
-            if (mLargeIcon != null && mLargeIcon.getType() == Icon.TYPE_BITMAP) {
-                n.largeIcon = mLargeIcon.getBitmap();
-            }
-            n.sound = mSound;
-            n.audioStreamType = mAudioStreamType;
-            n.audioAttributes = mAudioAttributes;
-            n.vibrate = mVibrate;
-            n.ledARGB = mLedArgb;
-            n.ledOnMS = mLedOnMs;
-            n.ledOffMS = mLedOffMs;
-            n.defaults = mDefaults;
-            n.flags = mFlags;
-            setBuilderBigContentView(n, makeBigContentView());
-            setBuilderHeadsUpContentView(n, makeHeadsUpContentView());
-            if (mLedOnMs != 0 || mLedOffMs != 0) {
-                n.flags |= FLAG_SHOW_LIGHTS;
-            }
-            if ((mDefaults & DEFAULT_LIGHTS) != 0) {
-                n.flags |= FLAG_SHOW_LIGHTS;
-            }
-            n.category = mCategory;
-            n.mGroupKey = mGroupKey;
-            n.mSortKey = mSortKey;
-            n.priority = mPriority;
             if (mActions.size() > 0) {
-                n.actions = new Action[mActions.size()];
-                mActions.toArray(n.actions);
+                mN.actions = new Action[mActions.size()];
+                mActions.toArray(mN.actions);
             }
-            n.visibility = mVisibility;
-
-            if (mPublicVersion != null) {
-                n.publicVersion = new Notification();
-                mPublicVersion.cloneInto(n.publicVersion, true);
+            if (!mPersonList.isEmpty()) {
+                mN.extras.putParcelableArrayList(EXTRA_PEOPLE_LIST, mPersonList);
             }
-            // Note: If you're adding new fields, also update restoreFromNotitification().
-            return n;
+            if (mN.bigContentView != null || mN.contentView != null
+                    || mN.headsUpContentView != null) {
+                mN.extras.putBoolean(EXTRA_CONTAINS_CUSTOM_VIEW, true);
+            }
+            return mN;
         }
 
         /**
-         * Capture, in the provided bundle, semantic information used in the construction of
-         * this Notification object.
-         * @hide
+         * Creates a Builder from an existing notification so further changes can be made.
+         * @param context The context for your application / activity.
+         * @param n The notification to create a Builder from.
          */
-        public void populateExtras(Bundle extras) {
-            // Store original information used in the construction of this object
-            extras.putInt(EXTRA_ORIGINATING_USERID, mOriginatingUserId);
-            extras.putParcelable(EXTRA_REBUILD_CONTEXT_APPLICATION_INFO,
-                    mContext.getApplicationInfo());
-            extras.putCharSequence(EXTRA_TITLE, mContentTitle);
-            extras.putCharSequence(EXTRA_TEXT, mContentText);
-            extras.putCharSequence(EXTRA_SUB_TEXT, mSubText);
-            extras.putCharSequence(EXTRA_INFO_TEXT, mContentInfo);
-            extras.putParcelable(EXTRA_SMALL_ICON, mSmallIcon);
-            extras.putInt(EXTRA_PROGRESS, mProgress);
-            extras.putInt(EXTRA_PROGRESS_MAX, mProgressMax);
-            extras.putBoolean(EXTRA_PROGRESS_INDETERMINATE, mProgressIndeterminate);
-            extras.putBoolean(EXTRA_SHOW_CHRONOMETER, mUseChronometer);
-            extras.putBoolean(EXTRA_SHOW_WHEN, mShowWhen);
-            if (mLargeIcon != null) {
-                extras.putParcelable(EXTRA_LARGE_ICON, mLargeIcon);
-            }
-            if (!mPeople.isEmpty()) {
-                extras.putStringArray(EXTRA_PEOPLE, mPeople.toArray(new String[mPeople.size()]));
-            }
-            // NOTE: If you're adding new extras also update restoreFromNotification().
-        }
-
-
-        /**
-         * @hide
-         */
-        public static void stripForDelivery(Notification n) {
-            if (!STRIP_AND_REBUILD) {
-                return;
-            }
-
-            String templateClass = n.extras.getString(EXTRA_TEMPLATE);
-            // Only strip views for known Styles because we won't know how to
-            // re-create them otherwise.
-            boolean stripViews = TextUtils.isEmpty(templateClass) ||
-                    getNotificationStyleClass(templateClass) != null;
-
-            boolean isStripped = false;
-
-            if (n.largeIcon != null && n.extras.containsKey(EXTRA_LARGE_ICON)) {
-                // TODO: Would like to check for equality here, but if the notification
-                // has been cloned, we can't.
-                n.largeIcon = null;
-                n.extras.putBoolean(EXTRA_REBUILD_LARGE_ICON, true);
-                isStripped = true;
-            }
-            // Get rid of unmodified BuilderRemoteViews.
-
-            if (stripViews &&
-                    n.contentView instanceof BuilderRemoteViews &&
-                    n.extras.getInt(EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT, -1) ==
-                            n.contentView.getSequenceNumber()) {
-                n.contentView = null;
-                n.extras.putBoolean(EXTRA_REBUILD_CONTENT_VIEW, true);
-                n.extras.remove(EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT);
-                isStripped = true;
-            }
-            if (stripViews &&
-                    n.bigContentView instanceof BuilderRemoteViews &&
-                    n.extras.getInt(EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT, -1) ==
-                            n.bigContentView.getSequenceNumber()) {
-                n.bigContentView = null;
-                n.extras.putBoolean(EXTRA_REBUILD_BIG_CONTENT_VIEW, true);
-                n.extras.remove(EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT);
-                isStripped = true;
-            }
-            if (stripViews &&
-                    n.headsUpContentView instanceof BuilderRemoteViews &&
-                    n.extras.getInt(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT, -1) ==
-                            n.headsUpContentView.getSequenceNumber()) {
-                n.headsUpContentView = null;
-                n.extras.putBoolean(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW, true);
-                n.extras.remove(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT);
-                isStripped = true;
-            }
-
-            if (isStripped) {
-                n.extras.putBoolean(EXTRA_NEEDS_REBUILD, true);
-            }
-        }
-
-        /**
-         * @hide
-         */
-        public static Notification rebuild(Context context, Notification n) {
-            Bundle extras = n.extras;
-            if (!extras.getBoolean(EXTRA_NEEDS_REBUILD)) return n;
-            extras.remove(EXTRA_NEEDS_REBUILD);
-
+        @NonNull
+        public static Notification.Builder recoverBuilder(Context context, Notification n) {
             // Re-create notification context so we can access app resources.
-            ApplicationInfo applicationInfo = extras.getParcelable(
-                    EXTRA_REBUILD_CONTEXT_APPLICATION_INFO);
+            ApplicationInfo applicationInfo = n.extras.getParcelable(
+                    EXTRA_BUILDER_APPLICATION_INFO);
             Context builderContext;
-            try {
-                builderContext = context.createApplicationContext(applicationInfo,
-                        Context.CONTEXT_RESTRICTED);
-            } catch (NameNotFoundException e) {
-                Log.e(TAG, "ApplicationInfo " + applicationInfo + " not found");
-                builderContext = context;  // try with our context
+            if (applicationInfo != null) {
+                try {
+                    builderContext = context.createApplicationContext(applicationInfo,
+                            Context.CONTEXT_RESTRICTED);
+                } catch (NameNotFoundException e) {
+                    Log.e(TAG, "ApplicationInfo " + applicationInfo + " not found");
+                    builderContext = context;  // try with our context
+                }
+            } else {
+                builderContext = context; // try with given context
             }
 
-            Builder b = new Builder(builderContext, n);
-            return b.rebuild();
+            return new Builder(builderContext, n);
         }
 
         /**
-         * Rebuilds the notification passed in to the rebuild-constructor
-         * {@link #Builder(Context, Notification)}.
-         *
-         * <p>
-         * Throws IllegalStateException when invoked on a Builder that isn't in rebuild mode.
-         *
-         * @hide
+         * Determines whether the platform can generate contextual actions for a notification.
+         * By default this is true.
          */
-        private Notification rebuild() {
-            if (mRebuildNotification == null) {
-                throw new IllegalStateException("rebuild() only valid when in 'rebuild' mode.");
-            }
-            mHasThreeLines = hasThreeLines();
-
-            Bundle extras = mRebuildNotification.extras;
-
-            if (extras.getBoolean(EXTRA_REBUILD_LARGE_ICON)) {
-                mRebuildNotification.largeIcon = extras.getParcelable(EXTRA_LARGE_ICON);
-            }
-            extras.remove(EXTRA_REBUILD_LARGE_ICON);
-
-            if (extras.getBoolean(EXTRA_REBUILD_CONTENT_VIEW)) {
-                setBuilderContentView(mRebuildNotification, makeContentView());
-                if (mStyle != null) {
-                    mStyle.populateContentView(mRebuildNotification);
-                }
-            }
-            extras.remove(EXTRA_REBUILD_CONTENT_VIEW);
-
-            if (extras.getBoolean(EXTRA_REBUILD_BIG_CONTENT_VIEW)) {
-                setBuilderBigContentView(mRebuildNotification, makeBigContentView());
-                if (mStyle != null) {
-                    mStyle.populateBigContentView(mRebuildNotification);
-                }
-            }
-            extras.remove(EXTRA_REBUILD_BIG_CONTENT_VIEW);
-
-            if (extras.getBoolean(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW)) {
-                setBuilderHeadsUpContentView(mRebuildNotification, makeHeadsUpContentView());
-                if (mStyle != null) {
-                    mStyle.populateHeadsUpContentView(mRebuildNotification);
-                }
-            }
-            extras.remove(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW);
-
-            mHasThreeLines = false;
-            return mRebuildNotification;
-        }
-
-        private static Class<? extends Style> getNotificationStyleClass(String templateClass) {
-            Class<? extends Style>[] classes = new Class[]{
-                    BigTextStyle.class, BigPictureStyle.class, InboxStyle.class, MediaStyle.class};
-            for (Class<? extends Style> innerClass : classes) {
-                if (templateClass.equals(innerClass.getName())) {
-                    return innerClass;
-                }
-            }
-            return null;
-        }
-
-        private void setBuilderContentView(Notification n, RemoteViews contentView) {
-            n.contentView = contentView;
-            if (contentView instanceof BuilderRemoteViews) {
-                mRebuildBundle.putInt(Builder.EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT,
-                        contentView.getSequenceNumber());
-            }
-        }
-
-        private void setBuilderBigContentView(Notification n, RemoteViews bigContentView) {
-            n.bigContentView = bigContentView;
-            if (bigContentView instanceof BuilderRemoteViews) {
-                mRebuildBundle.putInt(Builder.EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT,
-                        bigContentView.getSequenceNumber());
-            }
-        }
-
-        private void setBuilderHeadsUpContentView(Notification n,
-                RemoteViews headsUpContentView) {
-            n.headsUpContentView = headsUpContentView;
-            if (headsUpContentView instanceof BuilderRemoteViews) {
-                mRebuildBundle.putInt(Builder.EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT,
-                        headsUpContentView.getSequenceNumber());
-            }
-        }
-
-        private void restoreFromNotification(Notification n) {
-
-            // Notification fields.
-            mWhen = n.when;
-            mSmallIcon = n.mSmallIcon;
-            mSmallIconLevel = n.iconLevel;
-            mNumber = n.number;
-
-            mColor = n.color;
-
-            mContentView = n.contentView;
-            mDeleteIntent = n.deleteIntent;
-            mFullScreenIntent = n.fullScreenIntent;
-            mTickerText = n.tickerText;
-            mTickerView = n.tickerView;
-            mLargeIcon = n.mLargeIcon;
-            mSound = n.sound;
-            mAudioStreamType = n.audioStreamType;
-            mAudioAttributes = n.audioAttributes;
-
-            mVibrate = n.vibrate;
-            mLedArgb = n.ledARGB;
-            mLedOnMs = n.ledOnMS;
-            mLedOffMs = n.ledOffMS;
-            mDefaults = n.defaults;
-            mFlags = n.flags;
-
-            mCategory = n.category;
-            mGroupKey = n.mGroupKey;
-            mSortKey = n.mSortKey;
-            mPriority = n.priority;
-            mActions.clear();
-            if (n.actions != null) {
-                Collections.addAll(mActions, n.actions);
-            }
-            mVisibility = n.visibility;
-
-            mPublicVersion = n.publicVersion;
-
-            // Extras.
-            Bundle extras = n.extras;
-            mOriginatingUserId = extras.getInt(EXTRA_ORIGINATING_USERID);
-            mContentTitle = extras.getCharSequence(EXTRA_TITLE);
-            mContentText = extras.getCharSequence(EXTRA_TEXT);
-            mSubText = extras.getCharSequence(EXTRA_SUB_TEXT);
-            mContentInfo = extras.getCharSequence(EXTRA_INFO_TEXT);
-            mProgress = extras.getInt(EXTRA_PROGRESS);
-            mProgressMax = extras.getInt(EXTRA_PROGRESS_MAX);
-            mProgressIndeterminate = extras.getBoolean(EXTRA_PROGRESS_INDETERMINATE);
-            mUseChronometer = extras.getBoolean(EXTRA_SHOW_CHRONOMETER);
-            mShowWhen = extras.getBoolean(EXTRA_SHOW_WHEN);
-            if (extras.containsKey(EXTRA_LARGE_ICON)) {
-                mLargeIcon = extras.getParcelable(EXTRA_LARGE_ICON);
-            }
-            if (extras.containsKey(EXTRA_PEOPLE)) {
-                mPeople.clear();
-                Collections.addAll(mPeople, extras.getStringArray(EXTRA_PEOPLE));
-            }
+        @NonNull
+        public Builder setAllowSystemGeneratedContextualActions(boolean allowed) {
+            mN.mAllowSystemGeneratedContextualActions = allowed;
+            return this;
         }
 
         /**
@@ -3650,40 +5988,78 @@ public class Notification implements Parcelable
         /**
          * Combine all of the options that have been set and return a new {@link Notification}
          * object.
+         *
+         * If this notification has {@link BubbleMetadata} attached that was created with
+         * a shortcutId a check will be performed to ensure the shortcutId supplied to bubble
+         * metadata matches the shortcutId set on the  notification builder, if one was set.
+         * If the shortcutId's were specified but do not match, an exception is thrown here.
+         *
+         * @see BubbleMetadata.Builder#Builder(String)
+         * @see #setShortcutId(String)
          */
+        @NonNull
         public Notification build() {
-            if (mSmallIcon != null) {
-                mSmallIcon.convertToAshmem();
+            // Check shortcut id matches
+            if (mN.mShortcutId != null
+                    && mN.mBubbleMetadata != null
+                    && mN.mBubbleMetadata.getShortcutId() != null
+                    && !mN.mShortcutId.equals(mN.mBubbleMetadata.getShortcutId())) {
+                throw new IllegalArgumentException(
+                        "Notification and BubbleMetadata shortcut id's don't match,"
+                                + " notification: " + mN.mShortcutId
+                                + " vs bubble: " + mN.mBubbleMetadata.getShortcutId());
             }
-            if (mLargeIcon != null) {
-                mLargeIcon.convertToAshmem();
-            }
-            mOriginatingUserId = mContext.getUserId();
-            mHasThreeLines = hasThreeLines();
 
-            Notification n = buildUnstyled();
+            // first, add any extras from the calling code
+            if (mUserExtras != null) {
+                mN.extras = getAllExtras();
+            }
+
+            mN.creationTime = System.currentTimeMillis();
+
+            // lazy stuff from mContext; see comment in Builder(Context, Notification)
+            Notification.addFieldsFromContext(mContext, mN);
+
+            buildUnstyled();
 
             if (mStyle != null) {
+                mStyle.reduceImageSizes(mContext);
                 mStyle.purgeResources();
-                n = mStyle.buildStyled(n);
+                mStyle.validate(mContext);
+                mStyle.buildStyled(mN);
+            }
+            mN.reduceImageSizes(mContext);
+
+            if (mContext.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N
+                    && (useExistingRemoteView())) {
+                if (mN.contentView == null) {
+                    mN.contentView = createContentView();
+                    mN.extras.putInt(EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT,
+                            mN.contentView.getSequenceNumber());
+                }
+                if (mN.bigContentView == null) {
+                    mN.bigContentView = createBigContentView();
+                    if (mN.bigContentView != null) {
+                        mN.extras.putInt(EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT,
+                                mN.bigContentView.getSequenceNumber());
+                    }
+                }
+                if (mN.headsUpContentView == null) {
+                    mN.headsUpContentView = createHeadsUpContentView();
+                    if (mN.headsUpContentView != null) {
+                        mN.extras.putInt(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT,
+                                mN.headsUpContentView.getSequenceNumber());
+                    }
+                }
             }
 
-            if (mExtras != null) {
-                n.extras.putAll(mExtras);
+            if ((mN.defaults & DEFAULT_LIGHTS) != 0) {
+                mN.flags |= FLAG_SHOW_LIGHTS;
             }
 
-            if (mRebuildBundle.size() > 0) {
-                n.extras.putAll(mRebuildBundle);
-                mRebuildBundle.clear();
-            }
+            mN.allPendingIntents = null;
 
-            populateExtras(n.extras);
-            if (mStyle != null) {
-                mStyle.addExtras(n.extras);
-            }
-
-            mHasThreeLines = false;
-            return n;
+            return mN;
         }
 
         /**
@@ -3691,11 +6067,63 @@ public class Notification implements Parcelable
          *
          * @hide
          */
-        public Notification buildInto(Notification n) {
+        @NonNull
+        public Notification buildInto(@NonNull Notification n) {
             build().cloneInto(n, true);
             return n;
         }
 
+        /**
+         * Removes RemoteViews that were created for compatibility from {@param n}, if they did not
+         * change.
+         *
+         * @return {@param n}, if no stripping is needed, otherwise a stripped clone of {@param n}.
+         *
+         * @hide
+         */
+        public static Notification maybeCloneStrippedForDelivery(Notification n) {
+            String templateClass = n.extras.getString(EXTRA_TEMPLATE);
+
+            // Only strip views for known Styles because we won't know how to
+            // re-create them otherwise.
+            if (!TextUtils.isEmpty(templateClass)
+                    && getNotificationStyleClass(templateClass) == null) {
+                return n;
+            }
+
+            // Only strip unmodified BuilderRemoteViews.
+            boolean stripContentView = n.contentView instanceof BuilderRemoteViews &&
+                    n.extras.getInt(EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT, -1) ==
+                            n.contentView.getSequenceNumber();
+            boolean stripBigContentView = n.bigContentView instanceof BuilderRemoteViews &&
+                    n.extras.getInt(EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT, -1) ==
+                            n.bigContentView.getSequenceNumber();
+            boolean stripHeadsUpContentView = n.headsUpContentView instanceof BuilderRemoteViews &&
+                    n.extras.getInt(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT, -1) ==
+                            n.headsUpContentView.getSequenceNumber();
+
+            // Nothing to do here, no need to clone.
+            if (!stripContentView && !stripBigContentView && !stripHeadsUpContentView) {
+                return n;
+            }
+
+            Notification clone = n.clone();
+            if (stripContentView) {
+                clone.contentView = null;
+                clone.extras.remove(EXTRA_REBUILD_CONTENT_VIEW_ACTION_COUNT);
+            }
+            if (stripBigContentView) {
+                clone.bigContentView = null;
+                clone.extras.remove(EXTRA_REBUILD_BIG_CONTENT_VIEW_ACTION_COUNT);
+            }
+            if (stripHeadsUpContentView) {
+                clone.headsUpContentView = null;
+                clone.extras.remove(EXTRA_REBUILD_HEADS_UP_CONTENT_VIEW_ACTION_COUNT);
+            }
+            return clone;
+        }
+
+        @UnsupportedAppUsage
         private int getBaseLayoutResource() {
             return R.layout.notification_template_material_base;
         }
@@ -3716,13 +6144,313 @@ public class Notification implements Parcelable
             return R.layout.notification_template_material_inbox;
         }
 
+        private int getMessagingLayoutResource() {
+            return R.layout.notification_template_material_messaging;
+        }
+
+        private int getConversationLayoutResource() {
+            return R.layout.notification_template_material_conversation;
+        }
+
         private int getActionLayoutResource() {
             return R.layout.notification_material_action;
+        }
+
+        private int getEmphasizedActionLayoutResource() {
+            return R.layout.notification_material_action_emphasized;
         }
 
         private int getActionTombstoneLayoutResource() {
             return R.layout.notification_material_action_tombstone;
         }
+
+        private int getBackgroundColor(StandardTemplateParams p) {
+            if (isColorized(p)) {
+                return mBackgroundColor != COLOR_INVALID ? mBackgroundColor : getRawColor(p);
+            } else {
+                return COLOR_DEFAULT;
+            }
+        }
+
+        /**
+         * Gets a neutral color that can be used for icons or similar that should not stand out.
+         * @param p the template params to inflate this with
+         */
+        private int getNeutralColor(StandardTemplateParams p) {
+            if (isColorized(p)) {
+                return getSecondaryTextColor(p);
+            } else {
+                return resolveNeutralColor();
+            }
+        }
+
+        /**
+         * Same as getBackgroundColor but also resolved the default color to the background.
+         * @param p the template params to inflate this with
+         */
+        private int resolveBackgroundColor(StandardTemplateParams p) {
+            int backgroundColor = getBackgroundColor(p);
+            if (backgroundColor == COLOR_DEFAULT) {
+                backgroundColor = mContext.getColor(
+                        com.android.internal.R.color.notification_material_background_color);
+            }
+            return backgroundColor;
+        }
+
+        private boolean shouldTintActionButtons() {
+            return mTintActionButtons;
+        }
+
+        private boolean textColorsNeedInversion() {
+            if (mStyle == null || !MediaStyle.class.equals(mStyle.getClass())) {
+                return false;
+            }
+            int targetSdkVersion = mContext.getApplicationInfo().targetSdkVersion;
+            return targetSdkVersion > Build.VERSION_CODES.M
+                    && targetSdkVersion < Build.VERSION_CODES.O;
+        }
+
+        /**
+         * Set a color palette to be used as the background and textColors
+         *
+         * @param backgroundColor the color to be used as the background
+         * @param foregroundColor the color to be used as the foreground
+         *
+         * @hide
+         */
+        public void setColorPalette(int backgroundColor, int foregroundColor) {
+            mBackgroundColor = backgroundColor;
+            mForegroundColor = foregroundColor;
+            mTextColorsAreForBackground = COLOR_INVALID;
+            ensureColors(mParams.reset().fillTextsFrom(this));
+        }
+
+        /**
+         * Forces all styled remoteViews to be built from scratch and not use any cached
+         * RemoteViews.
+         * This is needed for legacy apps that are baking in their remoteviews into the
+         * notification.
+         *
+         * @hide
+         */
+        public void setRebuildStyledRemoteViews(boolean rebuild) {
+            mRebuildStyledRemoteViews = rebuild;
+        }
+
+        /**
+         * Get the text that should be displayed in the statusBar when heads upped. This is
+         * usually just the app name, but may be different depending on the style.
+         *
+         * @param publicMode If true, return a text that is safe to display in public.
+         *
+         * @hide
+         */
+        public CharSequence getHeadsUpStatusBarText(boolean publicMode) {
+            if (mStyle != null && !publicMode) {
+                CharSequence text = mStyle.getHeadsUpStatusBarText();
+                if (!TextUtils.isEmpty(text)) {
+                    return text;
+                }
+            }
+            return loadHeaderAppName();
+        }
+
+        /**
+         * @return if this builder uses a template
+         *
+         * @hide
+         */
+        public boolean usesTemplate() {
+            return (mN.contentView == null && mN.headsUpContentView == null
+                    && mN.bigContentView == null)
+                    || (mStyle != null && mStyle.displayCustomViewInline());
+        }
+    }
+
+    /**
+     * Reduces the image sizes to conform to a maximum allowed size. This also processes all custom
+     * remote views.
+     *
+     * @hide
+     */
+    void reduceImageSizes(Context context) {
+        if (extras.getBoolean(EXTRA_REDUCED_IMAGES)) {
+            return;
+        }
+        boolean isLowRam = ActivityManager.isLowRamDeviceStatic();
+        if (mLargeIcon != null || largeIcon != null) {
+            Resources resources = context.getResources();
+            Class<? extends Style> style = getNotificationStyle();
+            int maxWidth = resources.getDimensionPixelSize(isLowRam
+                    ? R.dimen.notification_right_icon_size_low_ram
+                    : R.dimen.notification_right_icon_size);
+            int maxHeight = maxWidth;
+            if (MediaStyle.class.equals(style)
+                    || DecoratedMediaCustomViewStyle.class.equals(style)) {
+                maxHeight = resources.getDimensionPixelSize(isLowRam
+                        ? R.dimen.notification_media_image_max_height_low_ram
+                        : R.dimen.notification_media_image_max_height);
+                maxWidth = resources.getDimensionPixelSize(isLowRam
+                        ? R.dimen.notification_media_image_max_width_low_ram
+                        : R.dimen.notification_media_image_max_width);
+            }
+            if (mLargeIcon != null) {
+                mLargeIcon.scaleDownIfNecessary(maxWidth, maxHeight);
+            }
+            if (largeIcon != null) {
+                largeIcon = Icon.scaleDownIfNecessary(largeIcon, maxWidth, maxHeight);
+            }
+        }
+        reduceImageSizesForRemoteView(contentView, context, isLowRam);
+        reduceImageSizesForRemoteView(headsUpContentView, context, isLowRam);
+        reduceImageSizesForRemoteView(bigContentView, context, isLowRam);
+        extras.putBoolean(EXTRA_REDUCED_IMAGES, true);
+    }
+
+    private void reduceImageSizesForRemoteView(RemoteViews remoteView, Context context,
+            boolean isLowRam) {
+        if (remoteView != null) {
+            Resources resources = context.getResources();
+            int maxWidth = resources.getDimensionPixelSize(isLowRam
+                    ? R.dimen.notification_custom_view_max_image_width_low_ram
+                    : R.dimen.notification_custom_view_max_image_width);
+            int maxHeight = resources.getDimensionPixelSize(isLowRam
+                    ? R.dimen.notification_custom_view_max_image_height_low_ram
+                    : R.dimen.notification_custom_view_max_image_height);
+            remoteView.reduceImageSizes(maxWidth, maxHeight);
+        }
+    }
+
+    /**
+     * @return whether this notification is a foreground service notification
+     * @hide
+     */
+    public boolean isForegroundService() {
+        return (flags & Notification.FLAG_FOREGROUND_SERVICE) != 0;
+    }
+
+    /**
+     * @return whether this notification has a media session attached
+     * @hide
+     */
+    public boolean hasMediaSession() {
+        return extras.getParcelable(Notification.EXTRA_MEDIA_SESSION) != null;
+    }
+
+    /**
+     * @return the style class of this notification
+     * @hide
+     */
+    public Class<? extends Notification.Style> getNotificationStyle() {
+        String templateClass = extras.getString(Notification.EXTRA_TEMPLATE);
+
+        if (!TextUtils.isEmpty(templateClass)) {
+            return Notification.getNotificationStyleClass(templateClass);
+        }
+        return null;
+    }
+
+    /**
+     * @return true if this notification is colorized.
+     *
+     * @hide
+     */
+    public boolean isColorized() {
+        if (isColorizedMedia()) {
+            return true;
+        }
+        return extras.getBoolean(EXTRA_COLORIZED)
+                && (hasColorizedPermission() || isForegroundService());
+    }
+
+    /**
+     * Returns whether an app can colorize due to the android.permission.USE_COLORIZED_NOTIFICATIONS
+     * permission. The permission is checked when a notification is enqueued.
+     */
+    private boolean hasColorizedPermission() {
+        return (flags & Notification.FLAG_CAN_COLORIZE) != 0;
+    }
+
+    /**
+     * @return true if this notification is colorized and it is a media notification
+     *
+     * @hide
+     */
+    public boolean isColorizedMedia() {
+        Class<? extends Style> style = getNotificationStyle();
+        if (MediaStyle.class.equals(style)) {
+            Boolean colorized = (Boolean) extras.get(EXTRA_COLORIZED);
+            if ((colorized == null || colorized) && hasMediaSession()) {
+                return true;
+            }
+        } else if (DecoratedMediaCustomViewStyle.class.equals(style)) {
+            if (extras.getBoolean(EXTRA_COLORIZED) && hasMediaSession()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * @return true if this is a media notification
+     *
+     * @hide
+     */
+    public boolean isMediaNotification() {
+        Class<? extends Style> style = getNotificationStyle();
+        if (MediaStyle.class.equals(style)) {
+            return true;
+        } else if (DecoratedMediaCustomViewStyle.class.equals(style)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @return true if this notification is showing as a bubble
+     *
+     * @hide
+     */
+    public boolean isBubbleNotification() {
+        return (flags & Notification.FLAG_BUBBLE) != 0;
+    }
+
+    private boolean hasLargeIcon() {
+        return mLargeIcon != null || largeIcon != null;
+    }
+
+    /**
+     * @return true if the notification will show the time; false otherwise
+     * @hide
+     */
+    public boolean showsTime() {
+        return when != 0 && extras.getBoolean(EXTRA_SHOW_WHEN);
+    }
+
+    /**
+     * @return true if the notification will show a chronometer; false otherwise
+     * @hide
+     */
+    public boolean showsChronometer() {
+        return when != 0 && extras.getBoolean(EXTRA_SHOW_CHRONOMETER);
+    }
+
+    /**
+     * @removed
+     */
+    @SystemApi
+    public static Class<? extends Style> getNotificationStyleClass(String templateClass) {
+        Class<? extends Style>[] classes = new Class[] {
+                BigTextStyle.class, BigPictureStyle.class, InboxStyle.class, MediaStyle.class,
+                DecoratedCustomViewStyle.class, DecoratedMediaCustomViewStyle.class,
+                MessagingStyle.class };
+        for (Class<? extends Style> innerClass : classes) {
+            if (templateClass.equals(innerClass.getName())) {
+                return innerClass;
+            }
+        }
+        return null;
     }
 
     /**
@@ -3730,6 +6458,12 @@ public class Notification implements Parcelable
      * object.
      */
     public static abstract class Style {
+
+        /**
+         * The number of items allowed simulatanously in the remote input history.
+         * @hide
+         */
+        static final int MAX_REMOTE_INPUT_HISTORY_LINES = 3;
         private CharSequence mBigContentTitle;
 
         /**
@@ -3776,17 +6510,30 @@ public class Notification implements Parcelable
         }
 
         protected RemoteViews getStandardView(int layoutId) {
+            StandardTemplateParams p = mBuilder.mParams.reset().fillTextsFrom(mBuilder);
+            return getStandardView(layoutId, p, null);
+        }
+
+
+        /**
+         * Get the standard view for this style.
+         *
+         * @param layoutId The layout id to use.
+         * @param p the params for this inflation.
+         * @param result The result where template bind information is saved.
+         * @return A remoteView for this style.
+         * @hide
+         */
+        protected RemoteViews getStandardView(int layoutId, StandardTemplateParams p,
+                TemplateBindResult result) {
             checkBuilder();
 
-            // Nasty.
-            CharSequence oldBuilderContentTitle = mBuilder.mContentTitle;
             if (mBigContentTitle != null) {
-                mBuilder.setContentTitle(mBigContentTitle);
+                p.title = mBigContentTitle;
             }
 
-            RemoteViews contentView = mBuilder.applyStandardTemplateWithActions(layoutId);
-
-            mBuilder.mContentTitle = oldBuilderContentTitle;
+            RemoteViews contentView = mBuilder.applyStandardTemplateWithActions(layoutId, p,
+                    result);
 
             if (mBigContentTitle != null && mBigContentTitle.equals("")) {
                 contentView.setViewVisibility(R.id.line1, View.GONE);
@@ -3794,38 +6541,40 @@ public class Notification implements Parcelable
                 contentView.setViewVisibility(R.id.line1, View.VISIBLE);
             }
 
-            // The last line defaults to the subtext, but can be replaced by mSummaryText
-            final CharSequence overflowText =
-                    mSummaryTextSet ? mSummaryText
-                                    : mBuilder.mSubText;
-            if (overflowText != null) {
-                contentView.setTextViewText(R.id.text, mBuilder.processLegacyText(overflowText));
-                contentView.setViewVisibility(R.id.overflow_divider, View.VISIBLE);
-                contentView.setViewVisibility(R.id.line3, View.VISIBLE);
-            } else {
-                // Clear text in case we use the line to show the profile badge.
-                contentView.setTextViewText(R.id.text, "");
-                contentView.setViewVisibility(R.id.overflow_divider, View.GONE);
-                contentView.setViewVisibility(R.id.line3, View.GONE);
-            }
-
             return contentView;
         }
 
         /**
-         * Changes the padding of the first line such that the big and small content view have the
-         * same top padding.
+         * Construct a Style-specific RemoteViews for the collapsed notification layout.
+         * The default implementation has nothing additional to add.
          *
+         * @param increasedHeight true if this layout be created with an increased height.
          * @hide
          */
-        protected void applyTopPadding(RemoteViews contentView) {
-            int topPadding = Builder.calculateTopPadding(mBuilder.mContext,
-                    mBuilder.mHasThreeLines,
-                    mBuilder.mContext.getResources().getConfiguration().fontScale);
-            contentView.setViewPadding(R.id.line1, 0, topPadding, 0, 0);
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            return null;
         }
 
         /**
+         * Construct a Style-specific RemoteViews for the final big notification layout.
+         * @hide
+         */
+        public RemoteViews makeBigContentView() {
+            return null;
+        }
+
+        /**
+         * Construct a Style-specific RemoteViews for the final HUN layout.
+         *
+         * @param increasedHeight true if this layout be created with an increased height.
+         * @hide
+         */
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            return null;
+        }
+
+        /**
+         * Apply any style-specific extras to this notification before shipping it out.
          * @hide
          */
         public void addExtras(Bundle extras) {
@@ -3839,6 +6588,7 @@ public class Notification implements Parcelable
         }
 
         /**
+         * Reconstruct the internal state of this Style object from extras.
          * @hide
          */
         protected void restoreFromExtras(Bundle extras) {
@@ -3856,10 +6606,7 @@ public class Notification implements Parcelable
          * @hide
          */
         public Notification buildStyled(Notification wip) {
-            populateTickerView(wip);
-            populateContentView(wip);
-            populateBigContentView(wip);
-            populateHeadsUpContentView(wip);
+            addExtras(wip.extras);
             return wip;
         }
 
@@ -3867,26 +6614,6 @@ public class Notification implements Parcelable
          * @hide
          */
         public void purgeResources() {}
-
-        // The following methods are split out so we can re-create notification partially.
-        /**
-         * @hide
-         */
-        protected void populateTickerView(Notification wip) {}
-        /**
-         * @hide
-         */
-        protected void populateContentView(Notification wip) {}
-
-        /**
-         * @hide
-         */
-        protected void populateBigContentView(Notification wip) {}
-
-        /**
-         * @hide
-         */
-        protected void populateHeadsUpContentView(Notification wip) {}
 
         /**
          * Calls {@link android.app.Notification.Builder#build()} on the Builder this Style is
@@ -3906,6 +6633,52 @@ public class Notification implements Parcelable
          */
         protected boolean hasProgress() {
             return true;
+        }
+
+        /**
+         * @hide
+         * @return Whether we should put the summary be put into the notification header
+         */
+        public boolean hasSummaryInHeader() {
+            return true;
+        }
+
+        /**
+         * @hide
+         * @return Whether custom content views are displayed inline in the style
+         */
+        public boolean displayCustomViewInline() {
+            return false;
+        }
+
+        /**
+         * Reduces the image sizes contained in this style.
+         *
+         * @hide
+         */
+        public void reduceImageSizes(Context context) {
+        }
+
+        /**
+         * Validate that this style was properly composed. This is called at build time.
+         * @hide
+         */
+        public void validate(Context context) {
+        }
+
+        /**
+         * @hide
+         */
+        public abstract boolean areNotificationsVisiblyDifferent(Style other);
+
+        /**
+         * @return the text that should be displayed in the statusBar when heads-upped.
+         * If {@code null} is returned, the default implementation will be used.
+         *
+         * @hide
+         */
+        public CharSequence getHeadsUpStatusBarText() {
+            return null;
         }
     }
 
@@ -3934,6 +6707,10 @@ public class Notification implements Parcelable
         public BigPictureStyle() {
         }
 
+        /**
+         * @deprecated use {@code BigPictureStyle()}.
+         */
+        @Deprecated
         public BigPictureStyle(Builder builder) {
             setBuilder(builder);
         }
@@ -3953,6 +6730,13 @@ public class Notification implements Parcelable
         public BigPictureStyle setSummaryText(CharSequence cs) {
             internalSetSummaryText(safeCharSequence(cs));
             return this;
+        }
+
+        /**
+         * @hide
+         */
+        public Bitmap getBigPicture() {
+            return mPicture;
         }
 
         /**
@@ -3998,31 +6782,69 @@ public class Notification implements Parcelable
             }
         }
 
-        private RemoteViews makeBigContentView() {
-            // Replace mLargeIcon with mBigLargeIcon if mBigLargeIconSet
+        /**
+         * @hide
+         */
+        @Override
+        public void reduceImageSizes(Context context) {
+            super.reduceImageSizes(context);
+            Resources resources = context.getResources();
+            boolean isLowRam = ActivityManager.isLowRamDeviceStatic();
+            if (mPicture != null) {
+                int maxPictureWidth = resources.getDimensionPixelSize(isLowRam
+                        ? R.dimen.notification_big_picture_max_height_low_ram
+                        : R.dimen.notification_big_picture_max_height);
+                int maxPictureHeight = resources.getDimensionPixelSize(isLowRam
+                        ? R.dimen.notification_big_picture_max_width_low_ram
+                        : R.dimen.notification_big_picture_max_width);
+                mPicture = Icon.scaleDownIfNecessary(mPicture, maxPictureWidth, maxPictureHeight);
+            }
+            if (mBigLargeIcon != null) {
+                int rightIconSize = resources.getDimensionPixelSize(isLowRam
+                        ? R.dimen.notification_right_icon_size_low_ram
+                        : R.dimen.notification_right_icon_size);
+                mBigLargeIcon.scaleDownIfNecessary(rightIconSize, rightIconSize);
+            }
+        }
+
+        /**
+         * @hide
+         */
+        public RemoteViews makeBigContentView() {
+            // Replace mN.mLargeIcon with mBigLargeIcon if mBigLargeIconSet
             // This covers the following cases:
             //   1. mBigLargeIconSet -> mBigLargeIcon (null or non-null) applies, overrides
-            //          mLargeIcon
-            //   2. !mBigLargeIconSet -> mLargeIcon applies
+            //          mN.mLargeIcon
+            //   2. !mBigLargeIconSet -> mN.mLargeIcon applies
             Icon oldLargeIcon = null;
+            Bitmap largeIconLegacy = null;
             if (mBigLargeIconSet) {
-                oldLargeIcon = mBuilder.mLargeIcon;
-                mBuilder.mLargeIcon = mBigLargeIcon;
+                oldLargeIcon = mBuilder.mN.mLargeIcon;
+                mBuilder.mN.mLargeIcon = mBigLargeIcon;
+                // The legacy largeIcon might not allow us to clear the image, as it's taken in
+                // replacement if the other one is null. Because we're restoring these legacy icons
+                // for old listeners, this is in general non-null.
+                largeIconLegacy = mBuilder.mN.largeIcon;
+                mBuilder.mN.largeIcon = null;
             }
 
-            RemoteViews contentView = getStandardView(mBuilder.getBigPictureLayoutResource());
+            StandardTemplateParams p = mBuilder.mParams.reset().fillTextsFrom(mBuilder);
+            RemoteViews contentView = getStandardView(mBuilder.getBigPictureLayoutResource(),
+                    p, null /* result */);
+            if (mSummaryTextSet) {
+                contentView.setTextViewText(R.id.text, mBuilder.processTextSpans(
+                        mBuilder.processLegacyText(mSummaryText)));
+                mBuilder.setTextViewColorSecondary(contentView, R.id.text, p);
+                contentView.setViewVisibility(R.id.text, View.VISIBLE);
+            }
+            mBuilder.setContentMinHeight(contentView, mBuilder.mN.hasLargeIcon());
 
             if (mBigLargeIconSet) {
-                mBuilder.mLargeIcon = oldLargeIcon;
+                mBuilder.mN.mLargeIcon = oldLargeIcon;
+                mBuilder.mN.largeIcon = largeIconLegacy;
             }
 
             contentView.setImageViewBitmap(R.id.big_picture, mPicture);
-
-            applyTopPadding(contentView);
-
-            boolean twoTextLines = mBuilder.mSubText != null && mBuilder.mContentText != null;
-            mBuilder.addProfileBadge(contentView,
-                    twoTextLines ? R.id.profile_badge_line2 : R.id.profile_badge_line3);
             return contentView;
         }
 
@@ -4056,8 +6878,35 @@ public class Notification implements Parcelable
          * @hide
          */
         @Override
-        public void populateBigContentView(Notification wip) {
-            mBuilder.setBuilderBigContentView(wip, makeBigContentView());
+        public boolean hasSummaryInHeader() {
+            return false;
+        }
+
+        /**
+         * @hide
+         * Note that we aren't actually comparing the contents of the bitmaps here, so this
+         * is only doing a cursory inspection. Bitmaps of equal size will appear the same.
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            BigPictureStyle otherS = (BigPictureStyle) other;
+            return areBitmapsObviouslyDifferent(getBigPicture(), otherS.getBigPicture());
+        }
+
+        private static boolean areBitmapsObviouslyDifferent(Bitmap a, Bitmap b) {
+            if (a == b) {
+                return false;
+            }
+            if (a == null || b == null) {
+                return true;
+            }
+            return a.getWidth() != b.getWidth()
+                    || a.getHeight() != b.getHeight()
+                    || a.getConfig() != b.getConfig()
+                    || a.getGenerationId() != b.getGenerationId();
         }
     }
 
@@ -4080,15 +6929,15 @@ public class Notification implements Parcelable
      */
     public static class BigTextStyle extends Style {
 
-        private static final int MAX_LINES = 13;
-        private static final int LINES_CONSUMED_BY_ACTIONS = 3;
-        private static final int LINES_CONSUMED_BY_SUMMARY = 2;
-
         private CharSequence mBigText;
 
         public BigTextStyle() {
         }
 
+        /**
+         * @deprecated use {@code BigTextStyle()}.
+         */
+        @Deprecated
         public BigTextStyle(Builder builder) {
             setBuilder(builder);
         }
@@ -4122,6 +6971,13 @@ public class Notification implements Parcelable
         /**
          * @hide
          */
+        public CharSequence getBigText() {
+            return mBigText;
+        }
+
+        /**
+         * @hide
+         */
         public void addExtras(Bundle extras) {
             super.addExtras(extras);
 
@@ -4138,54 +6994,1045 @@ public class Notification implements Parcelable
             mBigText = extras.getCharSequence(EXTRA_BIG_TEXT);
         }
 
-        private RemoteViews makeBigContentView() {
-
-            // Nasty
-            CharSequence oldBuilderContentText = mBuilder.mContentText;
-            mBuilder.mContentText = null;
-
-            RemoteViews contentView = getStandardView(mBuilder.getBigTextLayoutResource());
-
-            mBuilder.mContentText = oldBuilderContentText;
-
-            contentView.setTextViewText(R.id.big_text, mBuilder.processLegacyText(mBigText));
-            contentView.setViewVisibility(R.id.big_text, View.VISIBLE);
-            contentView.setInt(R.id.big_text, "setMaxLines", calculateMaxLines());
-            contentView.setViewVisibility(R.id.text2, View.GONE);
-
-            applyTopPadding(contentView);
-
-            mBuilder.shrinkLine3Text(contentView);
-
-            mBuilder.addProfileBadge(contentView, R.id.profile_badge_large_template);
-
-            return contentView;
-        }
-
-        private int calculateMaxLines() {
-            int lineCount = MAX_LINES;
-            boolean hasActions = mBuilder.mActions.size() > 0;
-            boolean hasSummary = (mSummaryTextSet ? mSummaryText : mBuilder.mSubText) != null;
-            if (hasActions) {
-                lineCount -= LINES_CONSUMED_BY_ACTIONS;
+        /**
+         * @param increasedHeight true if this layout be created with an increased height.
+         *
+         * @hide
+         */
+        @Override
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            if (increasedHeight) {
+                mBuilder.mOriginalActions = mBuilder.mActions;
+                mBuilder.mActions = new ArrayList<>();
+                RemoteViews remoteViews = makeBigContentView();
+                mBuilder.mActions = mBuilder.mOriginalActions;
+                mBuilder.mOriginalActions = null;
+                return remoteViews;
             }
-            if (hasSummary) {
-                lineCount -= LINES_CONSUMED_BY_SUMMARY;
-            }
-
-            // If we have less top padding at the top, we can fit less lines.
-            if (!mBuilder.mHasThreeLines) {
-                lineCount--;
-            }
-            return lineCount;
+            return super.makeContentView(increasedHeight);
         }
 
         /**
          * @hide
          */
         @Override
-        public void populateBigContentView(Notification wip) {
-            mBuilder.setBuilderBigContentView(wip, makeBigContentView());
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            if (increasedHeight && mBuilder.mActions.size() > 0) {
+                return makeBigContentView();
+            }
+            return super.makeHeadsUpContentView(increasedHeight);
+        }
+
+        /**
+         * @hide
+         */
+        public RemoteViews makeBigContentView() {
+            StandardTemplateParams p = mBuilder.mParams.reset().fillTextsFrom(mBuilder).text(null);
+            TemplateBindResult result = new TemplateBindResult();
+            RemoteViews contentView = getStandardView(mBuilder.getBigTextLayoutResource(), p,
+                    result);
+            contentView.setInt(R.id.big_text, "setImageEndMargin", result.getIconMarginEnd());
+
+            CharSequence bigTextText = mBuilder.processLegacyText(mBigText);
+            if (TextUtils.isEmpty(bigTextText)) {
+                // In case the bigtext is null / empty fall back to the normal text to avoid a weird
+                // experience
+                bigTextText = mBuilder.processLegacyText(
+                        mBuilder.getAllExtras().getCharSequence(EXTRA_TEXT));
+            }
+            contentView.setTextViewText(R.id.big_text, mBuilder.processTextSpans(bigTextText));
+            mBuilder.setTextViewColorSecondary(contentView, R.id.big_text, p);
+            contentView.setViewVisibility(R.id.big_text,
+                    TextUtils.isEmpty(bigTextText) ? View.GONE : View.VISIBLE);
+            contentView.setBoolean(R.id.big_text, "setHasImage",
+                    result.isRightIconContainerVisible());
+
+            return contentView;
+        }
+
+        /**
+         * @hide
+         * Spans are ignored when comparing text for visual difference.
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            BigTextStyle newS = (BigTextStyle) other;
+            return !Objects.equals(String.valueOf(getBigText()), String.valueOf(newS.getBigText()));
+        }
+
+    }
+
+    /**
+     * Helper class for generating large-format notifications that include multiple back-and-forth
+     * messages of varying types between any number of people.
+     *
+     * <p>
+     * If the platform does not provide large-format notifications, this method has no effect. The
+     * user will always see the normal notification view.
+     *
+     * <p>
+     * If the app is targeting Android P and above, it is required to use the {@link Person}
+     * class in order to get an optimal rendering of the notification and its avatars. For
+     * conversations involving multiple people, the app should also make sure that it marks the
+     * conversation as a group with {@link #setGroupConversation(boolean)}.
+     *
+     * <p>
+     * This class is a "rebuilder": It attaches to a Builder object and modifies its behavior.
+     * Here's an example of how this may be used:
+     * <pre class="prettyprint">
+     *
+     * Person user = new Person.Builder().setIcon(userIcon).setName(userName).build();
+     * MessagingStyle style = new MessagingStyle(user)
+     *      .addMessage(messages[1].getText(), messages[1].getTime(), messages[1].getPerson())
+     *      .addMessage(messages[2].getText(), messages[2].getTime(), messages[2].getPerson())
+     *      .setGroupConversation(hasMultiplePeople());
+     *
+     * Notification noti = new Notification.Builder()
+     *     .setContentTitle(&quot;2 new messages with &quot; + sender.toString())
+     *     .setContentText(subject)
+     *     .setSmallIcon(R.drawable.new_message)
+     *     .setLargeIcon(aBitmap)
+     *     .setStyle(style)
+     *     .build();
+     * </pre>
+     */
+    public static class MessagingStyle extends Style {
+
+        /**
+         * The maximum number of messages that will be retained in the Notification itself (the
+         * number displayed is up to the platform).
+         */
+        public static final int MAXIMUM_RETAINED_MESSAGES = 25;
+
+
+        /** @hide */
+        public static final int CONVERSATION_TYPE_LEGACY = 0;
+        /** @hide */
+        public static final int CONVERSATION_TYPE_NORMAL = 1;
+        /** @hide */
+        public static final int CONVERSATION_TYPE_IMPORTANT = 2;
+
+        /** @hide */
+        @IntDef(prefix = {"CONVERSATION_TYPE_"}, value = {
+                CONVERSATION_TYPE_LEGACY, CONVERSATION_TYPE_NORMAL, CONVERSATION_TYPE_IMPORTANT
+        })
+        @Retention(RetentionPolicy.SOURCE)
+        public @interface ConversationType {}
+
+        @NonNull Person mUser;
+        @Nullable CharSequence mConversationTitle;
+        @Nullable Icon mShortcutIcon;
+        List<Message> mMessages = new ArrayList<>();
+        List<Message> mHistoricMessages = new ArrayList<>();
+        boolean mIsGroupConversation;
+        @ConversationType int mConversationType = CONVERSATION_TYPE_LEGACY;
+        int mUnreadMessageCount;
+
+        MessagingStyle() {
+        }
+
+        /**
+         * @param userDisplayName Required - the name to be displayed for any replies sent by the
+         * user before the posting app reposts the notification with those messages after they've
+         * been actually sent and in previous messages sent by the user added in
+         * {@link #addMessage(Notification.MessagingStyle.Message)}
+         *
+         * @deprecated use {@code MessagingStyle(Person)}
+         */
+        public MessagingStyle(@NonNull CharSequence userDisplayName) {
+            this(new Person.Builder().setName(userDisplayName).build());
+        }
+
+        /**
+         * @param user Required - The person displayed for any messages that are sent by the
+         * user. Any messages added with {@link #addMessage(Notification.MessagingStyle.Message)}
+         * who don't have a Person associated with it will be displayed as if they were sent
+         * by this user. The user also needs to have a valid name associated with it, which will
+         * be enforced starting in Android P.
+         */
+        public MessagingStyle(@NonNull Person user) {
+            mUser = user;
+        }
+
+        /**
+         * Validate that this style was properly composed. This is called at build time.
+         * @hide
+         */
+        @Override
+        public void validate(Context context) {
+            super.validate(context);
+            if (context.getApplicationInfo().targetSdkVersion
+                    >= Build.VERSION_CODES.P && (mUser == null || mUser.getName() == null)) {
+                throw new RuntimeException("User must be valid and have a name.");
+            }
+        }
+
+        /**
+         * @return the text that should be displayed in the statusBar when heads upped.
+         * If {@code null} is returned, the default implementation will be used.
+         *
+         * @hide
+         */
+        @Override
+        public CharSequence getHeadsUpStatusBarText() {
+            CharSequence conversationTitle = !TextUtils.isEmpty(super.mBigContentTitle)
+                    ? super.mBigContentTitle
+                    : mConversationTitle;
+            if (mConversationType == CONVERSATION_TYPE_LEGACY
+                    && !TextUtils.isEmpty(conversationTitle) && !hasOnlyWhiteSpaceSenders()) {
+                return conversationTitle;
+            }
+            return null;
+        }
+
+        /**
+         * @return the user to be displayed for any replies sent by the user
+         */
+        @NonNull
+        public Person getUser() {
+            return mUser;
+        }
+
+        /**
+         * Returns the name to be displayed for any replies sent by the user
+         *
+         * @deprecated use {@link #getUser()} instead
+         */
+        public CharSequence getUserDisplayName() {
+            return mUser.getName();
+        }
+
+        /**
+         * Sets the title to be displayed on this conversation. May be set to {@code null}.
+         *
+         * <p>Starting in {@link Build.VERSION_CODES#R, this conversation title will be ignored if a
+         * valid shortcutId is added via {@link Notification.Builder#setShortcutId(String)}. In this
+         * case, {@link ShortcutInfo#getLongLabel()} (or, if missing,
+         * {@link ShortcutInfo#getShortLabel()}) will be shown as the conversation title
+         * instead.
+         *
+         * <p>This API's behavior was changed in SDK version {@link Build.VERSION_CODES#P}. If your
+         * application's target version is less than {@link Build.VERSION_CODES#P}, setting a
+         * conversation title to a non-null value will make {@link #isGroupConversation()} return
+         * {@code true} and passing {@code null} will make it return {@code false}. In
+         * {@link Build.VERSION_CODES#P} and beyond, use {@link #setGroupConversation(boolean)}
+         * to set group conversation status.
+         *
+         * @param conversationTitle Title displayed for this conversation
+         * @return this object for method chaining
+         */
+        public MessagingStyle setConversationTitle(@Nullable CharSequence conversationTitle) {
+            mConversationTitle = conversationTitle;
+            return this;
+        }
+
+        /**
+         * Return the title to be displayed on this conversation. May return {@code null}.
+         */
+        @Nullable
+        public CharSequence getConversationTitle() {
+            return mConversationTitle;
+        }
+
+        /**
+         * Sets the icon to be displayed on the conversation, derived from the shortcutId.
+         *
+         * @hide
+         */
+        public MessagingStyle setShortcutIcon(@Nullable Icon conversationIcon) {
+            mShortcutIcon = conversationIcon;
+            return this;
+        }
+
+        /**
+         * Return the icon to be displayed on this conversation, derived from the shortcutId. May
+         * return {@code null}.
+         *
+         * @hide
+         */
+        @Nullable
+        public Icon getShortcutIcon() {
+            return mShortcutIcon;
+        }
+
+        /**
+         * Sets the conversation type of this MessageStyle notification.
+         * {@link #CONVERSATION_TYPE_LEGACY} will use the "older" layout from pre-R,
+         * {@link #CONVERSATION_TYPE_NORMAL} will use the new "conversation" layout, and
+         * {@link #CONVERSATION_TYPE_IMPORTANT} will add additional "important" treatments.
+         *
+         * @hide
+         */
+        public MessagingStyle setConversationType(@ConversationType int conversationType) {
+            mConversationType = conversationType;
+            return this;
+        }
+
+        /** @hide */
+        @ConversationType
+        public int getConversationType() {
+            return mConversationType;
+        }
+
+        /** @hide */
+        public int getUnreadMessageCount() {
+            return mUnreadMessageCount;
+        }
+
+        /** @hide */
+        public MessagingStyle setUnreadMessageCount(int unreadMessageCount) {
+            mUnreadMessageCount = unreadMessageCount;
+            return this;
+        }
+
+        /**
+         * Adds a message for display by this notification. Convenience call for a simple
+         * {@link Message} in {@link #addMessage(Notification.MessagingStyle.Message)}.
+         * @param text A {@link CharSequence} to be displayed as the message content
+         * @param timestamp Time at which the message arrived
+         * @param sender A {@link CharSequence} to be used for displaying the name of the
+         * sender. Should be <code>null</code> for messages by the current user, in which case
+         * the platform will insert {@link #getUserDisplayName()}.
+         * Should be unique amongst all individuals in the conversation, and should be
+         * consistent during re-posts of the notification.
+         *
+         * @see Message#Message(CharSequence, long, CharSequence)
+         *
+         * @return this object for method chaining
+         *
+         * @deprecated use {@link #addMessage(CharSequence, long, Person)}
+         */
+        public MessagingStyle addMessage(CharSequence text, long timestamp, CharSequence sender) {
+            return addMessage(text, timestamp,
+                    sender == null ? null : new Person.Builder().setName(sender).build());
+        }
+
+        /**
+         * Adds a message for display by this notification. Convenience call for a simple
+         * {@link Message} in {@link #addMessage(Notification.MessagingStyle.Message)}.
+         * @param text A {@link CharSequence} to be displayed as the message content
+         * @param timestamp Time at which the message arrived
+         * @param sender The {@link Person} who sent the message.
+         * Should be <code>null</code> for messages by the current user, in which case
+         * the platform will insert the user set in {@code MessagingStyle(Person)}.
+         *
+         * @see Message#Message(CharSequence, long, CharSequence)
+         *
+         * @return this object for method chaining
+         */
+        public MessagingStyle addMessage(@NonNull CharSequence text, long timestamp,
+                @Nullable Person sender) {
+            return addMessage(new Message(text, timestamp, sender));
+        }
+
+        /**
+         * Adds a {@link Message} for display in this notification.
+         *
+         * <p>The messages should be added in chronologic order, i.e. the oldest first,
+         * the newest last.
+         *
+         * @param message The {@link Message} to be displayed
+         * @return this object for method chaining
+         */
+        public MessagingStyle addMessage(Message message) {
+            mMessages.add(message);
+            if (mMessages.size() > MAXIMUM_RETAINED_MESSAGES) {
+                mMessages.remove(0);
+            }
+            return this;
+        }
+
+        /**
+         * Adds a {@link Message} for historic context in this notification.
+         *
+         * <p>Messages should be added as historic if they are not the main subject of the
+         * notification but may give context to a conversation. The system may choose to present
+         * them only when relevant, e.g. when replying to a message through a {@link RemoteInput}.
+         *
+         * <p>The messages should be added in chronologic order, i.e. the oldest first,
+         * the newest last.
+         *
+         * @param message The historic {@link Message} to be added
+         * @return this object for method chaining
+         */
+        public MessagingStyle addHistoricMessage(Message message) {
+            mHistoricMessages.add(message);
+            if (mHistoricMessages.size() > MAXIMUM_RETAINED_MESSAGES) {
+                mHistoricMessages.remove(0);
+            }
+            return this;
+        }
+
+        /**
+         * Gets the list of {@code Message} objects that represent the notification
+         */
+        public List<Message> getMessages() {
+            return mMessages;
+        }
+
+        /**
+         * Gets the list of historic {@code Message}s in the notification.
+         */
+        public List<Message> getHistoricMessages() {
+            return mHistoricMessages;
+        }
+
+        /**
+         * Sets whether this conversation notification represents a group. If the app is targeting
+         * Android P, this is required if the app wants to display the largeIcon set with
+         * {@link Notification.Builder#setLargeIcon(Bitmap)}, otherwise it will be hidden.
+         *
+         * @param isGroupConversation {@code true} if the conversation represents a group,
+         * {@code false} otherwise.
+         * @return this object for method chaining
+         */
+        public MessagingStyle setGroupConversation(boolean isGroupConversation) {
+            mIsGroupConversation = isGroupConversation;
+            return this;
+        }
+
+        /**
+         * Returns {@code true} if this notification represents a group conversation, otherwise
+         * {@code false}.
+         *
+         * <p> If the application that generated this {@link MessagingStyle} targets an SDK version
+         * less than {@link Build.VERSION_CODES#P}, this method becomes dependent on whether or
+         * not the conversation title is set; returning {@code true} if the conversation title is
+         * a non-null value, or {@code false} otherwise. From {@link Build.VERSION_CODES#P} forward,
+         * this method returns what's set by {@link #setGroupConversation(boolean)} allowing for
+         * named, non-group conversations.
+         *
+         * @see #setConversationTitle(CharSequence)
+         */
+        public boolean isGroupConversation() {
+            // When target SDK version is < P, a non-null conversation title dictates if this is
+            // as group conversation.
+            if (mBuilder != null
+                    && mBuilder.mContext.getApplicationInfo().targetSdkVersion
+                            < Build.VERSION_CODES.P) {
+                return mConversationTitle != null;
+            }
+
+            return mIsGroupConversation;
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public void addExtras(Bundle extras) {
+            super.addExtras(extras);
+            if (mUser != null) {
+                // For legacy usages
+                extras.putCharSequence(EXTRA_SELF_DISPLAY_NAME, mUser.getName());
+                extras.putParcelable(EXTRA_MESSAGING_PERSON, mUser);
+            }
+            if (mConversationTitle != null) {
+                extras.putCharSequence(EXTRA_CONVERSATION_TITLE, mConversationTitle);
+            }
+            if (!mMessages.isEmpty()) { extras.putParcelableArray(EXTRA_MESSAGES,
+                    Message.getBundleArrayForMessages(mMessages));
+            }
+            if (!mHistoricMessages.isEmpty()) { extras.putParcelableArray(EXTRA_HISTORIC_MESSAGES,
+                    Message.getBundleArrayForMessages(mHistoricMessages));
+            }
+            if (mShortcutIcon != null) {
+                extras.putParcelable(EXTRA_CONVERSATION_ICON, mShortcutIcon);
+            }
+            extras.putInt(EXTRA_CONVERSATION_UNREAD_MESSAGE_COUNT, mUnreadMessageCount);
+
+            fixTitleAndTextExtras(extras);
+            extras.putBoolean(EXTRA_IS_GROUP_CONVERSATION, mIsGroupConversation);
+        }
+
+        private void fixTitleAndTextExtras(Bundle extras) {
+            Message m = findLatestIncomingMessage();
+            CharSequence text = (m == null) ? null : m.mText;
+            CharSequence sender = m == null ? null
+                    : m.mSender == null || TextUtils.isEmpty(m.mSender.getName())
+                            ? mUser.getName() : m.mSender.getName();
+            CharSequence title;
+            if (!TextUtils.isEmpty(mConversationTitle)) {
+                if (!TextUtils.isEmpty(sender)) {
+                    BidiFormatter bidi = BidiFormatter.getInstance();
+                    title = mBuilder.mContext.getString(
+                            com.android.internal.R.string.notification_messaging_title_template,
+                            bidi.unicodeWrap(mConversationTitle), bidi.unicodeWrap(sender));
+                } else {
+                    title = mConversationTitle;
+                }
+            } else {
+                title = sender;
+            }
+
+            if (title != null) {
+                extras.putCharSequence(EXTRA_TITLE, title);
+            }
+            if (text != null) {
+                extras.putCharSequence(EXTRA_TEXT, text);
+            }
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        protected void restoreFromExtras(Bundle extras) {
+            super.restoreFromExtras(extras);
+
+            mUser = extras.getParcelable(EXTRA_MESSAGING_PERSON);
+            if (mUser == null) {
+                CharSequence displayName = extras.getCharSequence(EXTRA_SELF_DISPLAY_NAME);
+                mUser = new Person.Builder().setName(displayName).build();
+            }
+            mConversationTitle = extras.getCharSequence(EXTRA_CONVERSATION_TITLE);
+            Parcelable[] messages = extras.getParcelableArray(EXTRA_MESSAGES);
+            mMessages = Message.getMessagesFromBundleArray(messages);
+            Parcelable[] histMessages = extras.getParcelableArray(EXTRA_HISTORIC_MESSAGES);
+            mHistoricMessages = Message.getMessagesFromBundleArray(histMessages);
+            mIsGroupConversation = extras.getBoolean(EXTRA_IS_GROUP_CONVERSATION);
+            mUnreadMessageCount = extras.getInt(EXTRA_CONVERSATION_UNREAD_MESSAGE_COUNT);
+            mShortcutIcon = extras.getParcelable(EXTRA_CONVERSATION_ICON);
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            mBuilder.mOriginalActions = mBuilder.mActions;
+            mBuilder.mActions = new ArrayList<>();
+            RemoteViews remoteViews = makeMessagingView(true /* isCollapsed */,
+                    false /* hideLargeIcon */);
+            mBuilder.mActions = mBuilder.mOriginalActions;
+            mBuilder.mOriginalActions = null;
+            return remoteViews;
+        }
+
+        /**
+         * @hide
+         * Spans are ignored when comparing text for visual difference.
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            MessagingStyle newS = (MessagingStyle) other;
+            List<MessagingStyle.Message> oldMs = getMessages();
+            List<MessagingStyle.Message> newMs = newS.getMessages();
+
+            if (oldMs == null || newMs == null) {
+                newMs = new ArrayList<>();
+            }
+
+            int n = oldMs.size();
+            if (n != newMs.size()) {
+                return true;
+            }
+            for (int i = 0; i < n; i++) {
+                MessagingStyle.Message oldM = oldMs.get(i);
+                MessagingStyle.Message newM = newMs.get(i);
+                if (!Objects.equals(
+                        String.valueOf(oldM.getText()),
+                        String.valueOf(newM.getText()))) {
+                    return true;
+                }
+                if (!Objects.equals(oldM.getDataUri(), newM.getDataUri())) {
+                    return true;
+                }
+                String oldSender = String.valueOf(oldM.getSenderPerson() == null
+                        ? oldM.getSender()
+                        : oldM.getSenderPerson().getName());
+                String newSender = String.valueOf(newM.getSenderPerson() == null
+                        ? newM.getSender()
+                        : newM.getSenderPerson().getName());
+                if (!Objects.equals(oldSender, newSender)) {
+                    return true;
+                }
+
+                String oldKey = oldM.getSenderPerson() == null
+                        ? null : oldM.getSenderPerson().getKey();
+                String newKey = newM.getSenderPerson() == null
+                        ? null : newM.getSenderPerson().getKey();
+                if (!Objects.equals(oldKey, newKey)) {
+                    return true;
+                }
+                // Other fields (like timestamp) intentionally excluded
+            }
+            return false;
+        }
+
+        private Message findLatestIncomingMessage() {
+            return findLatestIncomingMessage(mMessages);
+        }
+
+        /**
+         * @hide
+         */
+        @Nullable
+        public static Message findLatestIncomingMessage(
+                List<Message> messages) {
+            for (int i = messages.size() - 1; i >= 0; i--) {
+                Message m = messages.get(i);
+                // Incoming messages have a non-empty sender.
+                if (m.mSender != null && !TextUtils.isEmpty(m.mSender.getName())) {
+                    return m;
+                }
+            }
+            if (!messages.isEmpty()) {
+                // No incoming messages, fall back to outgoing message
+                return messages.get(messages.size() - 1);
+            }
+            return null;
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeBigContentView() {
+            return makeMessagingView(false /* isCollapsed */, true /* hideLargeIcon */);
+        }
+
+        /**
+         * Create a messaging layout.
+         *
+         * @param isCollapsed Should this use the collapsed layout
+         * @param hideRightIcons Should the reply affordance be shown at the end of the notification
+         * @return the created remoteView.
+         */
+        @NonNull
+        private RemoteViews makeMessagingView(boolean isCollapsed, boolean hideRightIcons) {
+            CharSequence conversationTitle = !TextUtils.isEmpty(super.mBigContentTitle)
+                    ? super.mBigContentTitle
+                    : mConversationTitle;
+            boolean atLeastP = mBuilder.mContext.getApplicationInfo().targetSdkVersion
+                    >= Build.VERSION_CODES.P;
+            boolean isOneToOne;
+            CharSequence nameReplacement = null;
+            if (!atLeastP) {
+                isOneToOne = TextUtils.isEmpty(conversationTitle);
+                if (hasOnlyWhiteSpaceSenders()) {
+                    isOneToOne = true;
+                    nameReplacement = conversationTitle;
+                    conversationTitle = null;
+                }
+            } else {
+                isOneToOne = !isGroupConversation();
+            }
+            boolean isConversationLayout = mConversationType != CONVERSATION_TYPE_LEGACY;
+            boolean isImportantConversation = mConversationType == CONVERSATION_TYPE_IMPORTANT;
+            Icon largeIcon = mBuilder.mN.mLargeIcon;
+            TemplateBindResult bindResult = new TemplateBindResult();
+            StandardTemplateParams p = mBuilder.mParams.reset()
+                    .hasProgress(false)
+                    .title(conversationTitle)
+                    .text(null)
+                    .hideLargeIcon(hideRightIcons || isOneToOne)
+                    .hideReplyIcon(hideRightIcons)
+                    .headerTextSecondary(conversationTitle);
+            RemoteViews contentView = mBuilder.applyStandardTemplateWithActions(
+                    isConversationLayout
+                            ? mBuilder.getConversationLayoutResource()
+                            : mBuilder.getMessagingLayoutResource(),
+                    p,
+                    bindResult);
+
+            addExtras(mBuilder.mN.extras);
+            if (!isConversationLayout) {
+                // also update the end margin if there is an image
+                contentView.setViewLayoutMarginEnd(R.id.notification_messaging,
+                        bindResult.getIconMarginEnd());
+            }
+            contentView.setInt(R.id.status_bar_latest_event_content, "setLayoutColor",
+                    mBuilder.isColorized(p)
+                            ? mBuilder.getPrimaryTextColor(p)
+                            : mBuilder.resolveContrastColor(p));
+            contentView.setInt(R.id.status_bar_latest_event_content, "setSenderTextColor",
+                    mBuilder.getPrimaryTextColor(p));
+            contentView.setInt(R.id.status_bar_latest_event_content, "setMessageTextColor",
+                    mBuilder.getSecondaryTextColor(p));
+            contentView.setInt(R.id.status_bar_latest_event_content,
+                    "setNotificationBackgroundColor",
+                    mBuilder.resolveBackgroundColor(p));
+            contentView.setBoolean(R.id.status_bar_latest_event_content, "setIsCollapsed",
+                    isCollapsed);
+            contentView.setIcon(R.id.status_bar_latest_event_content, "setAvatarReplacement",
+                    mBuilder.mN.mLargeIcon);
+            contentView.setCharSequence(R.id.status_bar_latest_event_content, "setNameReplacement",
+                    nameReplacement);
+            contentView.setBoolean(R.id.status_bar_latest_event_content, "setIsOneToOne",
+                    isOneToOne);
+            contentView.setCharSequence(R.id.status_bar_latest_event_content,
+                    "setConversationTitle", conversationTitle);
+            if (isConversationLayout) {
+                contentView.setIcon(R.id.status_bar_latest_event_content,
+                        "setShortcutIcon", mShortcutIcon);
+                contentView.setBoolean(R.id.status_bar_latest_event_content,
+                        "setIsImportantConversation", isImportantConversation);
+            }
+            contentView.setIcon(R.id.status_bar_latest_event_content, "setLargeIcon",
+                    largeIcon);
+            contentView.setBundle(R.id.status_bar_latest_event_content, "setData",
+                    mBuilder.mN.extras);
+            return contentView;
+        }
+
+        private boolean hasOnlyWhiteSpaceSenders() {
+            for (int i = 0; i < mMessages.size(); i++) {
+                Message m = mMessages.get(i);
+                Person sender = m.getSenderPerson();
+                if (sender != null && !isWhiteSpace(sender.getName())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private boolean isWhiteSpace(CharSequence sender) {
+            if (TextUtils.isEmpty(sender)) {
+                return true;
+            }
+            if (sender.toString().matches("^\\s*$")) {
+                return true;
+            }
+            // Let's check if we only have 0 whitespace chars. Some apps did this as a workaround
+            // For the presentation that we had.
+            for (int i = 0; i < sender.length(); i++) {
+                char c = sender.charAt(i);
+                if (c != '\u200B') {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private CharSequence createConversationTitleFromMessages() {
+            ArraySet<CharSequence> names = new ArraySet<>();
+            for (int i = 0; i < mMessages.size(); i++) {
+                Message m = mMessages.get(i);
+                Person sender = m.getSenderPerson();
+                if (sender != null) {
+                    names.add(sender.getName());
+                }
+            }
+            SpannableStringBuilder title = new SpannableStringBuilder();
+            int size = names.size();
+            for (int i = 0; i < size; i++) {
+                CharSequence name = names.valueAt(i);
+                if (!TextUtils.isEmpty(title)) {
+                    title.append(", ");
+                }
+                title.append(BidiFormatter.getInstance().unicodeWrap(name));
+            }
+            return title;
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            RemoteViews remoteViews = makeMessagingView(true /* isCollapsed */,
+                    true /* hideLargeIcon */);
+            if (mConversationType == CONVERSATION_TYPE_LEGACY) {
+                remoteViews.setInt(R.id.notification_messaging, "setMaxDisplayedLines", 1);
+            }
+            return remoteViews;
+        }
+
+        private static TextAppearanceSpan makeFontColorSpan(int color) {
+            return new TextAppearanceSpan(null, 0, 0,
+                    ColorStateList.valueOf(color), null);
+        }
+
+        public static final class Message {
+            /** @hide */
+            public static final String KEY_TEXT = "text";
+            static final String KEY_TIMESTAMP = "time";
+            static final String KEY_SENDER = "sender";
+            static final String KEY_SENDER_PERSON = "sender_person";
+            static final String KEY_DATA_MIME_TYPE = "type";
+            static final String KEY_DATA_URI= "uri";
+            static final String KEY_EXTRAS_BUNDLE = "extras";
+            static final String KEY_REMOTE_INPUT_HISTORY = "remote_input_history";
+
+            private final CharSequence mText;
+            private final long mTimestamp;
+            @Nullable
+            private final Person mSender;
+            /** True if this message was generated from the extra
+             *  {@link Notification#EXTRA_REMOTE_INPUT_HISTORY_ITEMS}
+             */
+            private final boolean mRemoteInputHistory;
+
+            private Bundle mExtras = new Bundle();
+            private String mDataMimeType;
+            private Uri mDataUri;
+
+            /**
+             * Constructor
+             * @param text A {@link CharSequence} to be displayed as the message content
+             * @param timestamp Time at which the message arrived
+             * @param sender A {@link CharSequence} to be used for displaying the name of the
+             * sender. Should be <code>null</code> for messages by the current user, in which case
+             * the platform will insert {@link MessagingStyle#getUserDisplayName()}.
+             * Should be unique amongst all individuals in the conversation, and should be
+             * consistent during re-posts of the notification.
+             *
+             *  @deprecated use {@code Message(CharSequence, long, Person)}
+             */
+            public Message(CharSequence text, long timestamp, CharSequence sender){
+                this(text, timestamp, sender == null ? null
+                        : new Person.Builder().setName(sender).build());
+            }
+
+            /**
+             * Constructor
+             * @param text A {@link CharSequence} to be displayed as the message content
+             * @param timestamp Time at which the message arrived
+             * @param sender The {@link Person} who sent the message.
+             * Should be <code>null</code> for messages by the current user, in which case
+             * the platform will insert the user set in {@code MessagingStyle(Person)}.
+             * <p>
+             * The person provided should contain an Icon, set with
+             * {@link Person.Builder#setIcon(Icon)} and also have a name provided
+             * with {@link Person.Builder#setName(CharSequence)}. If multiple users have the same
+             * name, consider providing a key with {@link Person.Builder#setKey(String)} in order
+             * to differentiate between the different users.
+             * </p>
+             */
+            public Message(@NonNull CharSequence text, long timestamp, @Nullable Person sender) {
+                this(text, timestamp, sender, false /* remoteHistory */);
+            }
+
+            /**
+             * Constructor
+             * @param text A {@link CharSequence} to be displayed as the message content
+             * @param timestamp Time at which the message arrived
+             * @param sender The {@link Person} who sent the message.
+             * Should be <code>null</code> for messages by the current user, in which case
+             * the platform will insert the user set in {@code MessagingStyle(Person)}.
+             * @param remoteInputHistory True if the messages was generated from the extra
+             * {@link Notification#EXTRA_REMOTE_INPUT_HISTORY_ITEMS}.
+             * <p>
+             * The person provided should contain an Icon, set with
+             * {@link Person.Builder#setIcon(Icon)} and also have a name provided
+             * with {@link Person.Builder#setName(CharSequence)}. If multiple users have the same
+             * name, consider providing a key with {@link Person.Builder#setKey(String)} in order
+             * to differentiate between the different users.
+             * </p>
+             * @hide
+             */
+            public Message(@NonNull CharSequence text, long timestamp, @Nullable Person sender,
+                    boolean remoteInputHistory) {
+                mText = text;
+                mTimestamp = timestamp;
+                mSender = sender;
+                mRemoteInputHistory = remoteInputHistory;
+            }
+
+            /**
+             * Sets a binary blob of data and an associated MIME type for a message. In the case
+             * where the platform doesn't support the MIME type, the original text provided in the
+             * constructor will be used.
+             * @param dataMimeType The MIME type of the content. See
+             * <a href="{@docRoot}notifications/messaging.html"> for the list of supported MIME
+             * types on Android and Android Wear.
+             * @param dataUri The uri containing the content whose type is given by the MIME type.
+             * <p class="note">
+             * <ol>
+             *   <li>Notification Listeners including the System UI need permission to access the
+             *       data the Uri points to. The recommended ways to do this are:</li>
+             *   <li>Store the data in your own ContentProvider, making sure that other apps have
+             *       the correct permission to access your provider. The preferred mechanism for
+             *       providing access is to use per-URI permissions which are temporary and only
+             *       grant access to the receiving application. An easy way to create a
+             *       ContentProvider like this is to use the FileProvider helper class.</li>
+             *   <li>Use the system MediaStore. The MediaStore is primarily aimed at video, audio
+             *       and image MIME types, however beginning with Android 3.0 (API level 11) it can
+             *       also store non-media types (see MediaStore.Files for more info). Files can be
+             *       inserted into the MediaStore using scanFile() after which a content:// style
+             *       Uri suitable for sharing is passed to the provided onScanCompleted() callback.
+             *       Note that once added to the system MediaStore the content is accessible to any
+             *       app on the device.</li>
+             * </ol>
+             * @return this object for method chaining
+             */
+            public Message setData(String dataMimeType, Uri dataUri) {
+                mDataMimeType = dataMimeType;
+                mDataUri = dataUri;
+                return this;
+            }
+
+            /**
+             * Get the text to be used for this message, or the fallback text if a type and content
+             * Uri have been set
+             */
+            public CharSequence getText() {
+                return mText;
+            }
+
+            /**
+             * Get the time at which this message arrived
+             */
+            public long getTimestamp() {
+                return mTimestamp;
+            }
+
+            /**
+             * Get the extras Bundle for this message.
+             */
+            public Bundle getExtras() {
+                return mExtras;
+            }
+
+            /**
+             * Get the text used to display the contact's name in the messaging experience
+             *
+             * @deprecated use {@link #getSenderPerson()}
+             */
+            public CharSequence getSender() {
+                return mSender == null ? null : mSender.getName();
+            }
+
+            /**
+             * Get the sender associated with this message.
+             */
+            @Nullable
+            public Person getSenderPerson() {
+                return mSender;
+            }
+
+            /**
+             * Get the MIME type of the data pointed to by the Uri
+             */
+            public String getDataMimeType() {
+                return mDataMimeType;
+            }
+
+            /**
+             * Get the Uri pointing to the content of the message. Can be null, in which case
+             * {@see #getText()} is used.
+             */
+            public Uri getDataUri() {
+                return mDataUri;
+            }
+
+            /**
+             * @return True if the message was generated from
+             * {@link Notification#EXTRA_REMOTE_INPUT_HISTORY_ITEMS}.
+             * @hide
+             */
+            public boolean isRemoteInputHistory() {
+                return mRemoteInputHistory;
+            }
+
+            /**
+             * @hide
+             */
+            @VisibleForTesting
+            public Bundle toBundle() {
+                Bundle bundle = new Bundle();
+                if (mText != null) {
+                    bundle.putCharSequence(KEY_TEXT, mText);
+                }
+                bundle.putLong(KEY_TIMESTAMP, mTimestamp);
+                if (mSender != null) {
+                    // Legacy listeners need this
+                    bundle.putCharSequence(KEY_SENDER, mSender.getName());
+                    bundle.putParcelable(KEY_SENDER_PERSON, mSender);
+                }
+                if (mDataMimeType != null) {
+                    bundle.putString(KEY_DATA_MIME_TYPE, mDataMimeType);
+                }
+                if (mDataUri != null) {
+                    bundle.putParcelable(KEY_DATA_URI, mDataUri);
+                }
+                if (mExtras != null) {
+                    bundle.putBundle(KEY_EXTRAS_BUNDLE, mExtras);
+                }
+                if (mRemoteInputHistory) {
+                    bundle.putBoolean(KEY_REMOTE_INPUT_HISTORY, mRemoteInputHistory);
+                }
+                return bundle;
+            }
+
+            static Bundle[] getBundleArrayForMessages(List<Message> messages) {
+                Bundle[] bundles = new Bundle[messages.size()];
+                final int N = messages.size();
+                for (int i = 0; i < N; i++) {
+                    bundles[i] = messages.get(i).toBundle();
+                }
+                return bundles;
+            }
+
+            /**
+             * Returns a list of messages read from the given bundle list, e.g.
+             * {@link #EXTRA_MESSAGES} or {@link #EXTRA_HISTORIC_MESSAGES}.
+             */
+            @NonNull
+            public static List<Message> getMessagesFromBundleArray(@Nullable Parcelable[] bundles) {
+                if (bundles == null) {
+                    return new ArrayList<>();
+                }
+                List<Message> messages = new ArrayList<>(bundles.length);
+                for (int i = 0; i < bundles.length; i++) {
+                    if (bundles[i] instanceof Bundle) {
+                        Message message = getMessageFromBundle((Bundle)bundles[i]);
+                        if (message != null) {
+                            messages.add(message);
+                        }
+                    }
+                }
+                return messages;
+            }
+
+            /**
+             * Returns the message that is stored in the bundle (e.g. one of the values in the lists
+             * in {@link #EXTRA_MESSAGES} or {@link #EXTRA_HISTORIC_MESSAGES}) or null if the
+             * message couldn't be resolved.
+             * @hide
+             */
+            @Nullable
+            public static Message getMessageFromBundle(@NonNull Bundle bundle) {
+                try {
+                    if (!bundle.containsKey(KEY_TEXT) || !bundle.containsKey(KEY_TIMESTAMP)) {
+                        return null;
+                    } else {
+
+                        Person senderPerson = bundle.getParcelable(KEY_SENDER_PERSON);
+                        if (senderPerson == null) {
+                            // Legacy apps that use compat don't actually provide the sender objects
+                            // We need to fix the compat version to provide people / use
+                            // the native api instead
+                            CharSequence senderName = bundle.getCharSequence(KEY_SENDER);
+                            if (senderName != null) {
+                                senderPerson = new Person.Builder().setName(senderName).build();
+                            }
+                        }
+                        Message message = new Message(bundle.getCharSequence(KEY_TEXT),
+                                bundle.getLong(KEY_TIMESTAMP),
+                                senderPerson,
+                                bundle.getBoolean(KEY_REMOTE_INPUT_HISTORY, false));
+                        if (bundle.containsKey(KEY_DATA_MIME_TYPE) &&
+                                bundle.containsKey(KEY_DATA_URI)) {
+                            message.setData(bundle.getString(KEY_DATA_MIME_TYPE),
+                                    (Uri) bundle.getParcelable(KEY_DATA_URI));
+                        }
+                        if (bundle.containsKey(KEY_EXTRAS_BUNDLE)) {
+                            message.getExtras().putAll(bundle.getBundle(KEY_EXTRAS_BUNDLE));
+                        }
+                        return message;
+                    }
+                } catch (ClassCastException e) {
+                    return null;
+                }
+            }
         }
     }
 
@@ -4210,11 +8057,20 @@ public class Notification implements Parcelable
      * @see Notification#bigContentView
      */
     public static class InboxStyle extends Style {
+
+        /**
+         * The number of lines of remote input history allowed until we start reducing lines.
+         */
+        private static final int NUMBER_OF_HISTORY_ALLOWED_UNTIL_REDUCTION = 1;
         private ArrayList<CharSequence> mTexts = new ArrayList<CharSequence>(5);
 
         public InboxStyle() {
         }
 
+        /**
+         * @deprecated use {@code InboxStyle()}.
+         */
+        @Deprecated
         public InboxStyle(Builder builder) {
             setBuilder(builder);
         }
@@ -4247,6 +8103,13 @@ public class Notification implements Parcelable
         /**
          * @hide
          */
+        public ArrayList<CharSequence> getLines() {
+            return mTexts;
+        }
+
+        /**
+         * @hide
+         */
         public void addExtras(Bundle extras) {
             super.addExtras(extras);
 
@@ -4267,18 +8130,13 @@ public class Notification implements Parcelable
             }
         }
 
-        private RemoteViews makeBigContentView() {
-            // Remove the content text so line3 disappears unless you have a summary
-
-            // Nasty
-            CharSequence oldBuilderContentText = mBuilder.mContentText;
-            mBuilder.mContentText = null;
-
-            RemoteViews contentView = getStandardView(mBuilder.getInboxLayoutResource());
-
-            mBuilder.mContentText = oldBuilderContentText;
-
-            contentView.setViewVisibility(R.id.text2, View.GONE);
+        /**
+         * @hide
+         */
+        public RemoteViews makeBigContentView() {
+            StandardTemplateParams p = mBuilder.mParams.reset().fillTextsFrom(mBuilder).text(null);
+            TemplateBindResult result = new TemplateBindResult();
+            RemoteViews contentView = getStandardView(mBuilder.getInboxLayoutResource(), p, result);
 
             int[] rowIds = {R.id.inbox_text0, R.id.inbox_text1, R.id.inbox_text2, R.id.inbox_text3,
                     R.id.inbox_text4, R.id.inbox_text5, R.id.inbox_text6};
@@ -4288,35 +8146,63 @@ public class Notification implements Parcelable
                 contentView.setViewVisibility(rowId, View.GONE);
             }
 
-            final boolean largeText =
-                    mBuilder.mContext.getResources().getConfiguration().fontScale > 1f;
-            final float subTextSize = mBuilder.mContext.getResources().getDimensionPixelSize(
-                    R.dimen.notification_subtext_size);
             int i=0;
-            while (i < mTexts.size() && i < rowIds.length) {
-                CharSequence str = mTexts.get(i);
-                if (str != null && !str.equals("")) {
-                    contentView.setViewVisibility(rowIds[i], View.VISIBLE);
-                    contentView.setTextViewText(rowIds[i], mBuilder.processLegacyText(str));
-                    if (largeText) {
-                        contentView.setTextViewTextSize(rowIds[i], TypedValue.COMPLEX_UNIT_PX,
-                                subTextSize);
+            int topPadding = mBuilder.mContext.getResources().getDimensionPixelSize(
+                    R.dimen.notification_inbox_item_top_padding);
+            boolean first = true;
+            int onlyViewId = 0;
+            int maxRows = rowIds.length;
+            if (mBuilder.mActions.size() > 0) {
+                maxRows--;
+            }
+            RemoteInputHistoryItem[] remoteInputHistory = getParcelableArrayFromBundle(
+                    mBuilder.mN.extras, EXTRA_REMOTE_INPUT_HISTORY_ITEMS,
+                    RemoteInputHistoryItem.class);
+            if (remoteInputHistory != null
+                    && remoteInputHistory.length > NUMBER_OF_HISTORY_ALLOWED_UNTIL_REDUCTION) {
+                // Let's remove some messages to make room for the remote input history.
+                // 1 is always able to fit, but let's remove them if they are 2 or 3
+                int numRemoteInputs = Math.min(remoteInputHistory.length,
+                        MAX_REMOTE_INPUT_HISTORY_LINES);
+                int totalNumRows = mTexts.size() + numRemoteInputs
+                        - NUMBER_OF_HISTORY_ALLOWED_UNTIL_REDUCTION;
+                if (totalNumRows > maxRows) {
+                    int overflow = totalNumRows - maxRows;
+                    if (mTexts.size() > maxRows) {
+                        // Heuristic: if the Texts don't fit anyway, we'll rather drop the last
+                        // few messages, even with the remote input
+                        maxRows -= overflow;
+                    } else  {
+                        // otherwise we drop the first messages
+                        i = overflow;
                     }
+                }
+            }
+            while (i < mTexts.size() && i < maxRows) {
+                CharSequence str = mTexts.get(i);
+                if (!TextUtils.isEmpty(str)) {
+                    contentView.setViewVisibility(rowIds[i], View.VISIBLE);
+                    contentView.setTextViewText(rowIds[i],
+                            mBuilder.processTextSpans(mBuilder.processLegacyText(str)));
+                    mBuilder.setTextViewColorSecondary(contentView, rowIds[i], p);
+                    contentView.setViewPadding(rowIds[i], 0, topPadding, 0, 0);
+                    handleInboxImageMargin(contentView, rowIds[i], first,
+                            result.getIconMarginEnd());
+                    if (first) {
+                        onlyViewId = rowIds[i];
+                    } else {
+                        onlyViewId = 0;
+                    }
+                    first = false;
                 }
                 i++;
             }
-
-            contentView.setViewVisibility(R.id.inbox_end_pad,
-                    mTexts.size() > 0 ? View.VISIBLE : View.GONE);
-
-            contentView.setViewVisibility(R.id.inbox_more,
-                    mTexts.size() > rowIds.length ? View.VISIBLE : View.GONE);
-
-            applyTopPadding(contentView);
-
-            mBuilder.shrinkLine3Text(contentView);
-
-            mBuilder.addProfileBadge(contentView, R.id.profile_badge_large_template);
+            if (onlyViewId != 0) {
+                // We only have 1 entry, lets make it look like the normal Text of a Bigtext
+                topPadding = mBuilder.mContext.getResources().getDimensionPixelSize(
+                        R.dimen.notification_text_margin_top);
+                contentView.setViewPadding(onlyViewId, 0, topPadding, 0, 0);
+            }
 
             return contentView;
         }
@@ -4325,8 +8211,41 @@ public class Notification implements Parcelable
          * @hide
          */
         @Override
-        public void populateBigContentView(Notification wip) {
-            mBuilder.setBuilderBigContentView(wip, makeBigContentView());
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            InboxStyle newS = (InboxStyle) other;
+
+            final ArrayList<CharSequence> myLines = getLines();
+            final ArrayList<CharSequence> newLines = newS.getLines();
+            final int n = myLines.size();
+            if (n != newLines.size()) {
+                return true;
+            }
+
+            for (int i = 0; i < n; i++) {
+                if (!Objects.equals(
+                        String.valueOf(myLines.get(i)),
+                        String.valueOf(newLines.get(i)))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void handleInboxImageMargin(RemoteViews contentView, int id, boolean first,
+                int marginEndValue) {
+            int endMargin = 0;
+            if (first) {
+                final int max = mBuilder.mN.extras.getInt(EXTRA_PROGRESS_MAX, 0);
+                final boolean ind = mBuilder.mN.extras.getBoolean(EXTRA_PROGRESS_INDETERMINATE);
+                boolean hasProgress = max != 0 || ind;
+                if (!hasProgress) {
+                    endMargin = marginEndValue;
+                }
+            }
+            contentView.setViewLayoutMarginEnd(id, endMargin);
         }
     }
 
@@ -4339,20 +8258,26 @@ public class Notification implements Parcelable
      * shown as icon-only pushbuttons, suitable for transport controls. The Bitmap given to
      * {@link Notification.Builder#setLargeIcon(android.graphics.Bitmap) setLargeIcon()} will be
      * treated as album artwork.
-     *
+     * <p>
      * Unlike the other styles provided here, MediaStyle can also modify the standard-size
      * {@link Notification#contentView}; by providing action indices to
      * {@link #setShowActionsInCompactView(int...)} you can promote up to 3 actions to be displayed
      * in the standard view alongside the usual content.
-     *
+     * <p>
      * Notifications created with MediaStyle will have their category set to
      * {@link Notification#CATEGORY_TRANSPORT CATEGORY_TRANSPORT} unless you set a different
      * category using {@link Notification.Builder#setCategory(String) setCategory()}.
-     *
+     * <p>
      * Finally, if you attach a {@link android.media.session.MediaSession.Token} using
      * {@link android.app.Notification.MediaStyle#setMediaSession(MediaSession.Token)},
      * the System UI can identify this as a notification representing an active media session
      * and respond accordingly (by showing album artwork in the lockscreen, for example).
+     *
+     * <p>
+     * Starting at {@link android.os.Build.VERSION_CODES#O Android O} any notification that has a
+     * media session attached with {@link #setMediaSession(MediaSession.Token)} will be colorized.
+     * You can opt-out of this behavior by using {@link Notification.Builder#setColorized(boolean)}.
+     * <p>
      *
      * To use this style with your Notification, feed it to
      * {@link Notification.Builder#setStyle(android.app.Notification.Style)} like so:
@@ -4368,10 +8293,20 @@ public class Notification implements Parcelable
      * </pre>
      *
      * @see Notification#bigContentView
+     * @see Notification.Builder#setColorized(boolean)
      */
     public static class MediaStyle extends Style {
+        // Changing max media buttons requires also changing templates
+        // (notification_template_material_media and notification_template_material_big_media).
         static final int MAX_MEDIA_BUTTONS_IN_COMPACT = 3;
         static final int MAX_MEDIA_BUTTONS = 5;
+        @IdRes private static final int[] MEDIA_BUTTON_IDS = {
+                R.id.action0,
+                R.id.action1,
+                R.id.action2,
+                R.id.action3,
+                R.id.action4,
+        };
 
         private int[] mActionsToShowInCompact = null;
         private MediaSession.Token mToken;
@@ -4379,6 +8314,10 @@ public class Notification implements Parcelable
         public MediaStyle() {
         }
 
+        /**
+         * @deprecated use {@code MediaStyle()}.
+         */
+        @Deprecated
         public MediaStyle(Builder builder) {
             setBuilder(builder);
         }
@@ -4407,6 +8346,7 @@ public class Notification implements Parcelable
          * @hide
          */
         @Override
+        @UnsupportedAppUsage
         public Notification buildStyled(Notification wip) {
             super.buildStyled(wip);
             if (wip.category == null) {
@@ -4419,16 +8359,24 @@ public class Notification implements Parcelable
          * @hide
          */
         @Override
-        public void populateContentView(Notification wip) {
-            mBuilder.setBuilderContentView(wip, makeMediaContentView());
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            return makeMediaContentView();
         }
 
         /**
          * @hide
          */
         @Override
-        public void populateBigContentView(Notification wip) {
-            mBuilder.setBuilderBigContentView(wip, makeMediaBigContentView());
+        public RemoteViews makeBigContentView() {
+            return makeMediaBigContentView();
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            return makeMediaContentView();
         }
 
         /** @hide */
@@ -4459,98 +8407,131 @@ public class Notification implements Parcelable
             }
         }
 
-        private RemoteViews generateMediaActionButton(Action action) {
-            final boolean tombstone = (action.actionIntent == null);
-            RemoteViews button = new BuilderRemoteViews(mBuilder.mContext.getApplicationInfo(),
-                    R.layout.notification_material_media_action);
-            button.setImageViewIcon(R.id.action0, action.getIcon());
-            button.setDrawableParameters(R.id.action0, false, -1,
-                    0xFFFFFFFF,
-                    PorterDuff.Mode.SRC_ATOP, -1);
-            if (!tombstone) {
-                button.setOnClickPendingIntent(R.id.action0, action.actionIntent);
+        /**
+         * @hide
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
             }
-            button.setContentDescription(R.id.action0, action.title);
-            return button;
+            // All fields to compare are on the Notification object
+            return false;
+        }
+
+        private void bindMediaActionButton(RemoteViews container, @IdRes int buttonId,
+                Action action, StandardTemplateParams p) {
+            final boolean tombstone = (action.actionIntent == null);
+            container.setViewVisibility(buttonId, View.VISIBLE);
+            if (buttonId != R.id.media_seamless) {
+                container.setImageViewIcon(buttonId, action.getIcon());
+            }
+
+            // If the action buttons should not be tinted, then just use the default
+            // notification color. Otherwise, just use the passed-in color.
+            Resources resources = mBuilder.mContext.getResources();
+            Configuration currentConfig = resources.getConfiguration();
+            boolean inNightMode = (currentConfig.uiMode & Configuration.UI_MODE_NIGHT_MASK)
+                    == Configuration.UI_MODE_NIGHT_YES;
+            int tintColor = mBuilder.shouldTintActionButtons() || mBuilder.isColorized(p)
+                    ? getActionColor(p)
+                    : ContrastColorUtil.resolveColor(mBuilder.mContext,
+                            Notification.COLOR_DEFAULT, inNightMode);
+
+            container.setDrawableTint(buttonId, false, tintColor,
+                    PorterDuff.Mode.SRC_ATOP);
+
+            final TypedArray typedArray = mBuilder.mContext.obtainStyledAttributes(
+                    new int[]{ android.R.attr.colorControlHighlight });
+            int rippleAlpha = Color.alpha(typedArray.getColor(0, 0));
+            typedArray.recycle();
+            int rippleColor = Color.argb(rippleAlpha, Color.red(tintColor), Color.green(tintColor),
+                    Color.blue(tintColor));
+            container.setRippleDrawableColor(buttonId, ColorStateList.valueOf(rippleColor));
+
+            if (!tombstone) {
+                container.setOnClickPendingIntent(buttonId, action.actionIntent);
+            }
+            container.setContentDescription(buttonId, action.title);
         }
 
         private RemoteViews makeMediaContentView() {
+            StandardTemplateParams p = mBuilder.mParams.reset().hasProgress(false).fillTextsFrom(
+                    mBuilder);
             RemoteViews view = mBuilder.applyStandardTemplate(
-                    R.layout.notification_template_material_media, false /* hasProgress */);
+                    R.layout.notification_template_material_media, p,
+                    null /* result */);
 
             final int numActions = mBuilder.mActions.size();
-            final int N = mActionsToShowInCompact == null
+            final int numActionsToShow = mActionsToShowInCompact == null
                     ? 0
                     : Math.min(mActionsToShowInCompact.length, MAX_MEDIA_BUTTONS_IN_COMPACT);
-            if (N > 0) {
-                view.removeAllViews(com.android.internal.R.id.media_actions);
-                for (int i = 0; i < N; i++) {
-                    if (i >= numActions) {
-                        throw new IllegalArgumentException(String.format(
-                                "setShowActionsInCompactView: action %d out of bounds (max %d)",
-                                i, numActions - 1));
-                    }
-
+            if (numActionsToShow > numActions) {
+                throw new IllegalArgumentException(String.format(
+                        "setShowActionsInCompactView: action %d out of bounds (max %d)",
+                        numActions, numActions - 1));
+            }
+            for (int i = 0; i < MAX_MEDIA_BUTTONS_IN_COMPACT; i++) {
+                if (i < numActionsToShow) {
                     final Action action = mBuilder.mActions.get(mActionsToShowInCompact[i]);
-                    final RemoteViews button = generateMediaActionButton(action);
-                    view.addView(com.android.internal.R.id.media_actions, button);
+                    bindMediaActionButton(view, MEDIA_BUTTON_IDS[i], action, p);
+                } else {
+                    view.setViewVisibility(MEDIA_BUTTON_IDS[i], View.GONE);
                 }
             }
-            styleText(view);
-            hideRightIcon(view);
+            bindMediaActionButton(view, R.id.media_seamless, new Action(
+                    R.drawable.ic_media_seamless, mBuilder.mContext.getString(
+                            com.android.internal.R.string.ext_media_seamless_action), null), p);
+            view.setViewVisibility(R.id.media_seamless, View.GONE);
+            handleImage(view);
+            // handle the content margin
+            int endMargin = R.dimen.notification_content_margin_end;
+            if (mBuilder.mN.hasLargeIcon()) {
+                endMargin = R.dimen.notification_media_image_margin_end;
+            }
+            view.setViewLayoutMarginEndDimen(R.id.notification_main_column, endMargin);
             return view;
+        }
+
+        private int getActionColor(StandardTemplateParams p) {
+            return mBuilder.isColorized(p) ? mBuilder.getPrimaryTextColor(p)
+                    : mBuilder.resolveContrastColor(p);
         }
 
         private RemoteViews makeMediaBigContentView() {
             final int actionCount = Math.min(mBuilder.mActions.size(), MAX_MEDIA_BUTTONS);
-            RemoteViews big = mBuilder.applyStandardTemplate(getBigLayoutResource(actionCount),
-                    false /* hasProgress */);
+            // Dont add an expanded view if there is no more content to be revealed
+            int actionsInCompact = mActionsToShowInCompact == null
+                    ? 0
+                    : Math.min(mActionsToShowInCompact.length, MAX_MEDIA_BUTTONS_IN_COMPACT);
+            if (!mBuilder.mN.hasLargeIcon() && actionCount <= actionsInCompact) {
+                return null;
+            }
+            StandardTemplateParams p = mBuilder.mParams.reset().hasProgress(false).fillTextsFrom(
+                    mBuilder);
+            RemoteViews big = mBuilder.applyStandardTemplate(
+                    R.layout.notification_template_material_big_media, p , null /* result */);
 
-            if (actionCount > 0) {
-                big.removeAllViews(com.android.internal.R.id.media_actions);
-                for (int i = 0; i < actionCount; i++) {
-                    final RemoteViews button = generateMediaActionButton(mBuilder.mActions.get(i));
-                    big.addView(com.android.internal.R.id.media_actions, button);
+            for (int i = 0; i < MAX_MEDIA_BUTTONS; i++) {
+                if (i < actionCount) {
+                    bindMediaActionButton(big, MEDIA_BUTTON_IDS[i], mBuilder.mActions.get(i), p);
+                } else {
+                    big.setViewVisibility(MEDIA_BUTTON_IDS[i], View.GONE);
                 }
             }
-            styleText(big);
-            hideRightIcon(big);
-            applyTopPadding(big);
-            big.setViewVisibility(android.R.id.progress, View.GONE);
+            bindMediaActionButton(big, R.id.media_seamless, new Action(R.drawable.ic_media_seamless,
+                    mBuilder.mContext.getString(
+                            com.android.internal.R.string.ext_media_seamless_action), null), p);
+            big.setViewVisibility(R.id.media_seamless, View.GONE);
+            handleImage(big);
             return big;
         }
 
-        private int getBigLayoutResource(int actionCount) {
-            if (actionCount <= 3) {
-                return R.layout.notification_template_material_big_media_narrow;
-            } else {
-                return R.layout.notification_template_material_big_media;
+        private void handleImage(RemoteViews contentView) {
+            if (mBuilder.mN.hasLargeIcon()) {
+                contentView.setViewLayoutMarginEndDimen(R.id.line1, 0);
+                contentView.setViewLayoutMarginEndDimen(R.id.text, 0);
             }
-        }
-
-        private void hideRightIcon(RemoteViews contentView) {
-            contentView.setViewVisibility(R.id.right_icon, View.GONE);
-        }
-
-        /**
-         * Applies the special text colors for media notifications to all text views.
-         */
-        private void styleText(RemoteViews contentView) {
-            int primaryColor = mBuilder.mContext.getColor(
-                    R.color.notification_media_primary_color);
-            int secondaryColor = mBuilder.mContext.getColor(
-                    R.color.notification_media_secondary_color);
-            contentView.setTextColor(R.id.title, primaryColor);
-            if (mBuilder.showsTimeOrChronometer()) {
-                if (mBuilder.mUseChronometer) {
-                    contentView.setTextColor(R.id.chronometer, secondaryColor);
-                } else {
-                    contentView.setTextColor(R.id.time, secondaryColor);
-                }
-            }
-            contentView.setTextColor(R.id.text2, secondaryColor);
-            contentView.setTextColor(R.id.text, secondaryColor);
-            contentView.setTextColor(R.id.info, secondaryColor);
         }
 
         /**
@@ -4561,6 +8542,828 @@ public class Notification implements Parcelable
             return false;
         }
     }
+
+    /**
+     * Notification style for custom views that are decorated by the system
+     *
+     * <p>Instead of providing a notification that is completely custom, a developer can set this
+     * style and still obtain system decorations like the notification header with the expand
+     * affordance and actions.
+     *
+     * <p>Use {@link android.app.Notification.Builder#setCustomContentView(RemoteViews)},
+     * {@link android.app.Notification.Builder#setCustomBigContentView(RemoteViews)} and
+     * {@link android.app.Notification.Builder#setCustomHeadsUpContentView(RemoteViews)} to set the
+     * corresponding custom views to display.
+     *
+     * To use this style with your Notification, feed it to
+     * {@link Notification.Builder#setStyle(android.app.Notification.Style)} like so:
+     * <pre class="prettyprint">
+     * Notification noti = new Notification.Builder()
+     *     .setSmallIcon(R.drawable.ic_stat_player)
+     *     .setLargeIcon(albumArtBitmap))
+     *     .setCustomContentView(contentView);
+     *     .setStyle(<b>new Notification.DecoratedCustomViewStyle()</b>)
+     *     .build();
+     * </pre>
+     */
+    public static class DecoratedCustomViewStyle extends Style {
+
+        public DecoratedCustomViewStyle() {
+        }
+
+        /**
+         * @hide
+         */
+        public boolean displayCustomViewInline() {
+            return true;
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            return makeStandardTemplateWithCustomContent(mBuilder.mN.contentView);
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeBigContentView() {
+            return makeDecoratedBigContentView();
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            return makeDecoratedHeadsUpContentView();
+        }
+
+        private RemoteViews makeDecoratedHeadsUpContentView() {
+            RemoteViews headsUpContentView = mBuilder.mN.headsUpContentView == null
+                    ? mBuilder.mN.contentView
+                    : mBuilder.mN.headsUpContentView;
+            if (mBuilder.mActions.size() == 0) {
+               return makeStandardTemplateWithCustomContent(headsUpContentView);
+            }
+            TemplateBindResult result = new TemplateBindResult();
+            RemoteViews remoteViews = mBuilder.applyStandardTemplateWithActions(
+                        mBuilder.getBigBaseLayoutResource(), result);
+            buildIntoRemoteViewContent(remoteViews, headsUpContentView, result);
+            return remoteViews;
+        }
+
+        private RemoteViews makeStandardTemplateWithCustomContent(RemoteViews customContent) {
+            TemplateBindResult result = new TemplateBindResult();
+            RemoteViews remoteViews = mBuilder.applyStandardTemplate(
+                    mBuilder.getBaseLayoutResource(), result);
+            buildIntoRemoteViewContent(remoteViews, customContent, result);
+            return remoteViews;
+        }
+
+        private RemoteViews makeDecoratedBigContentView() {
+            RemoteViews bigContentView = mBuilder.mN.bigContentView == null
+                    ? mBuilder.mN.contentView
+                    : mBuilder.mN.bigContentView;
+            if (mBuilder.mActions.size() == 0) {
+                return makeStandardTemplateWithCustomContent(bigContentView);
+            }
+            TemplateBindResult result = new TemplateBindResult();
+            RemoteViews remoteViews = mBuilder.applyStandardTemplateWithActions(
+                    mBuilder.getBigBaseLayoutResource(), result);
+            buildIntoRemoteViewContent(remoteViews, bigContentView, result);
+            return remoteViews;
+        }
+
+        private void buildIntoRemoteViewContent(RemoteViews remoteViews,
+                RemoteViews customContent, TemplateBindResult result) {
+            int childIndex = -1;
+            if (customContent != null) {
+                // Need to clone customContent before adding, because otherwise it can no longer be
+                // parceled independently of remoteViews.
+                customContent = customContent.clone();
+                remoteViews.removeAllViewsExceptId(R.id.notification_main_column, R.id.progress);
+                remoteViews.addView(R.id.notification_main_column, customContent, 0 /* index */);
+                remoteViews.addFlags(RemoteViews.FLAG_REAPPLY_DISALLOWED);
+                childIndex = 0;
+            }
+            remoteViews.setIntTag(R.id.notification_main_column,
+                    com.android.internal.R.id.notification_custom_view_index_tag,
+                    childIndex);
+            // also update the end margin if there is an image
+            Resources resources = mBuilder.mContext.getResources();
+            int endMargin = resources.getDimensionPixelSize(
+                    R.dimen.notification_content_margin_end) + result.getIconMarginEnd();
+            remoteViews.setViewLayoutMarginEnd(R.id.notification_main_column, endMargin);
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            // Comparison done for all custom RemoteViews, independent of style
+            return false;
+        }
+    }
+
+    /**
+     * Notification style for media custom views that are decorated by the system
+     *
+     * <p>Instead of providing a media notification that is completely custom, a developer can set
+     * this style and still obtain system decorations like the notification header with the expand
+     * affordance and actions.
+     *
+     * <p>Use {@link android.app.Notification.Builder#setCustomContentView(RemoteViews)},
+     * {@link android.app.Notification.Builder#setCustomBigContentView(RemoteViews)} and
+     * {@link android.app.Notification.Builder#setCustomHeadsUpContentView(RemoteViews)} to set the
+     * corresponding custom views to display.
+     * <p>
+     * Contrary to {@link MediaStyle} a developer has to opt-in to the colorizing of the
+     * notification by using {@link Notification.Builder#setColorized(boolean)}.
+     * <p>
+     * To use this style with your Notification, feed it to
+     * {@link Notification.Builder#setStyle(android.app.Notification.Style)} like so:
+     * <pre class="prettyprint">
+     * Notification noti = new Notification.Builder()
+     *     .setSmallIcon(R.drawable.ic_stat_player)
+     *     .setLargeIcon(albumArtBitmap))
+     *     .setCustomContentView(contentView);
+     *     .setStyle(<b>new Notification.DecoratedMediaCustomViewStyle()</b>
+     *          .setMediaSession(mySession))
+     *     .build();
+     * </pre>
+     *
+     * @see android.app.Notification.DecoratedCustomViewStyle
+     * @see android.app.Notification.MediaStyle
+     */
+    public static class DecoratedMediaCustomViewStyle extends MediaStyle {
+
+        public DecoratedMediaCustomViewStyle() {
+        }
+
+        /**
+         * @hide
+         */
+        public boolean displayCustomViewInline() {
+            return true;
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeContentView(boolean increasedHeight) {
+            RemoteViews remoteViews = super.makeContentView(false /* increasedHeight */);
+            return buildIntoRemoteView(remoteViews, R.id.notification_content_container,
+                    mBuilder.mN.contentView);
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeBigContentView() {
+            RemoteViews customRemoteView = mBuilder.mN.bigContentView != null
+                    ? mBuilder.mN.bigContentView
+                    : mBuilder.mN.contentView;
+            return makeBigContentViewWithCustomContent(customRemoteView);
+        }
+
+        private RemoteViews makeBigContentViewWithCustomContent(RemoteViews customRemoteView) {
+            RemoteViews remoteViews = super.makeBigContentView();
+            if (remoteViews != null) {
+                return buildIntoRemoteView(remoteViews, R.id.notification_main_column,
+                        customRemoteView);
+            } else if (customRemoteView != mBuilder.mN.contentView){
+                remoteViews = super.makeContentView(false /* increasedHeight */);
+                return buildIntoRemoteView(remoteViews, R.id.notification_content_container,
+                        customRemoteView);
+            } else {
+                return null;
+            }
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public RemoteViews makeHeadsUpContentView(boolean increasedHeight) {
+            RemoteViews customRemoteView = mBuilder.mN.headsUpContentView != null
+                    ? mBuilder.mN.headsUpContentView
+                    : mBuilder.mN.contentView;
+            return makeBigContentViewWithCustomContent(customRemoteView);
+        }
+
+        /**
+         * @hide
+         */
+        @Override
+        public boolean areNotificationsVisiblyDifferent(Style other) {
+            if (other == null || getClass() != other.getClass()) {
+                return true;
+            }
+            // Comparison done for all custom RemoteViews, independent of style
+            return false;
+        }
+
+        private RemoteViews buildIntoRemoteView(RemoteViews remoteViews, int id,
+                RemoteViews customContent) {
+            if (customContent != null) {
+                // Need to clone customContent before adding, because otherwise it can no longer be
+                // parceled independently of remoteViews.
+                customContent = customContent.clone();
+                customContent.overrideTextColors(mBuilder.getPrimaryTextColor(mBuilder.mParams));
+                remoteViews.removeAllViews(id);
+                remoteViews.addView(id, customContent);
+                remoteViews.addFlags(RemoteViews.FLAG_REAPPLY_DISALLOWED);
+            }
+            return remoteViews;
+        }
+    }
+
+    /**
+     * Encapsulates the information needed to display a notification as a bubble.
+     *
+     * <p>A bubble is used to display app content in a floating window over the existing
+     * foreground activity. A bubble has a collapsed state represented by an icon and an
+     * expanded state that displays an activity. These may be defined via
+     * {@link Builder#Builder(PendingIntent, Icon)} or they may
+     * be defined via an existing shortcut using {@link Builder#Builder(String)}.
+     * </p>
+     *
+     * <b>Notifications with a valid and allowed bubble will display in collapsed state
+     * outside of the notification shade on unlocked devices. When a user interacts with the
+     * collapsed bubble, the bubble activity will be invoked and displayed.</b>
+     *
+     * @see Notification.Builder#setBubbleMetadata(BubbleMetadata)
+     */
+    public static final class BubbleMetadata implements Parcelable {
+
+        private PendingIntent mPendingIntent;
+        private PendingIntent mDeleteIntent;
+        private Icon mIcon;
+        private int mDesiredHeight;
+        @DimenRes private int mDesiredHeightResId;
+        private int mFlags;
+        private String mShortcutId;
+
+        /**
+         * If set and the app creating the bubble is in the foreground, the bubble will be posted
+         * in its expanded state.
+         *
+         * <p>This flag has no effect if the app posting the bubble is not in the foreground.
+         * The app is considered foreground if it is visible and on the screen, note that
+         * a foreground service does not qualify.
+         * </p>
+         *
+         * <p>Generally this flag should only be set if the user has performed an action to request
+         * or create a bubble.</p>
+         *
+         * @hide
+         */
+        public static final int FLAG_AUTO_EXPAND_BUBBLE = 0x00000001;
+
+        /**
+         * Indicates whether the notification associated with the bubble is being visually
+         * suppressed from the notification shade. When <code>true</code> the notification is
+         * hidden, when <code>false</code> the notification shows as normal.
+         *
+         * <p>Apps sending bubbles may set this flag so that the bubble is posted <b>without</b>
+         * the associated notification in the notification shade.</p>
+         *
+         * <p>Apps sending bubbles can only apply this flag when the app is in the foreground,
+         * otherwise the flag is not respected. The app is considered foreground if it is visible
+         * and on the screen, note that a foreground service does not qualify.</p>
+         *
+         * <p>Generally this flag should only be set by the app if the user has performed an
+         * action to request or create a bubble, or if the user has seen the content in the
+         * notification and the notification is no longer relevant. </p>
+         *
+         * <p>The system will also update this flag with <code>true</code> to hide the notification
+         * from the user once the bubble has been expanded. </p>
+         *
+         * @hide
+         */
+        public static final int FLAG_SUPPRESS_NOTIFICATION = 0x00000002;
+
+        private BubbleMetadata(PendingIntent expandIntent, PendingIntent deleteIntent,
+                Icon icon, int height, @DimenRes int heightResId, String shortcutId) {
+            mPendingIntent = expandIntent;
+            mIcon = icon;
+            mDesiredHeight = height;
+            mDesiredHeightResId = heightResId;
+            mDeleteIntent = deleteIntent;
+            mShortcutId = shortcutId;
+        }
+
+        private BubbleMetadata(Parcel in) {
+            if (in.readInt() != 0) {
+                mPendingIntent = PendingIntent.CREATOR.createFromParcel(in);
+            }
+            if (in.readInt() != 0) {
+                mIcon = Icon.CREATOR.createFromParcel(in);
+            }
+            mDesiredHeight = in.readInt();
+            mFlags = in.readInt();
+            if (in.readInt() != 0) {
+                mDeleteIntent = PendingIntent.CREATOR.createFromParcel(in);
+            }
+            mDesiredHeightResId = in.readInt();
+            if (in.readInt() != 0) {
+                mShortcutId = in.readString8();
+            }
+        }
+
+        /**
+         * @return the shortcut id used for this bubble if created via
+         * {@link Builder#Builder(String)} or null if created
+         * via {@link Builder#Builder(PendingIntent, Icon)}.
+         */
+        @Nullable
+        public String getShortcutId() {
+            return mShortcutId;
+        }
+
+        /**
+         * @return the pending intent used to populate the floating window for this bubble, or
+         * null if this bubble is created via {@link Builder#Builder(String)}.
+         */
+        @SuppressLint("InvalidNullConversion")
+        @Nullable
+        public PendingIntent getIntent() {
+            return mPendingIntent;
+        }
+
+        /**
+         * @deprecated use {@link #getIntent()} instead.
+         * @removed Removed from the R SDK but was never publicly stable.
+         */
+        @Nullable
+        @Deprecated
+        public PendingIntent getBubbleIntent() {
+            return mPendingIntent;
+        }
+
+        /**
+         * @return the pending intent to send when the bubble is dismissed by a user, if one exists.
+         */
+        @Nullable
+        public PendingIntent getDeleteIntent() {
+            return mDeleteIntent;
+        }
+
+        /**
+         * @return the icon that will be displayed for this bubble when it is collapsed, or null
+         * if the bubble is created via {@link Builder#Builder(String)}.
+         */
+        @SuppressLint("InvalidNullConversion")
+        @Nullable
+        public Icon getIcon() {
+            return mIcon;
+        }
+
+        /**
+         * @deprecated use {@link #getIcon()} instead.
+         * @removed Removed from the R SDK but was never publicly stable.
+         */
+        @Nullable
+        @Deprecated
+        public Icon getBubbleIcon() {
+            return mIcon;
+        }
+
+        /**
+         * @return the ideal height, in DPs, for the floating window that app content defined by
+         * {@link #getIntent()} for this bubble. A value of 0 indicates a desired height has
+         * not been set.
+         */
+        @Dimension(unit = DP)
+        public int getDesiredHeight() {
+            return mDesiredHeight;
+        }
+
+        /**
+         * @return the resId of ideal height for the floating window that app content defined by
+         * {@link #getIntent()} for this bubble. A value of 0 indicates a res value has not
+         * been provided for the desired height.
+         */
+        @DimenRes
+        public int getDesiredHeightResId() {
+            return mDesiredHeightResId;
+        }
+
+        /**
+         * @return whether this bubble should auto expand when it is posted.
+         *
+         * @see BubbleMetadata.Builder#setAutoExpandBubble(boolean)
+         */
+        public boolean getAutoExpandBubble() {
+            return (mFlags & FLAG_AUTO_EXPAND_BUBBLE) != 0;
+        }
+
+        /**
+         * Indicates whether the notification associated with the bubble is being visually
+         * suppressed from the notification shade. When <code>true</code> the notification is
+         * hidden, when <code>false</code> the notification shows as normal.
+         *
+         * <p>Apps sending bubbles may set this flag so that the bubble is posted <b>without</b>
+         * the associated notification in the notification shade.</p>
+         *
+         * <p>Apps sending bubbles can only apply this flag when the app is in the foreground,
+         * otherwise the flag is not respected. The app is considered foreground if it is visible
+         * and on the screen, note that a foreground service does not qualify.</p>
+         *
+         * <p>Generally the app should only set this flag if the user has performed an
+         * action to request or create a bubble, or if the user has seen the content in the
+         * notification and the notification is no longer relevant. </p>
+         *
+         * <p>The system will update this flag with <code>true</code> to hide the notification
+         * from the user once the bubble has been expanded.</p>
+         *
+         * @return whether this bubble should suppress the notification when it is posted.
+         *
+         * @see BubbleMetadata.Builder#setSuppressNotification(boolean)
+         */
+        public boolean isNotificationSuppressed() {
+            return (mFlags & FLAG_SUPPRESS_NOTIFICATION) != 0;
+        }
+
+        public static final @android.annotation.NonNull Parcelable.Creator<BubbleMetadata> CREATOR =
+                new Parcelable.Creator<BubbleMetadata>() {
+
+                    @Override
+                    public BubbleMetadata createFromParcel(Parcel source) {
+                        return new BubbleMetadata(source);
+                    }
+
+                    @Override
+                    public BubbleMetadata[] newArray(int size) {
+                        return new BubbleMetadata[size];
+                    }
+                };
+
+        @Override
+        public int describeContents() {
+            return 0;
+        }
+
+        @Override
+        public void writeToParcel(Parcel out, int flags) {
+            out.writeInt(mPendingIntent != null ? 1 : 0);
+            if (mPendingIntent != null) {
+                mPendingIntent.writeToParcel(out, 0);
+            }
+            out.writeInt(mIcon != null ? 1 : 0);
+            if (mIcon != null) {
+                mIcon.writeToParcel(out, 0);
+            }
+            out.writeInt(mDesiredHeight);
+            out.writeInt(mFlags);
+            out.writeInt(mDeleteIntent != null ? 1 : 0);
+            if (mDeleteIntent != null) {
+                mDeleteIntent.writeToParcel(out, 0);
+            }
+            out.writeInt(mDesiredHeightResId);
+            out.writeInt(TextUtils.isEmpty(mShortcutId) ? 0 : 1);
+            if (!TextUtils.isEmpty(mShortcutId)) {
+                out.writeString8(mShortcutId);
+            }
+        }
+
+        /**
+         * @hide
+         */
+        public void setFlags(int flags) {
+            mFlags = flags;
+        }
+
+        /**
+         * @hide
+         */
+        public int getFlags() {
+            return mFlags;
+        }
+
+        /**
+         * Builder to construct a {@link BubbleMetadata} object.
+         */
+        public static final class Builder {
+
+            private PendingIntent mPendingIntent;
+            private Icon mIcon;
+            private int mDesiredHeight;
+            @DimenRes private int mDesiredHeightResId;
+            private int mFlags;
+            private PendingIntent mDeleteIntent;
+            private String mShortcutId;
+
+            /**
+             * @deprecated use {@link Builder#Builder(String)} for a bubble created via a
+             * {@link ShortcutInfo} or {@link Builder#Builder(PendingIntent, Icon)} for a bubble
+             * created via a {@link PendingIntent}.
+             */
+            @Deprecated
+            public Builder() {
+            }
+
+            /**
+             * Creates a {@link BubbleMetadata.Builder} based on a {@link ShortcutInfo}. To create
+             * a shortcut bubble, ensure that the shortcut associated with the provided
+             * {@param shortcutId} is published as a dynamic shortcut that was built with
+             * {@link ShortcutInfo.Builder#setLongLived(boolean)} being true, otherwise your
+             * notification will not be able to bubble.
+             *
+             * <p>The shortcut icon will be used to represent the bubble when it is collapsed.</p>
+             *
+             * <p>The shortcut activity will be used when the bubble is expanded. This will display
+             * the shortcut activity in a floating window over the existing foreground activity.</p>
+             *
+             * <p>If the shortcut has not been published when the bubble notification is sent,
+             * no bubble will be produced. If the shortcut is deleted while the bubble is active,
+             * the bubble will be removed.</p>
+             *
+             * @throws NullPointerException if shortcutId is null.
+             *
+             * @see ShortcutInfo
+             * @see ShortcutInfo.Builder#setLongLived(boolean)
+             * @see android.content.pm.ShortcutManager#addDynamicShortcuts(List)
+             */
+            public Builder(@NonNull String shortcutId) {
+                if (TextUtils.isEmpty(shortcutId)) {
+                    throw new NullPointerException("Bubble requires a non-null shortcut id");
+                }
+                mShortcutId = shortcutId;
+            }
+
+            /**
+             * Creates a {@link BubbleMetadata.Builder} based on the provided intent and icon.
+             *
+             * <p>The icon will be used to represent the bubble when it is collapsed. An icon
+             * should be representative of the content within the bubble. If your app produces
+             * multiple bubbles, the icon should be unique for each of them.</p>
+             *
+             * <p>The intent that will be used when the bubble is expanded. This will display the
+             * app content in a floating window over the existing foreground activity. The intent
+             * should point to a resizable activity. </p>
+             *
+             * @throws NullPointerException if intent is null.
+             * @throws NullPointerException if icon is null.
+             */
+            public Builder(@NonNull PendingIntent intent, @NonNull Icon icon) {
+                if (intent == null) {
+                    throw new NullPointerException("Bubble requires non-null pending intent");
+                }
+                if (icon == null) {
+                    throw new NullPointerException("Bubbles require non-null icon");
+                }
+                if (icon.getType() != TYPE_URI_ADAPTIVE_BITMAP
+                        && icon.getType() != TYPE_URI) {
+                    Log.w(TAG, "Bubbles work best with icons of TYPE_URI or "
+                            + "TYPE_URI_ADAPTIVE_BITMAP. "
+                            + "In the future, using an icon of this type will be required.");
+                }
+                mPendingIntent = intent;
+                mIcon = icon;
+            }
+
+            /**
+             * @deprecated use {@link Builder#Builder(String)} instead.
+             * @removed Removed from the R SDK but was never publicly stable.
+             */
+            @NonNull
+            @Deprecated
+            public BubbleMetadata.Builder createShortcutBubble(@NonNull String shortcutId) {
+                if (!TextUtils.isEmpty(shortcutId)) {
+                    // If shortcut id is set, we don't use these if they were previously set.
+                    mPendingIntent = null;
+                    mIcon = null;
+                }
+                mShortcutId = shortcutId;
+                return this;
+            }
+
+            /**
+             * @deprecated use {@link Builder#Builder(PendingIntent, Icon)} instead.
+             * @removed Removed from the R SDK but was never publicly stable.
+             */
+            @NonNull
+            @Deprecated
+            public BubbleMetadata.Builder createIntentBubble(@NonNull PendingIntent intent,
+                    @NonNull Icon icon) {
+                if (intent == null) {
+                    throw new IllegalArgumentException("Bubble requires non-null pending intent");
+                }
+                if (icon == null) {
+                    throw new IllegalArgumentException("Bubbles require non-null icon");
+                }
+                if (icon.getType() != TYPE_URI_ADAPTIVE_BITMAP
+                        && icon.getType() != TYPE_URI) {
+                    Log.w(TAG, "Bubbles work best with icons of TYPE_URI or "
+                            + "TYPE_URI_ADAPTIVE_BITMAP. "
+                            + "In the future, using an icon of this type will be required.");
+                }
+                mShortcutId = null;
+                mPendingIntent = intent;
+                mIcon = icon;
+                return this;
+            }
+
+            /**
+             * Sets the intent for the bubble.
+             *
+             * <p>The intent that will be used when the bubble is expanded. This will display the
+             * app content in a floating window over the existing foreground activity. The intent
+             * should point to a resizable activity. </p>
+             *
+             * @throws NullPointerException  if intent is null.
+             * @throws IllegalStateException if this builder was created via
+             *                               {@link Builder#Builder(String)}.
+             */
+            @NonNull
+            public BubbleMetadata.Builder setIntent(@NonNull PendingIntent intent) {
+                if (mShortcutId != null) {
+                    throw new IllegalStateException("Created as a shortcut bubble, cannot set a "
+                            + "PendingIntent. Consider using "
+                            + "BubbleMetadata.Builder(PendingIntent,Icon) instead.");
+                }
+                if (intent == null) {
+                    throw new NullPointerException("Bubble requires non-null pending intent");
+                }
+                mPendingIntent = intent;
+                return this;
+            }
+
+            /**
+             * Sets the icon for the bubble. Can only be used if the bubble was created
+             * via {@link Builder#Builder(PendingIntent, Icon)}.
+             *
+             * <p>The icon will be used to represent the bubble when it is collapsed. An icon
+             * should be representative of the content within the bubble. If your app produces
+             * multiple bubbles, the icon should be unique for each of them.</p>
+             *
+             * <p>It is recommended to use an {@link Icon} of type {@link Icon#TYPE_URI}
+             * or {@link Icon#TYPE_URI_ADAPTIVE_BITMAP}</p>
+             *
+             * @throws NullPointerException  if icon is null.
+             * @throws IllegalStateException if this builder was created via
+             *                               {@link Builder#Builder(String)}.
+             */
+            @NonNull
+            public BubbleMetadata.Builder setIcon(@NonNull Icon icon) {
+                if (mShortcutId != null) {
+                    throw new IllegalStateException("Created as a shortcut bubble, cannot set an "
+                            + "Icon. Consider using "
+                            + "BubbleMetadata.Builder(PendingIntent,Icon) instead.");
+                }
+                if (icon == null) {
+                    throw new NullPointerException("Bubbles require non-null icon");
+                }
+                if (icon.getType() != TYPE_URI_ADAPTIVE_BITMAP
+                        && icon.getType() != TYPE_URI) {
+                    Log.w(TAG, "Bubbles work best with icons of TYPE_URI or "
+                            + "TYPE_URI_ADAPTIVE_BITMAP. "
+                            + "In the future, using an icon of this type will be required.");
+                }
+                mIcon = icon;
+                return this;
+            }
+
+            /**
+             * Sets the desired height in DPs for the expanded content of the bubble.
+             *
+             * <p>This height may not be respected if there is not enough space on the screen or if
+             * the provided height is too small to be useful.</p>
+             *
+             * <p>If {@link #setDesiredHeightResId(int)} was previously called on this builder, the
+             * previous value set will be cleared after calling this method, and this value will
+             * be used instead.</p>
+             *
+             * <p>A desired height (in DPs or via resID) is optional.</p>
+             *
+             * @see #setDesiredHeightResId(int)
+             */
+            @NonNull
+            public BubbleMetadata.Builder setDesiredHeight(@Dimension(unit = DP) int height) {
+                mDesiredHeight = Math.max(height, 0);
+                mDesiredHeightResId = 0;
+                return this;
+            }
+
+
+            /**
+             * Sets the desired height via resId for the expanded content of the bubble.
+             *
+             * <p>This height may not be respected if there is not enough space on the screen or if
+             * the provided height is too small to be useful.</p>
+             *
+             * <p>If {@link #setDesiredHeight(int)} was previously called on this builder, the
+             * previous value set will be cleared after calling this method, and this value will
+             * be used instead.</p>
+             *
+             * <p>A desired height (in DPs or via resID) is optional.</p>
+             *
+             * @see #setDesiredHeight(int)
+             */
+            @NonNull
+            public BubbleMetadata.Builder setDesiredHeightResId(@DimenRes int heightResId) {
+                mDesiredHeightResId = heightResId;
+                mDesiredHeight = 0;
+                return this;
+            }
+
+            /**
+             * Sets whether the bubble will be posted in its expanded state.
+             *
+             * <p>This flag has no effect if the app posting the bubble is not in the foreground.
+             * The app is considered foreground if it is visible and on the screen, note that
+             * a foreground service does not qualify.
+             * </p>
+             *
+             * <p>Generally, this flag should only be set if the user has performed an action to
+             * request or create a bubble.</p>
+             *
+             * <p>Setting this flag is optional; it defaults to false.</p>
+             */
+            @NonNull
+            public BubbleMetadata.Builder setAutoExpandBubble(boolean shouldExpand) {
+                setFlag(FLAG_AUTO_EXPAND_BUBBLE, shouldExpand);
+                return this;
+            }
+
+            /**
+             * Sets whether the bubble will be posted <b>without</b> the associated notification in
+             * the notification shade.
+             *
+             * <p>This flag has no effect if the app posting the bubble is not in the foreground.
+             * The app is considered foreground if it is visible and on the screen, note that
+             * a foreground service does not qualify.
+             * </p>
+             *
+             * <p>Generally, this flag should only be set if the user has performed an action to
+             * request or create a bubble, or if the user has seen the content in the notification
+             * and the notification is no longer relevant.</p>
+             *
+             * <p>Setting this flag is optional; it defaults to false.</p>
+             */
+            @NonNull
+            public BubbleMetadata.Builder setSuppressNotification(boolean shouldSuppressNotif) {
+                setFlag(FLAG_SUPPRESS_NOTIFICATION, shouldSuppressNotif);
+                return this;
+            }
+
+            /**
+             * Sets an intent to send when this bubble is explicitly removed by the user.
+             *
+             * <p>Setting a delete intent is optional.</p>
+             */
+            @NonNull
+            public BubbleMetadata.Builder setDeleteIntent(@Nullable PendingIntent deleteIntent) {
+                mDeleteIntent = deleteIntent;
+                return this;
+            }
+
+            /**
+             * Creates the {@link BubbleMetadata} defined by this builder.
+             *
+             * @throws NullPointerException if required elements have not been set.
+             */
+            @NonNull
+            public BubbleMetadata build() {
+                if (mShortcutId == null && mPendingIntent == null) {
+                    throw new NullPointerException(
+                            "Must supply pending intent or shortcut to bubble");
+                }
+                if (mShortcutId == null && mIcon == null) {
+                    throw new NullPointerException(
+                            "Must supply an icon or shortcut for the bubble");
+                }
+                BubbleMetadata data = new BubbleMetadata(mPendingIntent, mDeleteIntent,
+                        mIcon, mDesiredHeight, mDesiredHeightResId, mShortcutId);
+                data.setFlags(mFlags);
+                return data;
+            }
+
+            /**
+             * @hide
+             */
+            public BubbleMetadata.Builder setFlag(int mask, boolean value) {
+                if (value) {
+                    mFlags |= mask;
+                } else {
+                    mFlags &= ~mask;
+                }
+                return this;
+            }
+        }
+    }
+
 
     // When adding a new Style subclass here, don't forget to update
     // Builder.getNotificationStyleClass.
@@ -4630,7 +9433,10 @@ public class Notification implements Parcelable
          * <p>For custom display notifications created using {@link #setDisplayIntent},
          * the default is {@link #SIZE_MEDIUM}. All other notifications size automatically based
          * on their content.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_DEFAULT = 0;
 
         /**
@@ -4638,7 +9444,10 @@ public class Notification implements Parcelable
          * with an extra small size.
          * <p>This value is only applicable for custom display notifications created using
          * {@link #setDisplayIntent}.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_XSMALL = 1;
 
         /**
@@ -4646,7 +9455,10 @@ public class Notification implements Parcelable
          * with a small size.
          * <p>This value is only applicable for custom display notifications created using
          * {@link #setDisplayIntent}.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_SMALL = 2;
 
         /**
@@ -4654,7 +9466,10 @@ public class Notification implements Parcelable
          * with a medium size.
          * <p>This value is only applicable for custom display notifications created using
          * {@link #setDisplayIntent}.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_MEDIUM = 3;
 
         /**
@@ -4662,7 +9477,10 @@ public class Notification implements Parcelable
          * with a large size.
          * <p>This value is only applicable for custom display notifications created using
          * {@link #setDisplayIntent}.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_LARGE = 4;
 
         /**
@@ -4670,20 +9488,29 @@ public class Notification implements Parcelable
          * full screen.
          * <p>This value is only applicable for custom display notifications created using
          * {@link #setDisplayIntent}.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public static final int SIZE_FULL_SCREEN = 5;
 
         /**
          * Sentinel value for use with {@link #setHintScreenTimeout} to keep the screen on for a
          * short amount of time when this notification is displayed on the screen. This
          * is the default value.
+         *
+         * @deprecated This feature is no longer supported.
          */
+        @Deprecated
         public static final int SCREEN_TIMEOUT_SHORT = 0;
 
         /**
          * Sentinel value for use with {@link #setHintScreenTimeout} to keep the screen on
          * for a longer amount of time when this notification is displayed on the screen.
+         *
+         * @deprecated This feature is no longer supported.
          */
+        @Deprecated
         public static final int SCREEN_TIMEOUT_LONG = -1;
 
         /** Notification extra which contains wearable extensions */
@@ -4702,6 +9529,8 @@ public class Notification implements Parcelable
         private static final String KEY_CUSTOM_CONTENT_HEIGHT = "customContentHeight";
         private static final String KEY_GRAVITY = "gravity";
         private static final String KEY_HINT_SCREEN_TIMEOUT = "hintScreenTimeout";
+        private static final String KEY_DISMISSAL_ID = "dismissalId";
+        private static final String KEY_BRIDGE_TAG = "bridgeTag";
 
         // Flags bitwise-ored to mFlags
         private static final int FLAG_CONTENT_INTENT_AVAILABLE_OFFLINE = 0x1;
@@ -4709,6 +9538,8 @@ public class Notification implements Parcelable
         private static final int FLAG_HINT_SHOW_BACKGROUND_ONLY = 1 << 2;
         private static final int FLAG_START_SCROLL_BOTTOM = 1 << 3;
         private static final int FLAG_HINT_AVOID_BACKGROUND_CLIPPING = 1 << 4;
+        private static final int FLAG_BIG_PICTURE_AMBIENT = 1 << 5;
+        private static final int FLAG_HINT_CONTENT_INTENT_LAUNCHES_ACTIVITY = 1 << 6;
 
         // Default value for flags integer
         private static final int DEFAULT_FLAGS = FLAG_CONTENT_INTENT_AVAILABLE_OFFLINE;
@@ -4728,6 +9559,8 @@ public class Notification implements Parcelable
         private int mCustomContentHeight;
         private int mGravity = DEFAULT_GRAVITY;
         private int mHintScreenTimeout;
+        private String mDismissalId;
+        private String mBridgeTag;
 
         /**
          * Create a {@link android.app.Notification.WearableExtender} with default
@@ -4747,8 +9580,8 @@ public class Notification implements Parcelable
                 mFlags = wearableBundle.getInt(KEY_FLAGS, DEFAULT_FLAGS);
                 mDisplayIntent = wearableBundle.getParcelable(KEY_DISPLAY_INTENT);
 
-                Notification[] pages = getNotificationArrayFromBundle(
-                        wearableBundle, KEY_PAGES);
+                Notification[] pages = getParcelableArrayFromBundle(
+                        wearableBundle, KEY_PAGES, Notification.class);
                 if (pages != null) {
                     Collections.addAll(mPages, pages);
                 }
@@ -4764,6 +9597,8 @@ public class Notification implements Parcelable
                 mCustomContentHeight = wearableBundle.getInt(KEY_CUSTOM_CONTENT_HEIGHT);
                 mGravity = wearableBundle.getInt(KEY_GRAVITY, DEFAULT_GRAVITY);
                 mHintScreenTimeout = wearableBundle.getInt(KEY_HINT_SCREEN_TIMEOUT);
+                mDismissalId = wearableBundle.getString(KEY_DISMISSAL_ID);
+                mBridgeTag = wearableBundle.getString(KEY_BRIDGE_TAG);
             }
         }
 
@@ -4814,6 +9649,12 @@ public class Notification implements Parcelable
             if (mHintScreenTimeout != 0) {
                 wearableBundle.putInt(KEY_HINT_SCREEN_TIMEOUT, mHintScreenTimeout);
             }
+            if (mDismissalId != null) {
+                wearableBundle.putString(KEY_DISMISSAL_ID, mDismissalId);
+            }
+            if (mBridgeTag != null) {
+                wearableBundle.putString(KEY_BRIDGE_TAG, mBridgeTag);
+            }
 
             builder.getExtras().putBundle(EXTRA_WEARABLE_EXTENSIONS, wearableBundle);
             return builder;
@@ -4834,6 +9675,8 @@ public class Notification implements Parcelable
             that.mCustomContentHeight = this.mCustomContentHeight;
             that.mGravity = this.mGravity;
             that.mHintScreenTimeout = this.mHintScreenTimeout;
+            that.mDismissalId = this.mDismissalId;
+            that.mBridgeTag = this.mBridgeTag;
             return that;
         }
 
@@ -4917,7 +9760,9 @@ public class Notification implements Parcelable
          * @param intent the {@link PendingIntent} for an activity
          * @return this object for method chaining
          * @see android.app.Notification.WearableExtender#getDisplayIntent
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public WearableExtender setDisplayIntent(PendingIntent intent) {
             mDisplayIntent = intent;
             return this;
@@ -4926,7 +9771,10 @@ public class Notification implements Parcelable
         /**
          * Get the intent to launch inside of an activity view when displaying this
          * notification. This {@code PendingIntent} should be for an activity.
+         *
+         * @deprecated Display intents are no longer supported.
          */
+        @Deprecated
         public PendingIntent getDisplayIntent() {
             return mDisplayIntent;
         }
@@ -4940,7 +9788,9 @@ public class Notification implements Parcelable
          * @param page the notification to add as another page
          * @return this object for method chaining
          * @see android.app.Notification.WearableExtender#getPages
+         * @deprecated Multiple content pages are no longer supported.
          */
+        @Deprecated
         public WearableExtender addPage(Notification page) {
             mPages.add(page);
             return this;
@@ -4955,7 +9805,9 @@ public class Notification implements Parcelable
          * @param pages a list of notifications
          * @return this object for method chaining
          * @see android.app.Notification.WearableExtender#getPages
+         * @deprecated Multiple content pages are no longer supported.
          */
+        @Deprecated
         public WearableExtender addPages(List<Notification> pages) {
             mPages.addAll(pages);
             return this;
@@ -4965,7 +9817,9 @@ public class Notification implements Parcelable
          * Clear all additional pages present on this builder.
          * @return this object for method chaining.
          * @see #addPage
+         * @deprecated Multiple content pages are no longer supported.
          */
+        @Deprecated
         public WearableExtender clearPages() {
             mPages.clear();
             return this;
@@ -4977,7 +9831,9 @@ public class Notification implements Parcelable
          * subsequent pages. This field can be used to separate a notification into multiple
          * sections.
          * @return the pages for this notification
+         * @deprecated Multiple content pages are no longer supported.
          */
+        @Deprecated
         public List<Notification> getPages() {
             return mPages;
         }
@@ -4990,7 +9846,9 @@ public class Notification implements Parcelable
          * @param background the background bitmap
          * @return this object for method chaining
          * @see android.app.Notification.WearableExtender#getBackground
+         * @deprecated Background images are no longer supported.
          */
+        @Deprecated
         public WearableExtender setBackground(Bitmap background) {
             mBackground = background;
             return this;
@@ -5003,7 +9861,9 @@ public class Notification implements Parcelable
          *
          * @return the background image
          * @see android.app.Notification.WearableExtender#setBackground
+         * @deprecated Background images are no longer supported.
          */
+        @Deprecated
         public Bitmap getBackground() {
             return mBackground;
         }
@@ -5011,6 +9871,7 @@ public class Notification implements Parcelable
         /**
          * Set an icon that goes with the content of this notification.
          */
+        @Deprecated
         public WearableExtender setContentIcon(int icon) {
             mContentIcon = icon;
             return this;
@@ -5019,6 +9880,7 @@ public class Notification implements Parcelable
         /**
          * Get an icon that goes with the content of this notification.
          */
+        @Deprecated
         public int getContentIcon() {
             return mContentIcon;
         }
@@ -5029,6 +9891,7 @@ public class Notification implements Parcelable
          * {@link android.view.Gravity#END}. The default value is {@link android.view.Gravity#END}.
          * @see #setContentIcon
          */
+        @Deprecated
         public WearableExtender setContentIconGravity(int contentIconGravity) {
             mContentIconGravity = contentIconGravity;
             return this;
@@ -5040,20 +9903,17 @@ public class Notification implements Parcelable
          * {@link android.view.Gravity#END}. The default value is {@link android.view.Gravity#END}.
          * @see #getContentIcon
          */
+        @Deprecated
         public int getContentIconGravity() {
             return mContentIconGravity;
         }
 
         /**
-         * Set an action from this notification's actions to be clickable with the content of
-         * this notification. This action will no longer display separately from the
-         * notification's content.
+         * Set an action from this notification's actions as the primary action. If the action has a
+         * {@link RemoteInput} associated with it, shortcuts to the options for that input are shown
+         * directly on the notification.
          *
-         * <p>For notifications with multiple pages, child pages can also have content actions
-         * set, although the list of available actions comes from the main notification and not
-         * from the child page's notification.
-         *
-         * @param actionIndex The index of the action to hoist onto the current notification page.
+         * @param actionIndex The index of the primary action.
          *                    If wearable actions were added to the main notification, this index
          *                    will apply to that list, otherwise it will apply to the regular
          *                    actions list.
@@ -5064,13 +9924,8 @@ public class Notification implements Parcelable
         }
 
         /**
-         * Get the index of the notification action, if any, that was specified as being clickable
-         * with the content of this notification. This action will no longer display separately
-         * from the notification's content.
-         *
-         * <p>For notifications with multiple pages, child pages can also have content actions
-         * set, although the list of available actions comes from the main notification and not
-         * from the child page's notification.
+         * Get the index of the notification action, if any, that was specified as the primary
+         * action.
          *
          * <p>If wearable specific actions were added to the main notification, this index will
          * apply to that list, otherwise it will apply to the regular actions list.
@@ -5087,6 +9942,7 @@ public class Notification implements Parcelable
          * {@link android.view.Gravity#CENTER_VERTICAL} and {@link android.view.Gravity#BOTTOM}.
          * The default value is {@link android.view.Gravity#BOTTOM}.
          */
+        @Deprecated
         public WearableExtender setGravity(int gravity) {
             mGravity = gravity;
             return this;
@@ -5098,6 +9954,7 @@ public class Notification implements Parcelable
          * {@link android.view.Gravity#CENTER_VERTICAL} and {@link android.view.Gravity#BOTTOM}.
          * The default value is {@link android.view.Gravity#BOTTOM}.
          */
+        @Deprecated
         public int getGravity() {
             return mGravity;
         }
@@ -5111,6 +9968,7 @@ public class Notification implements Parcelable
          * documentation for the preset in question. See also
          * {@link #setCustomContentHeight} and {@link #getCustomSizePreset}.
          */
+        @Deprecated
         public WearableExtender setCustomSizePreset(int sizePreset) {
             mCustomSizePreset = sizePreset;
             return this;
@@ -5124,6 +9982,7 @@ public class Notification implements Parcelable
          * using {@link #setDisplayIntent}. Check the documentation for the preset in question.
          * See also {@link #setCustomContentHeight} and {@link #setCustomSizePreset}.
          */
+        @Deprecated
         public int getCustomSizePreset() {
             return mCustomSizePreset;
         }
@@ -5135,6 +9994,7 @@ public class Notification implements Parcelable
          * {@link android.app.Notification.WearableExtender#setCustomSizePreset} and
          * {@link #getCustomContentHeight}.
          */
+        @Deprecated
         public WearableExtender setCustomContentHeight(int height) {
             mCustomContentHeight = height;
             return this;
@@ -5146,6 +10006,7 @@ public class Notification implements Parcelable
          * using {@link #setDisplayIntent}. See also {@link #setCustomSizePreset} and
          * {@link #setCustomContentHeight}.
          */
+        @Deprecated
         public int getCustomContentHeight() {
             return mCustomContentHeight;
         }
@@ -5196,6 +10057,7 @@ public class Notification implements Parcelable
          * @param hintHideIcon {@code true} to hide the icon, {@code false} otherwise.
          * @return this object for method chaining
          */
+        @Deprecated
         public WearableExtender setHintHideIcon(boolean hintHideIcon) {
             setFlag(FLAG_HINT_HIDE_ICON, hintHideIcon);
             return this;
@@ -5206,6 +10068,7 @@ public class Notification implements Parcelable
          * @return {@code true} if this icon should not be displayed, false otherwise.
          * The default value is {@code false} if this was never set.
          */
+        @Deprecated
         public boolean getHintHideIcon() {
             return (mFlags & FLAG_HINT_HIDE_ICON) != 0;
         }
@@ -5215,6 +10078,7 @@ public class Notification implements Parcelable
          * displayed, and other semantic content should be hidden. This hint is only applicable
          * to sub-pages added using {@link #addPage}.
          */
+        @Deprecated
         public WearableExtender setHintShowBackgroundOnly(boolean hintShowBackgroundOnly) {
             setFlag(FLAG_HINT_SHOW_BACKGROUND_ONLY, hintShowBackgroundOnly);
             return this;
@@ -5225,6 +10089,7 @@ public class Notification implements Parcelable
          * displayed, and other semantic content should be hidden. This hint is only applicable
          * to sub-pages added using {@link android.app.Notification.WearableExtender#addPage}.
          */
+        @Deprecated
         public boolean getHintShowBackgroundOnly() {
             return (mFlags & FLAG_HINT_SHOW_BACKGROUND_ONLY) != 0;
         }
@@ -5236,6 +10101,7 @@ public class Notification implements Parcelable
          * @param hintAvoidBackgroundClipping {@code true} to avoid clipping if possible.
          * @return this object for method chaining
          */
+        @Deprecated
         public WearableExtender setHintAvoidBackgroundClipping(
                 boolean hintAvoidBackgroundClipping) {
             setFlag(FLAG_HINT_AVOID_BACKGROUND_CLIPPING, hintAvoidBackgroundClipping);
@@ -5249,6 +10115,7 @@ public class Notification implements Parcelable
          * @return {@code true} if it's ok if the background is clipped on the screen, false
          * otherwise. The default value is {@code false} if this was never set.
          */
+        @Deprecated
         public boolean getHintAvoidBackgroundClipping() {
             return (mFlags & FLAG_HINT_AVOID_BACKGROUND_CLIPPING) != 0;
         }
@@ -5260,6 +10127,7 @@ public class Notification implements Parcelable
          *     {@link #SCREEN_TIMEOUT_SHORT} or {@link #SCREEN_TIMEOUT_LONG}.
          * @return this object for method chaining
          */
+        @Deprecated
         public WearableExtender setHintScreenTimeout(int timeout) {
             mHintScreenTimeout = timeout;
             return this;
@@ -5271,8 +10139,102 @@ public class Notification implements Parcelable
          * @return the duration in milliseconds if > 0, or either one of the sentinel values
          *     {@link #SCREEN_TIMEOUT_SHORT} or {@link #SCREEN_TIMEOUT_LONG}.
          */
+        @Deprecated
         public int getHintScreenTimeout() {
             return mHintScreenTimeout;
+        }
+
+        /**
+         * Set a hint that this notification's {@link BigPictureStyle} (if present) should be
+         * converted to low-bit and displayed in ambient mode, especially useful for barcodes and
+         * qr codes, as well as other simple black-and-white tickets.
+         * @param hintAmbientBigPicture {@code true} to enable converstion and ambient.
+         * @return this object for method chaining
+         * @deprecated This feature is no longer supported.
+         */
+        @Deprecated
+        public WearableExtender setHintAmbientBigPicture(boolean hintAmbientBigPicture) {
+            setFlag(FLAG_BIG_PICTURE_AMBIENT, hintAmbientBigPicture);
+            return this;
+        }
+
+        /**
+         * Get a hint that this notification's {@link BigPictureStyle} (if present) should be
+         * converted to low-bit and displayed in ambient mode, especially useful for barcodes and
+         * qr codes, as well as other simple black-and-white tickets.
+         * @return {@code true} if it should be displayed in ambient, false otherwise
+         * otherwise. The default value is {@code false} if this was never set.
+         * @deprecated This feature is no longer supported.
+         */
+        @Deprecated
+        public boolean getHintAmbientBigPicture() {
+            return (mFlags & FLAG_BIG_PICTURE_AMBIENT) != 0;
+        }
+
+        /**
+         * Set a hint that this notification's content intent will launch an {@link Activity}
+         * directly, telling the platform that it can generate the appropriate transitions.
+         * @param hintContentIntentLaunchesActivity {@code true} if the content intent will launch
+         * an activity and transitions should be generated, false otherwise.
+         * @return this object for method chaining
+         */
+        public WearableExtender setHintContentIntentLaunchesActivity(
+                boolean hintContentIntentLaunchesActivity) {
+            setFlag(FLAG_HINT_CONTENT_INTENT_LAUNCHES_ACTIVITY, hintContentIntentLaunchesActivity);
+            return this;
+        }
+
+        /**
+         * Get a hint that this notification's content intent will launch an {@link Activity}
+         * directly, telling the platform that it can generate the appropriate transitions
+         * @return {@code true} if the content intent will launch an activity and transitions should
+         * be generated, false otherwise. The default value is {@code false} if this was never set.
+         */
+        public boolean getHintContentIntentLaunchesActivity() {
+            return (mFlags & FLAG_HINT_CONTENT_INTENT_LAUNCHES_ACTIVITY) != 0;
+        }
+
+        /**
+         * Sets the dismissal id for this notification. If a notification is posted with a
+         * dismissal id, then when that notification is canceled, notifications on other wearables
+         * and the paired Android phone having that same dismissal id will also be canceled. See
+         * <a href="{@docRoot}wear/notifications/index.html">Adding Wearable Features to
+         * Notifications</a> for more information.
+         * @param dismissalId the dismissal id of the notification.
+         * @return this object for method chaining
+         */
+        public WearableExtender setDismissalId(String dismissalId) {
+            mDismissalId = dismissalId;
+            return this;
+        }
+
+        /**
+         * Returns the dismissal id of the notification.
+         * @return the dismissal id of the notification or null if it has not been set.
+         */
+        public String getDismissalId() {
+            return mDismissalId;
+        }
+
+        /**
+         * Sets a bridge tag for this notification. A bridge tag can be set for notifications
+         * posted from a phone to provide finer-grained control on what notifications are bridged
+         * to wearables. See <a href="{@docRoot}wear/notifications/index.html">Adding Wearable
+         * Features to Notifications</a> for more information.
+         * @param bridgeTag the bridge tag of the notification.
+         * @return this object for method chaining
+         */
+        public WearableExtender setBridgeTag(String bridgeTag) {
+            mBridgeTag = bridgeTag;
+            return this;
+        }
+
+        /**
+         * Returns the bridge tag of the notification.
+         * @return the bridge tag or null if not present.
+         */
+        public String getBridgeTag() {
+            return mBridgeTag;
         }
 
         private void setFlag(int mask, boolean value) {
@@ -5386,7 +10348,7 @@ public class Notification implements Parcelable
         /**
          * Gets the accent color.
          *
-         * @see setColor
+         * @see #setColor
          */
         @ColorInt
         public int getColor() {
@@ -5683,17 +10645,216 @@ public class Notification implements Parcelable
     }
 
     /**
-     * Get an array of Notification objects from a parcelable array bundle field.
+     * <p>Helper class to add Android TV extensions to notifications. To create a notification
+     * with a TV extension:
+     *
+     * <ol>
+     *  <li>Create an {@link Notification.Builder}, setting any desired properties.
+     *  <li>Create a {@link TvExtender}.
+     *  <li>Set TV-specific properties using the {@code set} methods of
+     *  {@link TvExtender}.
+     *  <li>Call {@link Notification.Builder#extend(Notification.Extender)}
+     *  to apply the extension to a notification.
+     * </ol>
+     *
+     * <pre class="prettyprint">
+     * Notification notification = new Notification.Builder(context)
+     *         ...
+     *         .extend(new TvExtender()
+     *                 .set*(...))
+     *         .build();
+     * </pre>
+     *
+     * <p>TV extensions can be accessed on an existing notification by using the
+     * {@code TvExtender(Notification)} constructor, and then using the {@code get} methods
+     * to access values.
+     *
+     * @hide
+     */
+    @SystemApi
+    public static final class TvExtender implements Extender {
+        private static final String TAG = "TvExtender";
+
+        private static final String EXTRA_TV_EXTENDER = "android.tv.EXTENSIONS";
+        private static final String EXTRA_FLAGS = "flags";
+        private static final String EXTRA_CONTENT_INTENT = "content_intent";
+        private static final String EXTRA_DELETE_INTENT = "delete_intent";
+        private static final String EXTRA_CHANNEL_ID = "channel_id";
+        private static final String EXTRA_SUPPRESS_SHOW_OVER_APPS = "suppressShowOverApps";
+
+        // Flags bitwise-ored to mFlags
+        private static final int FLAG_AVAILABLE_ON_TV = 0x1;
+
+        private int mFlags;
+        private String mChannelId;
+        private PendingIntent mContentIntent;
+        private PendingIntent mDeleteIntent;
+        private boolean mSuppressShowOverApps;
+
+        /**
+         * Create a {@link TvExtender} with default options.
+         */
+        public TvExtender() {
+            mFlags = FLAG_AVAILABLE_ON_TV;
+        }
+
+        /**
+         * Create a {@link TvExtender} from the TvExtender options of an existing Notification.
+         *
+         * @param notif The notification from which to copy options.
+         */
+        public TvExtender(Notification notif) {
+            Bundle bundle = notif.extras == null ?
+                null : notif.extras.getBundle(EXTRA_TV_EXTENDER);
+            if (bundle != null) {
+                mFlags = bundle.getInt(EXTRA_FLAGS);
+                mChannelId = bundle.getString(EXTRA_CHANNEL_ID);
+                mSuppressShowOverApps = bundle.getBoolean(EXTRA_SUPPRESS_SHOW_OVER_APPS);
+                mContentIntent = bundle.getParcelable(EXTRA_CONTENT_INTENT);
+                mDeleteIntent = bundle.getParcelable(EXTRA_DELETE_INTENT);
+            }
+        }
+
+        /**
+         * Apply a TV extension to a notification that is being built. This is typically called by
+         * the {@link Notification.Builder#extend(Notification.Extender)}
+         * method of {@link Notification.Builder}.
+         */
+        @Override
+        public Notification.Builder extend(Notification.Builder builder) {
+            Bundle bundle = new Bundle();
+
+            bundle.putInt(EXTRA_FLAGS, mFlags);
+            bundle.putString(EXTRA_CHANNEL_ID, mChannelId);
+            bundle.putBoolean(EXTRA_SUPPRESS_SHOW_OVER_APPS, mSuppressShowOverApps);
+            if (mContentIntent != null) {
+                bundle.putParcelable(EXTRA_CONTENT_INTENT, mContentIntent);
+            }
+
+            if (mDeleteIntent != null) {
+                bundle.putParcelable(EXTRA_DELETE_INTENT, mDeleteIntent);
+            }
+
+            builder.getExtras().putBundle(EXTRA_TV_EXTENDER, bundle);
+            return builder;
+        }
+
+        /**
+         * Returns true if this notification should be shown on TV. This method return true
+         * if the notification was extended with a TvExtender.
+         */
+        public boolean isAvailableOnTv() {
+            return (mFlags & FLAG_AVAILABLE_ON_TV) != 0;
+        }
+
+        /**
+         * Specifies the channel the notification should be delivered on when shown on TV.
+         * It can be different from the channel that the notification is delivered to when
+         * posting on a non-TV device.
+         */
+        public TvExtender setChannel(String channelId) {
+            mChannelId = channelId;
+            return this;
+        }
+
+        /**
+         * Specifies the channel the notification should be delivered on when shown on TV.
+         * It can be different from the channel that the notification is delivered to when
+         * posting on a non-TV device.
+         */
+        public TvExtender setChannelId(String channelId) {
+            mChannelId = channelId;
+            return this;
+        }
+
+        /** @removed */
+        @Deprecated
+        public String getChannel() {
+            return mChannelId;
+        }
+
+        /**
+         * Returns the id of the channel this notification posts to on TV.
+         */
+        public String getChannelId() {
+            return mChannelId;
+        }
+
+        /**
+         * Supplies a {@link PendingIntent} to be sent when the notification is selected on TV.
+         * If provided, it is used instead of the content intent specified
+         * at the level of Notification.
+         */
+        public TvExtender setContentIntent(PendingIntent intent) {
+            mContentIntent = intent;
+            return this;
+        }
+
+        /**
+         * Returns the TV-specific content intent.  If this method returns null, the
+         * main content intent on the notification should be used.
+         *
+         * @see {@link Notification#contentIntent}
+         */
+        public PendingIntent getContentIntent() {
+            return mContentIntent;
+        }
+
+        /**
+         * Supplies a {@link PendingIntent} to send when the notification is cleared explicitly
+         * by the user on TV.  If provided, it is used instead of the delete intent specified
+         * at the level of Notification.
+         */
+        public TvExtender setDeleteIntent(PendingIntent intent) {
+            mDeleteIntent = intent;
+            return this;
+        }
+
+        /**
+         * Returns the TV-specific delete intent.  If this method returns null, the
+         * main delete intent on the notification should be used.
+         *
+         * @see {@link Notification#deleteIntent}
+         */
+        public PendingIntent getDeleteIntent() {
+            return mDeleteIntent;
+        }
+
+        /**
+         * Specifies whether this notification should suppress showing a message over top of apps
+         * outside of the launcher.
+         */
+        public TvExtender setSuppressShowOverApps(boolean suppress) {
+            mSuppressShowOverApps = suppress;
+            return this;
+        }
+
+        /**
+         * Returns true if this notification should not show messages over top of apps
+         * outside of the launcher.
+         */
+        public boolean getSuppressShowOverApps() {
+            return mSuppressShowOverApps;
+        }
+    }
+
+    /**
+     * Get an array of Parcelable objects from a parcelable array bundle field.
      * Update the bundle to have a typed array so fetches in the future don't need
      * to do an array copy.
      */
-    private static Notification[] getNotificationArrayFromBundle(Bundle bundle, String key) {
-        Parcelable[] array = bundle.getParcelableArray(key);
-        if (array instanceof Notification[] || array == null) {
-            return (Notification[]) array;
+    @Nullable
+    private static <T extends Parcelable> T[] getParcelableArrayFromBundle(
+            Bundle bundle, String key, Class<T> itemClass) {
+        final Parcelable[] array = bundle.getParcelableArray(key);
+        final Class<?> arrayClass = Array.newInstance(itemClass, 0).getClass();
+        if (arrayClass.isInstance(array) || array == null) {
+            return (T[]) array;
         }
-        Notification[] typedArray = Arrays.copyOf(array, array.length,
-                Notification[].class);
+        final T[] typedArray = (T[]) Array.newInstance(itemClass, array.length);
+        for (int i = 0; i < array.length; i++) {
+            typedArray[i] = (T) array[i];
+        }
         bundle.putParcelableArray(key, typedArray);
         return typedArray;
     }
@@ -5715,6 +10876,136 @@ public class Notification implements Parcelable
             BuilderRemoteViews brv = new BuilderRemoteViews(p);
             p.recycle();
             return brv;
+        }
+
+        /**
+         * Override and return true, since {@link RemoteViews#onLoadClass(Class)} is not overridden.
+         *
+         * @see RemoteViews#shouldUseStaticFilter()
+         */
+        @Override
+        protected boolean shouldUseStaticFilter() {
+            return true;
+        }
+    }
+
+    /**
+     * A result object where information about the template that was created is saved.
+     */
+    private static class TemplateBindResult {
+        int mIconMarginEnd;
+        boolean mRightIconContainerVisible;
+
+        /**
+         * Get the margin end that needs to be added to any fields that may overlap
+         * with the right actions.
+         */
+        public int getIconMarginEnd() {
+            return mIconMarginEnd;
+        }
+
+        /**
+         * Is the icon container visible on the right size because of the reply button or the
+         * right icon.
+         */
+        public boolean isRightIconContainerVisible() {
+            return mRightIconContainerVisible;
+        }
+
+        public void setIconMarginEnd(int iconMarginEnd) {
+            this.mIconMarginEnd = iconMarginEnd;
+        }
+
+        public void setRightIconContainerVisible(boolean iconContainerVisible) {
+            mRightIconContainerVisible = iconContainerVisible;
+        }
+    }
+
+    private static class StandardTemplateParams {
+        boolean hasProgress = true;
+        CharSequence title;
+        CharSequence text;
+        CharSequence headerTextSecondary;
+        CharSequence summaryText;
+        int maxRemoteInputHistory = Style.MAX_REMOTE_INPUT_HISTORY_LINES;
+        boolean hideLargeIcon;
+        boolean hideReplyIcon;
+        boolean allowColorization  = true;
+        boolean forceDefaultColor = false;
+
+        final StandardTemplateParams reset() {
+            hasProgress = true;
+            title = null;
+            text = null;
+            summaryText = null;
+            headerTextSecondary = null;
+            maxRemoteInputHistory = Style.MAX_REMOTE_INPUT_HISTORY_LINES;
+            allowColorization = true;
+            forceDefaultColor = false;
+            return this;
+        }
+
+        final StandardTemplateParams hasProgress(boolean hasProgress) {
+            this.hasProgress = hasProgress;
+            return this;
+        }
+
+        final StandardTemplateParams title(CharSequence title) {
+            this.title = title;
+            return this;
+        }
+
+        final StandardTemplateParams text(CharSequence text) {
+            this.text = text;
+            return this;
+        }
+
+        final StandardTemplateParams summaryText(CharSequence text) {
+            this.summaryText = text;
+            return this;
+        }
+
+        final StandardTemplateParams headerTextSecondary(CharSequence text) {
+            this.headerTextSecondary = text;
+            return this;
+        }
+
+        final StandardTemplateParams hideLargeIcon(boolean hideLargeIcon) {
+            this.hideLargeIcon = hideLargeIcon;
+            return this;
+        }
+
+        final StandardTemplateParams hideReplyIcon(boolean hideReplyIcon) {
+            this.hideReplyIcon = hideReplyIcon;
+            return this;
+        }
+
+        final StandardTemplateParams disallowColorization() {
+            this.allowColorization = false;
+            return this;
+        }
+
+        final StandardTemplateParams forceDefaultColor() {
+            this.forceDefaultColor = true;
+            return this;
+        }
+
+        final StandardTemplateParams fillTextsFrom(Builder b) {
+            Bundle extras = b.mN.extras;
+            this.title = b.processLegacyText(extras.getCharSequence(EXTRA_TITLE));
+            this.text = b.processLegacyText(extras.getCharSequence(EXTRA_TEXT));
+            this.summaryText = extras.getCharSequence(EXTRA_SUB_TEXT);
+            return this;
+        }
+
+        /**
+         * Set the maximum lines of remote input history lines allowed.
+         * @param maxRemoteInputHistory The number of lines.
+         * @return The builder for method chaining.
+         */
+        public StandardTemplateParams setMaxRemoteInputHistory(int maxRemoteInputHistory) {
+            this.maxRemoteInputHistory = maxRemoteInputHistory;
+            return this;
         }
     }
 }

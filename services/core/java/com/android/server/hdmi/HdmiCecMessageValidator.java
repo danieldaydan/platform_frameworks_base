@@ -22,7 +22,7 @@ import android.util.SparseArray;
 /**
  * A helper class to validates {@link HdmiCecMessage}.
  */
-public final class HdmiCecMessageValidator {
+public class HdmiCecMessageValidator {
     private static final String TAG = "HdmiCecMessageValidator";
 
     static final int OK = 0;
@@ -117,14 +117,15 @@ public final class HdmiCecMessageValidator {
         // TODO: Validate more than length for the following messages.
 
         // Messages for the One Touch Record.
-        FixedLengthValidator oneByteValidator = new FixedLengthValidator(1);
         addValidationInfo(Constants.MESSAGE_RECORD_ON,
                 new VariableLengthValidator(1, 8), DEST_DIRECT);
-        addValidationInfo(Constants.MESSAGE_RECORD_STATUS, oneByteValidator, DEST_DIRECT);
+        addValidationInfo(Constants.MESSAGE_RECORD_STATUS,
+                new RecordStatusInfoValidator(), DEST_DIRECT);
 
         // TODO: Handle messages for the Timer Programming.
 
         // Messages for the System Information.
+        FixedLengthValidator oneByteValidator = new FixedLengthValidator(1);
         addValidationInfo(Constants.MESSAGE_CEC_VERSION, oneByteValidator, DEST_DIRECT);
         addValidationInfo(Constants.MESSAGE_SET_MENU_LANGUAGE,
                 new FixedLengthValidator(3), DEST_BROADCAST);
@@ -140,7 +141,7 @@ public final class HdmiCecMessageValidator {
         // Allow unregistered source for all vendor specific commands, because we don't know
         // how to use the commands at this moment.
         addValidationInfo(Constants.MESSAGE_VENDOR_COMMAND,
-                maxLengthValidator, DEST_DIRECT | SRC_UNREGISTERED);
+                new VariableLengthValidator(1, 14), DEST_DIRECT | SRC_UNREGISTERED);
         addValidationInfo(Constants.MESSAGE_VENDOR_COMMAND_WITH_ID,
                 new VariableLengthValidator(4, 14), DEST_ALL | SRC_UNREGISTERED);
         addValidationInfo(Constants.MESSAGE_VENDOR_REMOTE_BUTTON_DOWN,
@@ -293,6 +294,11 @@ public final class HdmiCecMessageValidator {
         return success ? OK : ERROR_PARAMETER;
     }
 
+    private boolean isWithinRange(int value, int min, int max) {
+        value = value & 0xFF;
+        return (value >= min && value <= max);
+    }
+
     private class PhysicalAddressValidator implements ParameterValidator {
         @Override
         public int isValid(byte[] params) {
@@ -332,6 +338,25 @@ public final class HdmiCecMessageValidator {
             }
             return toErrorCode(
                     isValidPhysicalAddress(params, 0) && isValidPhysicalAddress(params, 2));
+        }
+    }
+
+    /**
+     * Check if the given record status message parameter is valid.
+     * A valid parameter should lie within the range description of Record Status Info defined in
+     * CEC 1.4 Specification : Operand Descriptions (Section 17)
+     */
+    private class RecordStatusInfoValidator implements ParameterValidator {
+        @Override
+        public int isValid(byte[] params) {
+            if (params.length < 1) {
+                return ERROR_PARAMETER_SHORT;
+            }
+            return toErrorCode(isWithinRange(params[0], 0x01, 0x07)
+                            || isWithinRange(params[0], 0x09, 0x0E)
+                            || isWithinRange(params[0], 0x10, 0x17)
+                            || isWithinRange(params[0], 0x1A, 0x1B)
+                            || params[0] == 0x1F);
         }
     }
 }

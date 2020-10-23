@@ -18,7 +18,8 @@ package android.view;
 
 import android.graphics.Rect;
 import android.test.AndroidTestCase;
-import android.test.suitebuilder.annotation.SmallTest;
+
+import androidx.test.filters.SmallTest;
 
 public class FocusFinderTest extends AndroidTestCase {
 
@@ -117,8 +118,8 @@ public class FocusFinderTest extends AndroidTestCase {
 
         // at edge
         rect2.offset(0, 1);
-        assertBeamsOverlap(View.FOCUS_LEFT, rect1, rect2);
-        assertBeamsOverlap(View.FOCUS_RIGHT, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_LEFT, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_RIGHT, rect1, rect2);
 
         // just beyond
         rect2.offset(0, 1);
@@ -133,8 +134,8 @@ public class FocusFinderTest extends AndroidTestCase {
 
         // at top edge
         rect2.offset(0, -1);
-        assertBeamsOverlap(View.FOCUS_LEFT, rect1, rect2);
-        assertBeamsOverlap(View.FOCUS_RIGHT, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_LEFT, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_RIGHT, rect1, rect2);
 
         // just beyond top edge
         rect2.offset(0, -1);
@@ -154,8 +155,8 @@ public class FocusFinderTest extends AndroidTestCase {
 
         // at edge
         rect2.offset(1, 0);
-        assertBeamsOverlap(View.FOCUS_UP, rect1, rect2);
-        assertBeamsOverlap(View.FOCUS_DOWN, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_UP, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_DOWN, rect1, rect2);
 
         // just beyond
         rect2.offset(1, 0);
@@ -170,8 +171,8 @@ public class FocusFinderTest extends AndroidTestCase {
 
         // at edge
         rect2.offset(-1, 0);
-        assertBeamsOverlap(View.FOCUS_UP, rect1, rect2);
-        assertBeamsOverlap(View.FOCUS_DOWN, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_UP, rect1, rect2);
+        assertBeamsDontOverlap(View.FOCUS_DOWN, rect1, rect2);
 
         // just beyond edge
         rect2.offset(-1, 0);
@@ -445,7 +446,7 @@ public class FocusFinderTest extends AndroidTestCase {
         assertBetterCandidate(View.FOCUS_LEFT,
                 //       L    T    R    B
                 new Rect(150, 0,   200,  50),   // src
-                new Rect(0,   50,  50,   50),   // better, (way further, but in beam)
+                new Rect(0,   0,   50,   50),   // better, (way further, but in beam)
                 new Rect(49,  99,  149,  101)); // worse, even though it is closer 
     }
 

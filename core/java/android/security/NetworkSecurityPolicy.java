@@ -62,7 +62,8 @@ public class NetworkSecurityPolicy {
      * traffic from applications is handled by higher-level network stacks/components which can
      * honor this aspect of the policy.
      *
-     * <p>NOTE: {@link android.webkit.WebView} does not honor this flag.
+     * <p>NOTE: {@link android.webkit.WebView} honors this flag for applications targeting API level
+     * 26 and up.
      */
     public boolean isCleartextTrafficPermitted() {
         return libcore.net.NetworkSecurityPolicy.getInstance().isCleartextTrafficPermitted();
@@ -73,7 +74,6 @@ public class NetworkSecurityPolicy {
      * TLS or STARTTLS) is permitted for communicating with {@code hostname} for this process.
      *
      * @see #isCleartextTrafficPermitted()
-     * @hide
      */
     public boolean isCleartextTrafficPermitted(String hostname) {
         return libcore.net.NetworkSecurityPolicy.getInstance()
@@ -93,6 +93,16 @@ public class NetworkSecurityPolicy {
         libcore.net.NetworkSecurityPolicy.setInstance(policy);
     }
 
+    /**
+     * Handle an update to the system or user certificate stores.
+     * @hide
+     */
+    public void handleTrustStorageUpdate() {
+        ApplicationConfig config = ApplicationConfig.getDefaultInstance();
+        if (config != null) {
+            config.handleTrustStorageUpdate();
+        }
+    }
 
     /**
      * Returns an {@link ApplicationConfig} based on the configuration for {@code packageName}.

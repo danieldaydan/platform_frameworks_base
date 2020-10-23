@@ -24,6 +24,11 @@
 
 #include "utils/Macros.h"
 
+// Smaller than INT_MIN/INT_MAX because we offset these values
+// and thus don't want to be adding offsets to INT_MAX, that's bad
+#define DIRTY_MIN (-0x7ffffff - 1)
+#define DIRTY_MAX (0x8000000)
+
 namespace android {
 namespace uirenderer {
 
@@ -33,6 +38,7 @@ class Matrix4;
 
 class DamageAccumulator {
     PREVENT_COPY_AND_ASSIGN(DamageAccumulator);
+
 public:
     DamageAccumulator();
     // mAllocator will clean everything up for us, no need for a dtor
@@ -52,7 +58,7 @@ public:
     // Returns the current dirty area, *NOT* transformed by pushed transforms
     void peekAtDirty(SkRect* dest) const;
 
-    void computeCurrentTransform(Matrix4* outMatrix) const;
+    ANDROID_API void computeCurrentTransform(Matrix4* outMatrix) const;
 
     void finish(SkRect* totalDirty);
 

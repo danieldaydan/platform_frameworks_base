@@ -55,7 +55,7 @@ public:
     sp<XMLNode> newCData(const String8& filename) {
         return new XMLNode(filename);
     }
-    
+
     enum type {
         TYPE_NAMESPACE,
         TYPE_ELEMENT,
@@ -70,6 +70,7 @@ public:
     const String16& getElementNamespace() const;
     const String16& getElementName() const;
     const Vector<sp<XMLNode> >& getChildren() const;
+    Vector<sp<XMLNode> >& getChildren();
 
     const String8& getFilename() const;
     
@@ -97,6 +98,7 @@ public:
     const Vector<attribute_entry>& getAttributes() const;
 
     const attribute_entry* getAttribute(const String16& ns, const String16& name) const;
+    bool removeAttribute(const String16& ns, const String16& name);
     
     attribute_entry* editAttribute(const String16& ns, const String16& name);
 
@@ -176,7 +178,7 @@ private:
     XMLNode(const String8& filename, const String16& s1, const String16& s2, bool isNamespace);
     
     // Creating a CDATA node.
-    XMLNode(const String8& filename);
+    explicit XMLNode(const String8& filename);
     
     status_t collect_strings(StringPool* dest, Vector<uint32_t>* outResIds,
             bool stripComments, bool stripRawValues) const;

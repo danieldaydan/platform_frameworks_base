@@ -1,41 +1,61 @@
 package com.android.systemui.statusbar.policy;
 
+import static junit.framework.Assert.assertEquals;
+
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
 import android.content.Intent;
+import android.net.ConnectivityManager;
 import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.test.suitebuilder.annotation.SmallTest;
+import android.testing.AndroidTestingRunner;
+import android.testing.TestableLooper.RunWithLooper;
 
 import com.android.systemui.statusbar.policy.NetworkController.IconState;
 
+import org.junit.Test;
+import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 @SmallTest
+@RunWith(AndroidTestingRunner.class)
+@RunWithLooper
 public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
     // These match the constants in WifiManager and need to be kept up to date.
     private static final int MIN_RSSI = -100;
     private static final int MAX_RSSI = -55;
 
+    @Test
     public void testWifiIcon() {
         String testSsid = "Test SSID";
         setWifiEnabled(true);
         verifyLastWifiIcon(false, WifiIcons.WIFI_NO_NETWORK);
 
         setWifiState(true, testSsid);
-        verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[0][0]);
+        setWifiLevel(0);
+        // Connected, but still not validated - does not show
+        verifyLastWifiIcon(false, WifiIcons.WIFI_SIGNAL_STRENGTH[0][0]);
 
         for (int testLevel = 0; testLevel < WifiIcons.WIFI_LEVEL_COUNT; testLevel++) {
             setWifiLevel(testLevel);
 
-            setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+            setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
             verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[1][testLevel]);
-            setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, false, true);
-            verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[0][testLevel]);
+            setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, false, true);
+            // Icon does not show if not validated
+            verifyLastWifiIcon(false, WifiIcons.WIFI_SIGNAL_STRENGTH[0][testLevel]);
         }
     }
 
+    @Test
     public void testQsWifiIcon() {
         String testSsid = "Test SSID";
 
@@ -49,15 +69,16 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         for (int testLevel = 0; testLevel < WifiIcons.WIFI_LEVEL_COUNT; testLevel++) {
             setWifiLevel(testLevel);
 
-            setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+            setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
             verifyLastQsWifiIcon(true, true, WifiIcons.QS_WIFI_SIGNAL_STRENGTH[1][testLevel],
                     testSsid);
-            setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, false, true);
+            setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, false, true);
             verifyLastQsWifiIcon(true, true, WifiIcons.QS_WIFI_SIGNAL_STRENGTH[0][testLevel],
                     testSsid);
         }
     }
 
+    @Test
     public void testQsDataDirection() {
         // Setup normal connection
         String testSsid = "Test SSID";
@@ -65,20 +86,24 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         setWifiEnabled(true);
         setWifiState(true, testSsid);
         setWifiLevel(testLevel);
-        setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
         verifyLastQsWifiIcon(true, true,
                 WifiIcons.QS_WIFI_SIGNAL_STRENGTH[1][testLevel], testSsid);
 
-        setWifiActivity(WifiManager.DATA_ACTIVITY_NONE);
+        // Set to different activity state first to ensure a callback happens.
+        setWifiActivity(WifiManager.TrafficStateCallback.DATA_ACTIVITY_IN);
+
+        setWifiActivity(WifiManager.TrafficStateCallback.DATA_ACTIVITY_NONE);
         verifyLastQsDataDirection(false, false);
-        setWifiActivity(WifiManager.DATA_ACTIVITY_IN);
+        setWifiActivity(WifiManager.TrafficStateCallback.DATA_ACTIVITY_IN);
         verifyLastQsDataDirection(true, false);
-        setWifiActivity(WifiManager.DATA_ACTIVITY_OUT);
+        setWifiActivity(WifiManager.TrafficStateCallback.DATA_ACTIVITY_OUT);
         verifyLastQsDataDirection(false, true);
-        setWifiActivity(WifiManager.DATA_ACTIVITY_INOUT);
+        setWifiActivity(WifiManager.TrafficStateCallback.DATA_ACTIVITY_INOUT);
         verifyLastQsDataDirection(true, true);
     }
 
+    @Test
     public void testRoamingIconDuringWifi() {
         // Setup normal connection
         String testSsid = "Test SSID";
@@ -86,16 +111,92 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         setWifiEnabled(true);
         setWifiState(true, testSsid);
         setWifiLevel(testLevel);
-        setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
         verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[1][testLevel]);
 
         setupDefaultSignal();
         setGsmRoaming(true);
         // Still be on wifi though.
-        setConnectivity(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_CELLULAR, false, false);
         verifyLastMobileDataIndicators(true,
-                TelephonyIcons.TELEPHONY_SIGNAL_STRENGTH_ROAMING[1][DEFAULT_LEVEL],
-                TelephonyIcons.ROAMING_ICON);
+                DEFAULT_LEVEL,
+                0, true);
+    }
+
+    @Test
+    public void testWifiIconInvalidatedViaCallback() {
+        // Setup normal connection
+        String testSsid = "Test SSID";
+        int testLevel = 2;
+        setWifiEnabled(true);
+        setWifiState(true, testSsid);
+        setWifiLevel(testLevel);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[1][testLevel]);
+
+        setConnectivityViaCallback(NetworkCapabilities.TRANSPORT_WIFI, false, true);
+        verifyLastWifiIcon(false, WifiIcons.WIFI_SIGNAL_STRENGTH[0][testLevel]);
+    }
+
+    @Test
+    public void testWifiIconDisconnectedViaCallback(){
+        // Setup normal connection
+        String testSsid = "Test SSID";
+        int testLevel = 2;
+        setWifiEnabled(true);
+        setWifiState(true, testSsid);
+        setWifiLevel(testLevel);
+        setConnectivityViaBroadcast(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[1][testLevel]);
+
+        setWifiState(false, testSsid);
+        setConnectivityViaCallback(NetworkCapabilities.TRANSPORT_WIFI, false, false);
+        verifyLastWifiIcon(false, WifiIcons.WIFI_NO_NETWORK);
+    }
+
+    @Test
+    public void testVpnWithUnderlyingWifi(){
+        String testSsid = "Test SSID";
+        int testLevel = 2;
+        setWifiEnabled(true);
+        verifyLastWifiIcon(false, WifiIcons.WIFI_NO_NETWORK);
+
+        setConnectivityViaCallback(NetworkCapabilities.TRANSPORT_VPN, false, true);
+        setConnectivityViaCallback(NetworkCapabilities.TRANSPORT_VPN, true, true);
+        verifyLastWifiIcon(false, WifiIcons.WIFI_NO_NETWORK);
+
+        // Mock calling setUnderlyingNetworks.
+        setWifiState(true, testSsid);
+        setWifiLevel(testLevel);
+        setConnectivityViaCallback(NetworkCapabilities.TRANSPORT_WIFI, true, true);
+        verifyLastWifiIcon(true, WifiIcons.WIFI_SIGNAL_STRENGTH[1][testLevel]);
+    }
+
+    @Test
+    public void testFetchInitialData() {
+        mNetworkController.mWifiSignalController.fetchInitialState();
+        Mockito.verify(mMockWm).getWifiState();
+        Mockito.verify(mMockCm).getNetworkInfo(ConnectivityManager.TYPE_WIFI);
+    }
+
+    @Test
+    public void testFetchInitialData_correctValues() {
+        String testSsid = "TEST";
+
+        when(mMockWm.getWifiState()).thenReturn(WifiManager.WIFI_STATE_ENABLED);
+        NetworkInfo networkInfo = mock(NetworkInfo.class);
+        when(networkInfo.isConnected()).thenReturn(true);
+        when(mMockCm.getNetworkInfo(ConnectivityManager.TYPE_WIFI)).thenReturn(networkInfo);
+        WifiInfo wifiInfo = mock(WifiInfo.class);
+        when(wifiInfo.getSSID()).thenReturn(testSsid);
+        when(mMockWm.getConnectionInfo()).thenReturn(wifiInfo);
+
+        mNetworkController.mWifiSignalController.fetchInitialState();
+
+        assertTrue(mNetworkController.mWifiSignalController.mCurrentState.enabled);
+        assertTrue(mNetworkController.mWifiSignalController.mCurrentState.connected);
+        assertEquals(testSsid, mNetworkController.mWifiSignalController.mCurrentState.ssid);
     }
 
     protected void setWifiActivity(int activity) {
@@ -114,22 +215,21 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
     }
 
     protected void setWifiEnabled(boolean enabled) {
-        Intent i = new Intent(WifiManager.WIFI_STATE_CHANGED_ACTION);
-        i.putExtra(WifiManager.EXTRA_WIFI_STATE,
+        when(mMockWm.getWifiState()).thenReturn(
                 enabled ? WifiManager.WIFI_STATE_ENABLED : WifiManager.WIFI_STATE_DISABLED);
-        mNetworkController.onReceive(mContext, i);
+        mNetworkController.onReceive(mContext, new Intent(WifiManager.WIFI_STATE_CHANGED_ACTION));
     }
 
     protected void setWifiState(boolean connected, String ssid) {
         Intent i = new Intent(WifiManager.NETWORK_STATE_CHANGED_ACTION);
-        NetworkInfo networkInfo = Mockito.mock(NetworkInfo.class);
-        Mockito.when(networkInfo.isConnected()).thenReturn(connected);
+        NetworkInfo networkInfo = mock(NetworkInfo.class);
+        when(networkInfo.isConnected()).thenReturn(connected);
 
-        WifiInfo wifiInfo = Mockito.mock(WifiInfo.class);
-        Mockito.when(wifiInfo.getSSID()).thenReturn(ssid);
+        WifiInfo wifiInfo = mock(WifiInfo.class);
+        when(wifiInfo.getSSID()).thenReturn(ssid);
+        when(mMockWm.getConnectionInfo()).thenReturn(wifiInfo);
 
         i.putExtra(WifiManager.EXTRA_NETWORK_INFO, networkInfo);
-        i.putExtra(WifiManager.EXTRA_WIFI_INFO, wifiInfo);
         mNetworkController.onReceive(mContext, i);
     }
 
@@ -138,8 +238,8 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         ArgumentCaptor<Boolean> outArg = ArgumentCaptor.forClass(Boolean.class);
 
         Mockito.verify(mCallbackHandler, Mockito.atLeastOnce()).setWifiIndicators(
-                Mockito.anyBoolean(), Mockito.any(IconState.class), Mockito.any(IconState.class),
-                inArg.capture(), outArg.capture(), Mockito.anyString());
+                anyBoolean(), any(), any(), inArg.capture(), outArg.capture(), any(), anyBoolean(),
+                any());
         assertEquals("WiFi data in, in quick settings", in, (boolean) inArg.getValue());
         assertEquals("WiFi data out, in quick settings", out, (boolean) outArg.getValue());
     }
@@ -151,10 +251,8 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         ArgumentCaptor<String> descArg = ArgumentCaptor.forClass(String.class);
 
         Mockito.verify(mCallbackHandler, Mockito.atLeastOnce()).setWifiIndicators(
-                enabledArg.capture(), Mockito.any(IconState.class),
-                iconArg.capture(), Mockito.anyBoolean(),
-                Mockito.anyBoolean(),
-                descArg.capture());
+                enabledArg.capture(), any(), iconArg.capture(), anyBoolean(),
+                anyBoolean(), descArg.capture(), anyBoolean(), any());
         IconState iconState = iconArg.getValue();
         assertEquals("WiFi enabled, in quick settings", enabled, (boolean) enabledArg.getValue());
         assertEquals("WiFi connected, in quick settings", connected, iconState.visible);
@@ -166,8 +264,8 @@ public class NetworkControllerWifiTest extends NetworkControllerBaseTest {
         ArgumentCaptor<IconState> iconArg = ArgumentCaptor.forClass(IconState.class);
 
         Mockito.verify(mCallbackHandler, Mockito.atLeastOnce()).setWifiIndicators(
-                Mockito.anyBoolean(), iconArg.capture(), Mockito.any(IconState.class),
-                Mockito.anyBoolean(), Mockito.anyBoolean(), Mockito.anyString());
+                anyBoolean(), iconArg.capture(), any(), anyBoolean(), anyBoolean(),
+                any(), anyBoolean(), any());
         IconState iconState = iconArg.getValue();
         assertEquals("WiFi visible, in status bar", visible, iconState.visible);
         assertEquals("WiFi signal, in status bar", icon, iconState.icon);

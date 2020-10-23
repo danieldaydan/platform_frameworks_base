@@ -16,18 +16,26 @@
 
 package android.webkit;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.annotation.SystemApi;
 import android.app.ActivityThread;
 import android.app.Application;
+import android.app.ResourcesManager;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
 import android.content.res.Resources;
 import android.graphics.Canvas;
+import android.graphics.RecordingCanvas;
+import android.os.RemoteException;
 import android.os.SystemProperties;
 import android.os.Trace;
 import android.util.SparseArray;
-import android.view.DisplayListCanvas;
 import android.view.View;
 import android.view.ViewRootImpl;
+
+import com.android.internal.util.ArrayUtils;
 
 /**
  * Delegate used by the WebView provider implementation to access
@@ -38,6 +46,7 @@ import android.view.ViewRootImpl;
 @SystemApi
 public final class WebViewDelegate {
 
+    @UnsupportedAppUsage
     /* package */ WebViewDelegate() { }
 
     /**
@@ -61,33 +70,35 @@ public final class WebViewDelegate {
     }
 
     /**
-     * Returns true if the WebView trace tag is enabled and false otherwise.
+     * Returns {@code true} if the WebView trace tag is enabled and {@code false} otherwise.
      */
     public boolean isTraceTagEnabled() {
         return Trace.isTagEnabled(Trace.TRACE_TAG_WEBVIEW);
     }
 
     /**
-     * Returns true if the draw GL functor can be invoked (see {@link #invokeDrawGlFunctor})
-     * and false otherwise.
+     * Returns {@code true} if the draw GL functor can be invoked (see {@link #invokeDrawGlFunctor})
+     * and {@code false} otherwise.
+     *
+     * @deprecated Use {@link #drawWebViewFunctor(Canvas, int)}
      */
+    @Deprecated
     public boolean canInvokeDrawGlFunctor(View containerView) {
-        ViewRootImpl viewRootImpl = containerView.getViewRootImpl();
-         // viewRootImpl can be null during teardown when window is leaked.
-        return viewRootImpl != null;
+        return true;
     }
 
     /**
-     * Invokes the draw GL functor. If waitForCompletion is false the functor
+     * Invokes the draw GL functor. If waitForCompletion is {@code false} the functor
      * may be invoked asynchronously.
      *
      * @param nativeDrawGLFunctor the pointer to the native functor that implements
      *        system/core/include/utils/Functor.h
+     * @deprecated Use {@link #drawWebViewFunctor(Canvas, int)}
      */
+    @Deprecated
     public void invokeDrawGlFunctor(View containerView, long nativeDrawGLFunctor,
             boolean waitForCompletion) {
-        ViewRootImpl viewRootImpl = containerView.getViewRootImpl();
-        viewRootImpl.invokeFunctor(nativeDrawGLFunctor, waitForCompletion);
+        ViewRootImpl.invokeFunctor(nativeDrawGLFunctor, waitForCompletion);
     }
 
     /**
@@ -99,14 +110,54 @@ public final class WebViewDelegate {
      * @param nativeDrawGLFunctor the pointer to the native functor that implements
      *        system/core/include/utils/Functor.h
      * @throws IllegalArgumentException if the canvas is not hardware accelerated
+     * @deprecated Use {@link #drawWebViewFunctor(Canvas, int)}
      */
+    @Deprecated
     public void callDrawGlFunction(Canvas canvas, long nativeDrawGLFunctor) {
-        if (!(canvas instanceof DisplayListCanvas)) {
+        if (!(canvas instanceof RecordingCanvas)) {
             // Canvas#isHardwareAccelerated() is only true for subclasses of HardwareCanvas.
             throw new IllegalArgumentException(canvas.getClass().getName()
                     + " is not a DisplayList canvas");
         }
-        ((DisplayListCanvas) canvas).callDrawGLFunction2(nativeDrawGLFunctor);
+        ((RecordingCanvas) canvas).drawGLFunctor2(nativeDrawGLFunctor, null);
+    }
+
+    /**
+     * Calls the function specified with the nativeDrawGLFunctor functor pointer. This
+     * functionality is used by the WebView for calling into their renderer from the
+     * framework display lists.
+     *
+     * @param canvas a hardware accelerated canvas (see {@link Canvas#isHardwareAccelerated()})
+     * @param nativeDrawGLFunctor the pointer to the native functor that implements
+     *        system/core/include/utils/Functor.h
+     * @param releasedRunnable Called when this nativeDrawGLFunctor is no longer referenced by this
+     *        canvas, so is safe to be destroyed.
+     * @throws IllegalArgumentException if the canvas is not hardware accelerated
+     * @deprecated Use {@link #drawWebViewFunctor(Canvas, int)}
+     */
+    @Deprecated
+    public void callDrawGlFunction(@NonNull Canvas canvas, long nativeDrawGLFunctor,
+            @Nullable Runnable releasedRunnable) {
+        if (!(canvas instanceof RecordingCanvas)) {
+            // Canvas#isHardwareAccelerated() is only true for subclasses of HardwareCanvas.
+            throw new IllegalArgumentException(canvas.getClass().getName()
+                    + " is not a DisplayList canvas");
+        }
+        ((RecordingCanvas) canvas).drawGLFunctor2(nativeDrawGLFunctor, releasedRunnable);
+    }
+
+    /**
+     * Call webview draw functor. See API in draw_fn.h.
+     * @param canvas a {@link RecordingCanvas}.
+     * @param functor created by AwDrawFn_CreateFunctor in draw_fn.h.
+     */
+    public void drawWebViewFunctor(@NonNull Canvas canvas, int functor) {
+        if (!(canvas instanceof RecordingCanvas)) {
+            // Canvas#isHardwareAccelerated() is only true for subclasses of RecordingCanvas.
+            throw new IllegalArgumentException(canvas.getClass().getName()
+                    + " is not a RecordingCanvas canvas");
+        }
+        ((RecordingCanvas) canvas).drawWebViewFunctor(functor);
     }
 
     /**
@@ -114,7 +165,9 @@ public final class WebViewDelegate {
      *
      * @param nativeDrawGLFunctor the pointer to the native functor that implements
      *        system/core/include/utils/Functor.h
+     * @deprecated Use {@link #drawWebViewFunctor(Canvas, int)}
      */
+    @Deprecated
     public void detachDrawGlFunctor(View containerView, long nativeDrawGLFunctor) {
         ViewRootImpl viewRootImpl = containerView.getViewRootImpl();
         if (nativeDrawGLFunctor != 0 && viewRootImpl != null) {
@@ -156,7 +209,45 @@ public final class WebViewDelegate {
      * Adds the WebView asset path to {@link android.content.res.AssetManager}.
      */
     public void addWebViewAssetPath(Context context) {
-        context.getAssets().addAssetPath(
-                WebViewFactory.getLoadedPackageInfo().applicationInfo.sourceDir);
+        final String[] newAssetPaths =
+                WebViewFactory.getLoadedPackageInfo().applicationInfo.getAllApkPaths();
+        final ApplicationInfo appInfo = context.getApplicationInfo();
+
+        // Build the new library asset path list.
+        String[] newLibAssets = appInfo.sharedLibraryFiles;
+        for (String newAssetPath : newAssetPaths) {
+            newLibAssets = ArrayUtils.appendElement(String.class, newLibAssets, newAssetPath);
+        }
+
+        if (newLibAssets != appInfo.sharedLibraryFiles) {
+            // Update the ApplicationInfo object with the new list.
+            // We know this will persist and future Resources created via ResourcesManager
+            // will include the shared library because this ApplicationInfo comes from the
+            // underlying LoadedApk in ContextImpl, which does not change during the life of the
+            // application.
+            appInfo.sharedLibraryFiles = newLibAssets;
+
+            // Update existing Resources with the WebView library.
+            ResourcesManager.getInstance().appendLibAssetsForMainAssetPath(
+                    appInfo.getBaseResourcePath(), newAssetPaths);
+        }
+    }
+
+    /**
+     * Returns whether WebView should run in multiprocess mode.
+     */
+    public boolean isMultiProcessEnabled() {
+        try {
+            return WebViewFactory.getUpdateService().isMultiProcessEnabled();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Returns the data directory suffix to use, or null for none.
+     */
+    public String getDataDirectorySuffix() {
+        return WebViewFactory.getDataDirectorySuffix();
     }
 }

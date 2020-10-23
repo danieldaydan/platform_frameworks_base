@@ -18,10 +18,19 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE_TAGS := tests
 
-LOCAL_SRC_FILES := $(call all-subdir-java-files)
+ifeq ($(SOUND_TRIGGER_USE_STUB_MODULE), 1)
+  LOCAL_SRC_FILES := $(call all-subdir-java-files)
+  LOCAL_PRIVILEGED_MODULE := true
+  LOCAL_CERTIFICATE := platform
+  TARGET_OUT_DATA_APPS_PRIVILEGED := $(TARGET_OUT_DATA)/priv-app
+else
+  LOCAL_SRC_FILES := src/android/hardware/soundtrigger/SoundTriggerTest.java
+endif
 
-LOCAL_JAVA_LIBRARIES := android.test.runner
+LOCAL_STATIC_JAVA_LIBRARIES := mockito-target
+LOCAL_JAVA_LIBRARIES := android.test.runner android.test.base
 
 LOCAL_PACKAGE_NAME := SoundTriggerTests
+LOCAL_PRIVATE_PLATFORM_APIS := true
 
 include $(BUILD_PACKAGE)

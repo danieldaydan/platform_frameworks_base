@@ -16,8 +16,10 @@
 
 package android.media;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.os.Parcel;
 import android.util.Log;
+import android.util.MathUtils;
 
 import java.util.Calendar;
 import java.util.Collections;
@@ -67,18 +69,22 @@ import java.util.TimeZone;
     /**
      * Indicate whether the media can be paused
      */
+    @UnsupportedAppUsage
     public static final int PAUSE_AVAILABLE         = 1; // Boolean
     /**
      * Indicate whether the media can be backward seeked
      */
+    @UnsupportedAppUsage
     public static final int SEEK_BACKWARD_AVAILABLE = 2; // Boolean
     /**
      * Indicate whether the media can be forward seeked
      */
+    @UnsupportedAppUsage
     public static final int SEEK_FORWARD_AVAILABLE  = 3; // Boolean
     /**
      * Indicate whether the media can be seeked
      */
+    @UnsupportedAppUsage
     public static final int SEEK_AVAILABLE          = 4; // Boolean
 
     // TODO: Should we use numbers compatible with the metadata retriever?
@@ -263,6 +269,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public Metadata() { }
 
     /**
@@ -332,7 +339,14 @@ import java.util.TimeZone;
             }
 
             // Skip to the next one.
-            parcel.setDataPosition(start + size);
+            try {
+                parcel.setDataPosition(MathUtils.addOrThrow(start, size));
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "Invalid size: " + e.getMessage());
+                error = true;
+                break;
+            }
+
             bytesLeft -= size;
             ++recCount;
         }
@@ -374,6 +388,7 @@ import java.util.TimeZone;
      * @return false if an error occurred.
      * {@hide}
      */
+    @UnsupportedAppUsage
     public boolean parse(Parcel parcel) {
         if (parcel.dataAvail() < kMetaHeaderSize) {
             Log.e(TAG, "Not enough data " + parcel.dataAvail());
@@ -410,6 +425,7 @@ import java.util.TimeZone;
     /**
      * @return The set of metadata ID found.
      */
+    @UnsupportedAppUsage
     public Set<Integer> keySet() {
         return mKeyToPosMap.keySet();
     }
@@ -417,6 +433,7 @@ import java.util.TimeZone;
     /**
      * @return true if a value is present for the given key.
      */
+    @UnsupportedAppUsage
     public boolean has(final int metadataId) {
         if (!checkMetadataId(metadataId)) {
             throw new IllegalArgumentException("Invalid key: " + metadataId);
@@ -431,6 +448,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public String getString(final int key) {
         checkType(key, STRING_VAL);
         return mParcel.readString();
@@ -439,6 +457,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public int getInt(final int key) {
         checkType(key, INTEGER_VAL);
         return mParcel.readInt();
@@ -447,6 +466,7 @@ import java.util.TimeZone;
     /**
      * Get the boolean value indicated by key
      */
+    @UnsupportedAppUsage
     public boolean getBoolean(final int key) {
         checkType(key, BOOLEAN_VAL);
         return mParcel.readInt() == 1;
@@ -455,6 +475,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public long getLong(final int key) {
         checkType(key, LONG_VAL);    /**
      * {@hide}
@@ -465,6 +486,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public double getDouble(final int key) {
         checkType(key, DOUBLE_VAL);
         return mParcel.readDouble();
@@ -473,6 +495,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public byte[] getByteArray(final int key) {
         checkType(key, BYTE_ARRAY_VAL);
         return mParcel.createByteArray();
@@ -481,6 +504,7 @@ import java.util.TimeZone;
     /**
      * {@hide}
      */
+    @UnsupportedAppUsage
     public Date getDate(final int key) {
         checkType(key, DATE_VAL);
         final long timeSinceEpoch = mParcel.readLong();

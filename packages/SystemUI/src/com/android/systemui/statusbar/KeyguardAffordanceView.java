@@ -21,25 +21,25 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ArgbEvaluator;
 import android.animation.PropertyValuesHolder;
 import android.animation.ValueAnimator;
+import android.annotation.Nullable;
 import android.content.Context;
+import android.content.res.TypedArray;
 import android.graphics.Canvas;
 import android.graphics.CanvasProperty;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
+import android.graphics.RecordingCanvas;
 import android.graphics.drawable.Drawable;
 import android.util.AttributeSet;
-import android.view.DisplayListCanvas;
 import android.view.RenderNodeAnimator;
 import android.view.View;
 import android.view.ViewAnimationUtils;
-import android.view.animation.AnimationUtils;
 import android.view.animation.Interpolator;
 import android.widget.ImageView;
 
+import com.android.systemui.Interpolators;
 import com.android.systemui.R;
-import com.android.systemui.statusbar.phone.KeyguardAffordanceHelper;
-import com.android.systemui.statusbar.phone.PhoneStatusBar;
 
 /**
  * An ImageView which does not have overlapping renderings commands and therefore does not need a
@@ -53,12 +53,10 @@ public class KeyguardAffordanceView extends ImageView {
     public static final float MAX_ICON_SCALE_AMOUNT = 1.5f;
     public static final float MIN_ICON_SCALE_AMOUNT = 0.8f;
 
+    protected final int mDarkIconColor;
+    protected final int mNormalColor;
     private final int mMinBackgroundRadius;
     private final Paint mCirclePaint;
-    private final Interpolator mAppearInterpolator;
-    private final Interpolator mDisappearInterpolator;
-    private final int mInverseColor;
-    private final int mNormalColor;
     private final ArgbEvaluator mColorInterpolator;
     private final FlingAnimationUtils mFlingAnimationUtils;
     private float mCircleRadius;
@@ -77,10 +75,11 @@ public class KeyguardAffordanceView extends ImageView {
     private float mCircleStartRadius;
     private float mMaxCircleSize;
     private Animator mPreviewClipper;
-    private float mRestingAlpha = KeyguardAffordanceHelper.SWIPE_RESTING_ALPHA_AMOUNT;
+    private float mRestingAlpha = 1f;
     private boolean mSupportHardware;
     private boolean mFinishing;
     private boolean mLaunchingAffordance;
+    private boolean mShouldTint = true;
 
     private CanvasProperty<Float> mHwCircleRadius;
     private CanvasProperty<Float> mHwCenterX;
@@ -127,21 +126,35 @@ public class KeyguardAffordanceView extends ImageView {
     public KeyguardAffordanceView(Context context, AttributeSet attrs, int defStyleAttr,
             int defStyleRes) {
         super(context, attrs, defStyleAttr, defStyleRes);
+        TypedArray a = context.obtainStyledAttributes(attrs, android.R.styleable.ImageView);
+
         mCirclePaint = new Paint();
         mCirclePaint.setAntiAlias(true);
         mCircleColor = 0xffffffff;
         mCirclePaint.setColor(mCircleColor);
 
-        mNormalColor = 0xffffffff;
-        mInverseColor = 0xff000000;
+        mNormalColor = a.getColor(android.R.styleable.ImageView_tint, 0xffffffff);
+        mDarkIconColor = 0xff000000;
         mMinBackgroundRadius = mContext.getResources().getDimensionPixelSize(
                 R.dimen.keyguard_affordance_min_background_radius);
-        mAppearInterpolator = AnimationUtils.loadInterpolator(mContext,
-                android.R.interpolator.linear_out_slow_in);
-        mDisappearInterpolator = AnimationUtils.loadInterpolator(mContext,
-                android.R.interpolator.fast_out_linear_in);
         mColorInterpolator = new ArgbEvaluator();
-        mFlingAnimationUtils = new FlingAnimationUtils(mContext, 0.3f);
+        mFlingAnimationUtils = new FlingAnimationUtils(mContext.getResources().getDisplayMetrics(),
+                0.3f);
+
+        a.recycle();
+    }
+
+    public void setImageDrawable(@Nullable Drawable drawable, boolean tint) {
+        super.setImageDrawable(drawable);
+        mShouldTint = tint;
+        updateIconColor();
+    }
+
+    /**
+     * If current drawable should be tinted.
+     */
+    public boolean shouldTint() {
+        return mShouldTint;
     }
 
     @Override
@@ -154,7 +167,7 @@ public class KeyguardAffordanceView extends ImageView {
 
     @Override
     protected void onDraw(Canvas canvas) {
-        mSupportHardware = false;//canvas.isHardwareAccelerated();
+        mSupportHardware = canvas.isHardwareAccelerated();
         drawBackgroundCircle(canvas);
         canvas.save();
         canvas.scale(mImageScale, mImageScale, getWidth() / 2, getHeight() / 2);
@@ -163,6 +176,9 @@ public class KeyguardAffordanceView extends ImageView {
     }
 
     public void setPreviewView(View v) {
+        if (mPreviewView == v) {
+            return;
+        }
         View oldPreviewView = mPreviewView;
         mPreviewView = v;
         if (mPreviewView != null) {
@@ -172,18 +188,22 @@ public class KeyguardAffordanceView extends ImageView {
     }
 
     private void updateIconColor() {
+        if (!mShouldTint) return;
         Drawable drawable = getDrawable().mutate();
         float alpha = mCircleRadius / mMinBackgroundRadius;
         alpha = Math.min(1.0f, alpha);
-        int color = (int) mColorInterpolator.evaluate(alpha, mNormalColor, mInverseColor);
+        int color = (int) mColorInterpolator.evaluate(alpha, mNormalColor, mDarkIconColor);
         drawable.setColorFilter(color, PorterDuff.Mode.SRC_ATOP);
     }
 
     private void drawBackgroundCircle(Canvas canvas) {
         if (mCircleRadius > 0 || mFinishing) {
-            if (mFinishing && mSupportHardware) {
-                DisplayListCanvas displayListCanvas = (DisplayListCanvas) canvas;
-                displayListCanvas.drawCircle(mHwCenterX, mHwCenterY, mHwCircleRadius,
+            if (mFinishing && mSupportHardware && mHwCenterX != null) {
+                // Our hardware drawing proparties can be null if the finishing started but we have
+                // never drawn before. In that case we are not doing a render thread animation
+                // anyway, so we need to use the normal drawing.
+                RecordingCanvas recordingCanvas = (RecordingCanvas) canvas;
+                recordingCanvas.drawCircle(mHwCenterX, mHwCenterY, mHwCircleRadius,
                         mHwCirclePaint);
             } else {
                 updateCircleColor();
@@ -261,7 +281,7 @@ public class KeyguardAffordanceView extends ImageView {
             RenderNodeAnimator animator = new RenderNodeAnimator(mHwCirclePaint,
                     RenderNodeAnimator.PAINT_ALPHA, 255);
             animator.setTarget(this);
-            animator.setInterpolator(PhoneStatusBar.ALPHA_IN);
+            animator.setInterpolator(Interpolators.ALPHA_IN);
             animator.setDuration(250);
             animator.start();
         }
@@ -282,7 +302,7 @@ public class KeyguardAffordanceView extends ImageView {
         RenderNodeAnimator animator = new RenderNodeAnimator(mHwCirclePaint,
                 RenderNodeAnimator.PAINT_ALPHA, 0);
         animator.setDuration(duration);
-        animator.setInterpolator(PhoneStatusBar.ALPHA_OUT);
+        animator.setInterpolator(Interpolators.ALPHA_OUT);
         animator.setTarget(this);
         animator.start();
     }
@@ -352,8 +372,8 @@ public class KeyguardAffordanceView extends ImageView {
             cancelAnimator(mPreviewClipper);
             ValueAnimator animator = getAnimatorToRadius(circleRadius);
             Interpolator interpolator = circleRadius == 0.0f
-                    ? mDisappearInterpolator
-                    : mAppearInterpolator;
+                    ? Interpolators.FAST_OUT_LINEAR_IN
+                    : Interpolators.LINEAR_OUT_SLOW_IN;
             animator.setInterpolator(interpolator);
             long duration = 250;
             if (!slowAnimation) {
@@ -438,8 +458,8 @@ public class KeyguardAffordanceView extends ImageView {
             animator.addListener(mScaleEndListener);
             if (interpolator == null) {
                 interpolator = imageScale == 0.0f
-                        ? mDisappearInterpolator
-                        : mAppearInterpolator;
+                        ? Interpolators.FAST_OUT_LINEAR_IN
+                        : Interpolators.LINEAR_OUT_SLOW_IN;
             }
             animator.setInterpolator(interpolator);
             if (duration == -1) {
@@ -451,13 +471,6 @@ public class KeyguardAffordanceView extends ImageView {
             animator.setDuration(duration);
             animator.start();
         }
-    }
-
-    public void setRestingAlpha(float alpha) {
-        mRestingAlpha = alpha;
-
-        // TODO: Handle the case an animation is playing.
-        setImageAlpha(alpha, false);
     }
 
     public float getRestingAlpha() {
@@ -490,19 +503,16 @@ public class KeyguardAffordanceView extends ImageView {
             int currentAlpha = getImageAlpha();
             ValueAnimator animator = ValueAnimator.ofInt(currentAlpha, endAlpha);
             mAlphaAnimator = animator;
-            animator.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
-                @Override
-                public void onAnimationUpdate(ValueAnimator animation) {
-                    int alpha = (int) animation.getAnimatedValue();
-                    if (background != null) background.mutate().setAlpha(alpha);
-                    setImageAlpha(alpha);
-                }
+            animator.addUpdateListener(animation -> {
+                int alpha1 = (int) animation.getAnimatedValue();
+                if (background != null) background.mutate().setAlpha(alpha1);
+                setImageAlpha(alpha1);
             });
             animator.addListener(mAlphaEndListener);
             if (interpolator == null) {
                 interpolator = alpha == 0.0f
-                        ? mDisappearInterpolator
-                        : mAppearInterpolator;
+                        ? Interpolators.FAST_OUT_LINEAR_IN
+                        : Interpolators.LINEAR_OUT_SLOW_IN;
             }
             animator.setInterpolator(interpolator);
             if (duration == -1) {
@@ -516,6 +526,10 @@ public class KeyguardAffordanceView extends ImageView {
             }
             animator.start();
         }
+    }
+
+    public boolean isAnimatingAlpha() {
+        return mAlphaAnimator != null;
     }
 
     private Animator.AnimatorListener getEndListener(final Runnable runnable) {

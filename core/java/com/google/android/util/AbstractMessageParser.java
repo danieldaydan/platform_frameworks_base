@@ -16,13 +16,15 @@
 
 package com.google.android.util;
 
+import android.compat.annotation.UnsupportedAppUsage;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.Set;
-import java.util.List;
 
 /**
  *
@@ -652,17 +654,29 @@ public abstract class AbstractMessageParser {
 
   /** Represents a unit of parsed output. */
   public static abstract class Token {
+    @UnsupportedAppUsage(implicitMember =
+            "values()[Lcom/google/android/util/AbstractMessageParser$Token$Type;")
     public enum Type {
 
+      @UnsupportedAppUsage
       HTML ("html"),
+      @UnsupportedAppUsage
       FORMAT ("format"),  // subtype of HTML
+      @UnsupportedAppUsage
       LINK ("l"),
+      @UnsupportedAppUsage
       SMILEY ("e"),
+      @UnsupportedAppUsage
       ACRONYM ("a"),
+      @UnsupportedAppUsage
       MUSIC ("m"),
+      @UnsupportedAppUsage
       GOOGLE_VIDEO ("v"),
+      @UnsupportedAppUsage
       YOUTUBE_VIDEO ("yt"),
+      @UnsupportedAppUsage
       PHOTO ("p"),
+      @UnsupportedAppUsage
       FLICKR ("f");
 
       //stringreps for HTML and FORMAT don't really matter

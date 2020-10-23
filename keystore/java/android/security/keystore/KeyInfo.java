@@ -78,7 +78,12 @@ public class KeyInfo implements KeySpec {
     private final @KeyProperties.BlockModeEnum String[] mBlockModes;
     private final boolean mUserAuthenticationRequired;
     private final int mUserAuthenticationValidityDurationSeconds;
+    private final @KeyProperties.AuthEnum int mUserAuthenticationType;
     private final boolean mUserAuthenticationRequirementEnforcedBySecureHardware;
+    private final boolean mUserAuthenticationValidWhileOnBody;
+    private final boolean mTrustedUserPresenceRequired;
+    private final boolean mInvalidatedByBiometricEnrollment;
+    private final boolean mUserConfirmationRequired;
 
     /**
      * @hide
@@ -97,7 +102,12 @@ public class KeyInfo implements KeySpec {
             @KeyProperties.BlockModeEnum String[] blockModes,
             boolean userAuthenticationRequired,
             int userAuthenticationValidityDurationSeconds,
-            boolean userAuthenticationRequirementEnforcedBySecureHardware) {
+            @KeyProperties.AuthEnum int userAuthenticationType,
+            boolean userAuthenticationRequirementEnforcedBySecureHardware,
+            boolean userAuthenticationValidWhileOnBody,
+            boolean trustedUserPresenceRequired,
+            boolean invalidatedByBiometricEnrollment,
+            boolean userConfirmationRequired) {
         mKeystoreAlias = keystoreKeyAlias;
         mInsideSecureHardware = insideSecureHardware;
         mOrigin = origin;
@@ -114,8 +124,13 @@ public class KeyInfo implements KeySpec {
         mBlockModes = ArrayUtils.cloneIfNotEmpty(ArrayUtils.nullToEmpty(blockModes));
         mUserAuthenticationRequired = userAuthenticationRequired;
         mUserAuthenticationValidityDurationSeconds = userAuthenticationValidityDurationSeconds;
+        mUserAuthenticationType = userAuthenticationType;
         mUserAuthenticationRequirementEnforcedBySecureHardware =
                 userAuthenticationRequirementEnforcedBySecureHardware;
+        mUserAuthenticationValidWhileOnBody = userAuthenticationValidWhileOnBody;
+        mTrustedUserPresenceRequired = trustedUserPresenceRequired;
+        mInvalidatedByBiometricEnrollment = invalidatedByBiometricEnrollment;
+        mUserConfirmationRequired = userConfirmationRequired;
     }
 
     /**
@@ -251,6 +266,27 @@ public class KeyInfo implements KeySpec {
     }
 
     /**
+     * Returns {@code true} if the key is authorized to be used only for messages confirmed by the
+     * user.
+     *
+     * Confirmation is separate from user authentication (see
+     * {@link #isUserAuthenticationRequired()}). Keys can be created that require confirmation but
+     * not user authentication, or user authentication but not confirmation, or both. Confirmation
+     * verifies that some user with physical possession of the device has approved a displayed
+     * message. User authentication verifies that the correct user is present and has
+     * authenticated.
+     *
+     * <p>This authorization applies only to secret key and private key operations. Public key
+     * operations are not restricted.
+     *
+     * @see KeyGenParameterSpec.Builder#setUserConfirmationRequired(boolean)
+     * @see KeyProtection.Builder#setUserConfirmationRequired(boolean)
+     */
+    public boolean isUserConfirmationRequired() {
+        return mUserConfirmationRequired;
+    }
+
+    /**
      * Gets the duration of time (seconds) for which this key is authorized to be used after the
      * user is successfully authenticated. This has effect only if user authentication is required
      * (see {@link #isUserAuthenticationRequired()}).
@@ -268,6 +304,22 @@ public class KeyInfo implements KeySpec {
     }
 
     /**
+     * Gets the acceptable user authentication types for which this key can be authorized to be
+     * used. This has effect only if user authentication is required (see
+     * {@link #isUserAuthenticationRequired()}).
+     *
+     * <p>This authorization applies only to secret key and private key operations. Public key
+     * operations are not restricted.
+     *
+     * @return integer representing the accepted forms of user authentication for this key
+     *
+     * @see #isUserAuthenticationRequired()
+     */
+    public @KeyProperties.AuthEnum int getUserAuthenticationType() {
+        return mUserAuthenticationType;
+    }
+
+    /**
      * Returns {@code true} if the requirement that this key can only be used if the user has been
      * authenticated is enforced by secure hardware (e.g., Trusted Execution Environment (TEE) or
      * Secure Element (SE)).
@@ -276,5 +328,31 @@ public class KeyInfo implements KeySpec {
      */
     public boolean isUserAuthenticationRequirementEnforcedBySecureHardware() {
         return mUserAuthenticationRequirementEnforcedBySecureHardware;
+    }
+
+    /**
+     * Returns {@code true} if this key will become unusable when the device is removed from the
+     * user's body.  This is possible only for keys with a specified validity duration, and only on
+     * devices with an on-body sensor.  Always returns {@code false} on devices that lack an on-body
+     * sensor.
+     */
+    public boolean isUserAuthenticationValidWhileOnBody() {
+        return mUserAuthenticationValidWhileOnBody;
+    }
+
+    /**
+     * Returns {@code true} if the key will be invalidated by enrollment of a new fingerprint or
+     * removal of all fingerprints.
+     */
+    public boolean isInvalidatedByBiometricEnrollment() {
+        return mInvalidatedByBiometricEnrollment;
+    }
+
+    /**
+     * Returns {@code true} if the key can only be only be used if a test for user presence has
+     * succeeded since Signature.initSign() has been called.
+     */
+    public boolean isTrustedUserPresenceRequired() {
+        return mTrustedUserPresenceRequired;
     }
 }

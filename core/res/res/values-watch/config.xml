@@ -21,9 +21,10 @@
      for watch products.  Do not translate. -->
 <resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
 
-    <!-- Only show settings item due to smaller real estate. -->
+    <!-- Show smaller list of items due to smaller real estate. -->
     <string-array translatable="false" name="config_globalActionsList">
-        <item>assist</item>
+        <item>power</item>
+        <item>restart</item>
     </string-array>
 
     <!-- Base "touch slop" value used by ViewConfiguration as a
@@ -57,4 +58,19 @@
 
     <!-- Use a custom transition for RemoteViews. -->
     <bool name="config_overrideRemoteViewsActivityTransition">true</bool>
+
+    <!-- Default value for android:focusableInTouchMode for some framework scrolling containers.
+         ListView/GridView are notably absent since this is their default anyway.
+         Set to true for watch devices. -->
+    <bool name="config_focusScrollContainersInTouchMode">true</bool>
+
+    <bool name="config_supportsMultiWindow">false</bool>
+    <bool name="config_supportsMultiDisplay">false</bool>
+    <bool name="config_supportsSplitScreenMultiWindow">false</bool>
+
+     <!-- Default Gravity setting for the system Toast view. Equivalent to: Gravity.CENTER -->
+     <integer name="config_toastDefaultGravity">0x00000011</integer>
+
+    <!-- Default hyphenation frequency setting (0=NONE, 1=NORMAL, 2=FULL). -->
+    <item name="config_preferredHyphenationFrequency" format="integer" type="dimen">1</item>
 </resources>

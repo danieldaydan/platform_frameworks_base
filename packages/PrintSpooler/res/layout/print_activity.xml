@@ -16,7 +16,6 @@
 
 <com.android.printspooler.widget.PrintContentView
         xmlns:android="http://schemas.android.com/apk/res/android"
-        xmlns:printspooler="http://schemas.android.com/apk/res/com.android.printspooler"
     android:id="@+id/options_content"
     android:layout_width="fill_parent"
     android:layout_height="fill_parent">
@@ -28,17 +27,19 @@
         android:layout_width="fill_parent"
         android:layout_height="wrap_content"
         android:paddingStart="8dip"
+        android:layout_marginEnd="16dp"
         android:elevation="@dimen/preview_controls_elevation"
-        android:background="?android:attr/colorPrimary">
+        style="?android:actionBarStyle">
 
-        <Spinner
+        <com.android.printspooler.widget.ClickInterceptSpinner
             android:id="@+id/destination_spinner"
-            android:layout_width="@dimen/preview_destination_spinner_width"
+            android:layout_width="wrap_content"
+            android:minWidth="@dimen/preview_destination_spinner_width"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dip"
             android:dropDownWidth="wrap_content"
             android:minHeight="?android:attr/listPreferredItemHeightSmall">
-        </Spinner>
+        </com.android.printspooler.widget.ClickInterceptSpinner>
 
     </FrameLayout>
 
@@ -48,11 +49,13 @@
         android:id="@+id/summary_content"
         android:layout_width="fill_parent"
         android:layout_height="wrap_content"
+        android:paddingTop="2dip"
         android:paddingStart="16dip"
         android:paddingEnd="16dip"
+        android:paddingBottom="8dip"
         android:orientation="horizontal"
         android:elevation="@dimen/preview_controls_elevation"
-        android:background="?android:attr/colorPrimary">
+        style="?android:actionBarStyle">
 
         <TextView
             android:layout_width="wrap_content"
@@ -69,7 +72,9 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="16dip"
             android:textAppearance="?android:attr/textAppearanceMedium"
-            android:textColor="?android:attr/textColorPrimary">
+            android:textColor="?android:attr/textColorPrimary"
+            android:singleLine="true"
+            android:ellipsize="end">
         </TextView>
 
         <TextView
@@ -87,7 +92,9 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="16dip"
             android:textAppearance="?android:attr/textAppearanceMedium"
-            android:textColor="?android:attr/textColorPrimary">
+            android:textColor="?android:attr/textColorPrimary"
+            android:singleLine="true"
+            android:ellipsize="end">
         </TextView>
 
     </LinearLayout>
@@ -100,6 +107,7 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="16dip"
         android:elevation="@dimen/preview_controls_elevation"
+        android:tint="@android:color/white"
         android:background="@drawable/print_button">
     </ImageButton>
 
@@ -114,15 +122,14 @@
         android:layout_width="fill_parent"
         android:layout_height="fill_parent"
         android:animateLayoutChanges="true"
-        android:background="@color/print_preview_background_color"
         android:gravity="center">
 
         <!-- Error message added here -->
 
         <android.support.v7.widget.RecyclerView
             android:id="@+id/preview_content"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
             android:clipToPadding="false"
             android:orientation="vertical">
         </android.support.v7.widget.RecyclerView>

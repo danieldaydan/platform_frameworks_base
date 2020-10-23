@@ -16,12 +16,18 @@
 
 package android.view;
 
+import static android.view.Display.INVALID_DISPLAY;
+
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.annotation.TestApi;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Build;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.text.method.MetaKeyKeyListener;
 import android.util.Log;
 import android.util.SparseIntArray;
-import android.view.KeyCharacterMap;
 import android.view.KeyCharacterMap.KeyData;
 
 /**
@@ -495,7 +501,8 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * On TV remotes, switches to viewing live TV. */
     public static final int KEYCODE_TV              = 170;
     /** Key code constant: Window key.
-     * On TV remotes, toggles picture-in-picture mode or other windowing functions. */
+     * On TV remotes, toggles picture-in-picture mode or other windowing functions.
+     * On Android Wear devices, triggers a display offset. */
     public static final int KEYCODE_WINDOW          = 171;
     /** Key code constant: Guide key.
      * On TV remotes, shows a programming guide. */
@@ -762,18 +769,22 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * focus. */
     public static final int KEYCODE_NAVIGATE_OUT    = 263;
     /** Key code constant: Primary stem key for Wear
-     * Main power/reset button on watch.
-     * @hide */
+     * Main power/reset button on watch. */
     public static final int KEYCODE_STEM_PRIMARY = 264;
-    /** Key code constant: Generic stem key 1 for Wear
-     * @hide */
+    /** Key code constant: Generic stem key 1 for Wear */
     public static final int KEYCODE_STEM_1 = 265;
-    /** Key code constant: Generic stem key 2 for Wear
-     * @hide */
+    /** Key code constant: Generic stem key 2 for Wear */
     public static final int KEYCODE_STEM_2 = 266;
-    /** Key code constant: Generic stem key 3 for Wear
-     * @hide */
+    /** Key code constant: Generic stem key 3 for Wear */
     public static final int KEYCODE_STEM_3 = 267;
+    /** Key code constant: Directional Pad Up-Left */
+    public static final int KEYCODE_DPAD_UP_LEFT    = 268;
+    /** Key code constant: Directional Pad Down-Left */
+    public static final int KEYCODE_DPAD_DOWN_LEFT  = 269;
+    /** Key code constant: Directional Pad Up-Right */
+    public static final int KEYCODE_DPAD_UP_RIGHT   = 270;
+    /** Key code constant: Directional Pad Down-Right */
+    public static final int KEYCODE_DPAD_DOWN_RIGHT = 271;
     /** Key code constant: Skip forward media key. */
     public static final int KEYCODE_MEDIA_SKIP_FORWARD = 272;
     /** Key code constant: Skip backward media key. */
@@ -784,11 +795,42 @@ public class KeyEvent extends InputEvent implements Parcelable {
     /** Key code constant: Step backward media key.
      * Steps media backward, one frame at a time. */
     public static final int KEYCODE_MEDIA_STEP_BACKWARD = 275;
-    /** Key code constant: put device to sleep unless a wakelock is held.
-     * @hide */
+    /** Key code constant: put device to sleep unless a wakelock is held. */
     public static final int KEYCODE_SOFT_SLEEP = 276;
+    /** Key code constant: Cut key. */
+    public static final int KEYCODE_CUT = 277;
+    /** Key code constant: Copy key. */
+    public static final int KEYCODE_COPY = 278;
+    /** Key code constant: Paste key. */
+    public static final int KEYCODE_PASTE = 279;
+    /** Key code constant: Consumed by the system for navigation up */
+    public static final int KEYCODE_SYSTEM_NAVIGATION_UP = 280;
+    /** Key code constant: Consumed by the system for navigation down */
+    public static final int KEYCODE_SYSTEM_NAVIGATION_DOWN = 281;
+    /** Key code constant: Consumed by the system for navigation left*/
+    public static final int KEYCODE_SYSTEM_NAVIGATION_LEFT = 282;
+    /** Key code constant: Consumed by the system for navigation right */
+    public static final int KEYCODE_SYSTEM_NAVIGATION_RIGHT = 283;
+    /** Key code constant: Show all apps */
+    public static final int KEYCODE_ALL_APPS = 284;
+    /** Key code constant: Refresh key. */
+    public static final int KEYCODE_REFRESH = 285;
+    /** Key code constant: Thumbs up key. Apps can use this to let user upvote content. */
+    public static final int KEYCODE_THUMBS_UP = 286;
+    /** Key code constant: Thumbs down key. Apps can use this to let user downvote content. */
+    public static final int KEYCODE_THUMBS_DOWN = 287;
+    /**
+     * Key code constant: Used to switch current {@link android.accounts.Account} that is
+     * consuming content. May be consumed by system to set account globally.
+     */
+    public static final int KEYCODE_PROFILE_SWITCH = 288;
 
-    private static final int LAST_KEYCODE = KEYCODE_SOFT_SLEEP;
+    /**
+     * Integer value of the last KEYCODE. Increases as new keycodes are added to KeyEvent.
+     * @hide
+     */
+    @TestApi
+    public static final int LAST_KEYCODE = KEYCODE_PROFILE_SWITCH;
 
     // NOTE: If you add a new keycode here you must also add it to:
     //  isSystem()
@@ -807,6 +849,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
 
     // Symbolic names of all metakeys in bit order from least significant to most significant.
     // Accordingly there are exactly 32 values in this table.
+    @UnsupportedAppUsage
     private static final String[] META_SYMBOLIC_NAMES = new String[] {
         "META_SHIFT_ON",
         "META_ALT_ON",
@@ -860,14 +903,16 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     public static final int ACTION_UP               = 1;
     /**
+     * @deprecated No longer used by the input system.
      * {@link #getAction} value: multiple duplicate key events have
      * occurred in a row, or a complex string is being delivered.  If the
-     * key code is not {#link {@link #KEYCODE_UNKNOWN} then the
-     * {#link {@link #getRepeatCount()} method returns the number of times
+     * key code is not {@link #KEYCODE_UNKNOWN} then the
+     * {@link #getRepeatCount()} method returns the number of times
      * the given key code should be executed.
      * Otherwise, if the key code is {@link #KEYCODE_UNKNOWN}, then
      * this is a sequence of characters as returned by {@link #getCharacters}.
      */
+    @Deprecated
     public static final int ACTION_MULTIPLE         = 2;
 
     /**
@@ -875,6 +920,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * Reserved for use by {@link MetaKeyKeyListener} for a published constant in its API.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final int META_CAP_LOCKED = 0x100;
 
     /**
@@ -882,6 +928,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * Reserved for use by {@link MetaKeyKeyListener} for a published constant in its API.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final int META_ALT_LOCKED = 0x200;
 
     /**
@@ -889,6 +936,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * Reserved for use by {@link MetaKeyKeyListener} for a published constant in its API.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final int META_SYM_LOCKED = 0x400;
 
     /**
@@ -897,6 +945,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * in its API that is currently being retained for legacy reasons.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final int META_SELECTING = 0x800;
 
     /**
@@ -1216,16 +1265,30 @@ public class KeyEvent extends InputEvent implements Parcelable {
 
     private KeyEvent mNext;
 
+    private int mId;
+    @UnsupportedAppUsage
     private int mDeviceId;
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private int mSource;
+    private int mDisplayId;
+    private @Nullable byte[] mHmac;
+    @UnsupportedAppUsage
     private int mMetaState;
+    @UnsupportedAppUsage
     private int mAction;
+    @UnsupportedAppUsage
     private int mKeyCode;
+    @UnsupportedAppUsage
     private int mScanCode;
+    @UnsupportedAppUsage
     private int mRepeatCount;
+    @UnsupportedAppUsage
     private int mFlags;
+    @UnsupportedAppUsage
     private long mDownTime;
+    @UnsupportedAppUsage
     private long mEventTime;
+    @UnsupportedAppUsage
     private String mCharacters;
 
     public interface Callback {
@@ -1272,8 +1335,9 @@ public class KeyEvent extends InputEvent implements Parcelable {
         boolean onKeyUp(int keyCode, KeyEvent event);
 
         /**
-         * Called when multiple down/up pairs of the same key have occurred
-         * in a row.
+         * Called when a user's interaction with an analog control, such as
+         * flinging a trackball, generates simulated down/up events for the same
+         * key multiple times in quick succession.
          *
          * @param keyCode The value in event.getKeyCode().
          * @param count Number of pairs as returned by event.getRepeatCount().
@@ -1287,9 +1351,9 @@ public class KeyEvent extends InputEvent implements Parcelable {
 
     private static native String nativeKeyCodeToString(int keyCode);
     private static native int nativeKeyCodeFromString(String keyCode);
+    private static native int nativeNextId();
 
-    private KeyEvent() {
-    }
+    private KeyEvent() {}
 
     /**
      * Create a new key event.
@@ -1299,6 +1363,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @param code The key code.
      */
     public KeyEvent(int action, int code) {
+        mId = nativeNextId();
         mAction = action;
         mKeyCode = code;
         mRepeatCount = 0;
@@ -1320,6 +1385,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     public KeyEvent(long downTime, long eventTime, int action,
                     int code, int repeat) {
+        mId = nativeNextId();
         mDownTime = downTime;
         mEventTime = eventTime;
         mAction = action;
@@ -1344,6 +1410,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     public KeyEvent(long downTime, long eventTime, int action,
                     int code, int repeat, int metaState) {
+        mId = nativeNextId();
         mDownTime = downTime;
         mEventTime = eventTime;
         mAction = action;
@@ -1372,6 +1439,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
     public KeyEvent(long downTime, long eventTime, int action,
                     int code, int repeat, int metaState,
                     int deviceId, int scancode) {
+        mId = nativeNextId();
         mDownTime = downTime;
         mEventTime = eventTime;
         mAction = action;
@@ -1402,6 +1470,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
     public KeyEvent(long downTime, long eventTime, int action,
                     int code, int repeat, int metaState,
                     int deviceId, int scancode, int flags) {
+        mId = nativeNextId();
         mDownTime = downTime;
         mEventTime = eventTime;
         mAction = action;
@@ -1434,6 +1503,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
     public KeyEvent(long downTime, long eventTime, int action,
                     int code, int repeat, int metaState,
                     int deviceId, int scancode, int flags, int source) {
+        mId = nativeNextId();
         mDownTime = downTime;
         mEventTime = eventTime;
         mAction = action;
@@ -1444,6 +1514,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mScanCode = scancode;
         mFlags = flags;
         mSource = source;
+        mDisplayId = INVALID_DISPLAY;
     }
 
     /**
@@ -1459,6 +1530,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @param flags The flags for this key event
      */
     public KeyEvent(long time, String characters, int deviceId, int flags) {
+        mId = nativeNextId();
         mDownTime = time;
         mEventTime = time;
         mCharacters = characters;
@@ -1468,12 +1540,14 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mDeviceId = deviceId;
         mFlags = flags;
         mSource = InputDevice.SOURCE_KEYBOARD;
+        mDisplayId = INVALID_DISPLAY;
     }
 
     /**
      * Make an exact copy of an existing key event.
      */
     public KeyEvent(KeyEvent origEvent) {
+        mId = origEvent.mId;
         mDownTime = origEvent.mDownTime;
         mEventTime = origEvent.mEventTime;
         mAction = origEvent.mAction;
@@ -1482,6 +1556,8 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mMetaState = origEvent.mMetaState;
         mDeviceId = origEvent.mDeviceId;
         mSource = origEvent.mSource;
+        mDisplayId = origEvent.mDisplayId;
+        mHmac = origEvent.mHmac == null ? null : origEvent.mHmac.clone();
         mScanCode = origEvent.mScanCode;
         mFlags = origEvent.mFlags;
         mCharacters = origEvent.mCharacters;
@@ -1500,6 +1576,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     @Deprecated
     public KeyEvent(KeyEvent origEvent, long eventTime, int newRepeat) {
+        mId = nativeNextId();  // Not an exact copy so assign a new ID.
         mDownTime = origEvent.mDownTime;
         mEventTime = eventTime;
         mAction = origEvent.mAction;
@@ -1508,6 +1585,8 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mMetaState = origEvent.mMetaState;
         mDeviceId = origEvent.mDeviceId;
         mSource = origEvent.mSource;
+        mDisplayId = origEvent.mDisplayId;
+        mHmac = null; // Don't copy HMAC, it will be invalid because eventTime is changing
         mScanCode = origEvent.mScanCode;
         mFlags = origEvent.mFlags;
         mCharacters = origEvent.mCharacters;
@@ -1529,14 +1608,16 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     /**
-     * Obtains a (potentially recycled) key event.
+     * Obtains a (potentially recycled) key event. Used by native code to create a Java object.
      *
      * @hide
      */
-    public static KeyEvent obtain(long downTime, long eventTime, int action,
-                    int code, int repeat, int metaState,
-                    int deviceId, int scancode, int flags, int source, String characters) {
+    public static KeyEvent obtain(int id, long downTime, long eventTime, int action,
+            int code, int repeat, int metaState,
+            int deviceId, int scancode, int flags, int source, int displayId, @Nullable byte[] hmac,
+            String characters) {
         KeyEvent ev = obtain();
+        ev.mId = id;
         ev.mDownTime = downTime;
         ev.mEventTime = eventTime;
         ev.mAction = action;
@@ -1547,9 +1628,38 @@ public class KeyEvent extends InputEvent implements Parcelable {
         ev.mScanCode = scancode;
         ev.mFlags = flags;
         ev.mSource = source;
+        ev.mDisplayId = displayId;
+        ev.mHmac = hmac;
         ev.mCharacters = characters;
         return ev;
     }
+
+    /**
+     * Obtains a (potentially recycled) key event.
+     *
+     * @hide
+     */
+    public static KeyEvent obtain(long downTime, long eventTime, int action,
+            int code, int repeat, int metaState,
+            int deviceId, int scanCode, int flags, int source, int displayId, String characters) {
+        return obtain(nativeNextId(), downTime, eventTime, action, code, repeat, metaState,
+                deviceId, scanCode, flags, source, displayId, null /* hmac */, characters);
+    }
+
+    /**
+     * Obtains a (potentially recycled) key event.
+     *
+     * @hide
+     */
+    @UnsupportedAppUsage
+    public static KeyEvent obtain(long downTime, long eventTime, int action,
+            int code, int repeat, int metaState,
+            int deviceId, int scancode, int flags, int source, String characters) {
+        return obtain(downTime, eventTime, action, code, repeat, metaState, deviceId, scancode,
+                flags, source, INVALID_DISPLAY, characters);
+    }
+
+    /**
 
     /**
      * Obtains a (potentially recycled) copy of another key event.
@@ -1558,6 +1668,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     public static KeyEvent obtain(KeyEvent other) {
         KeyEvent ev = obtain();
+        ev.mId = other.mId;
         ev.mDownTime = other.mDownTime;
         ev.mEventTime = other.mEventTime;
         ev.mAction = other.mAction;
@@ -1568,6 +1679,8 @@ public class KeyEvent extends InputEvent implements Parcelable {
         ev.mScanCode = other.mScanCode;
         ev.mFlags = other.mFlags;
         ev.mSource = other.mSource;
+        ev.mDisplayId = other.mDisplayId;
+        ev.mHmac = other.mHmac == null ? null : other.mHmac.clone();
         ev.mCharacters = other.mCharacters;
         return ev;
     }
@@ -1586,6 +1699,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @hide
      */
     @Override
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     public final void recycle() {
         super.recycle();
         mCharacters = null;
@@ -1603,6 +1717,12 @@ public class KeyEvent extends InputEvent implements Parcelable {
     @Override
     public final void recycleIfNeededAfterDispatch() {
         // Do nothing.
+    }
+
+    /** @hide */
+    @Override
+    public int getId() {
+        return mId;
     }
 
     /**
@@ -1633,6 +1753,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
     public static KeyEvent changeTimeRepeat(KeyEvent event, long eventTime,
             int newRepeat, int newFlags) {
         KeyEvent ret = new KeyEvent(event);
+        ret.mId = nativeNextId();  // Not an exact copy so assign a new ID.
         ret.mEventTime = eventTime;
         ret.mRepeatCount = newRepeat;
         ret.mFlags = newFlags;
@@ -1646,6 +1767,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @param action The new action code of the event.
      */
     private KeyEvent(KeyEvent origEvent, int action) {
+        mId = nativeNextId();  // Not an exact copy so assign a new ID.
         mDownTime = origEvent.mDownTime;
         mEventTime = origEvent.mEventTime;
         mAction = action;
@@ -1654,6 +1776,8 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mMetaState = origEvent.mMetaState;
         mDeviceId = origEvent.mDeviceId;
         mSource = origEvent.mSource;
+        mDisplayId = origEvent.mDisplayId;
+        mHmac = null; // Don't copy the hmac, it will be invalid since action is changing
         mScanCode = origEvent.mScanCode;
         mFlags = origEvent.mFlags;
         // Don't copy mCharacters, since one way or the other we'll lose it
@@ -1680,6 +1804,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      */
     public static KeyEvent changeFlags(KeyEvent event, int flags) {
         event = new KeyEvent(event);
+        event.mId = nativeNextId();  // Not an exact copy so assign a new ID.
         event.mFlags = flags;
         return event;
     }
@@ -1705,6 +1830,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @deprecated
      * @hide
      */
+    @UnsupportedAppUsage
     @Deprecated public final boolean isDown() {
         return mAction == ACTION_DOWN;
     }
@@ -1766,10 +1892,13 @@ public class KeyEvent extends InputEvent implements Parcelable {
     /** Whether key will, by default, trigger a click on the focused view.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final boolean isConfirmKey(int keyCode) {
         switch (keyCode) {
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_SPACE:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
                 return true;
             default:
                 return false;
@@ -1777,12 +1906,12 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     /**
-     * Whether this key is a media key, which can be send to apps that are
-     * interested in media key events.
+     * Returns whether this key will be sent to the
+     * {@link android.media.session.MediaSession.Callback} if not handled.
      *
      * @hide
      */
-    public static final boolean isMediaKey(int keyCode) {
+    public static final boolean isMediaSessionKey(int keyCode) {
         switch (keyCode) {
             case KeyEvent.KEYCODE_MEDIA_PLAY:
             case KeyEvent.KEYCODE_MEDIA_PAUSE:
@@ -1799,7 +1928,6 @@ public class KeyEvent extends InputEvent implements Parcelable {
         }
         return false;
     }
-
 
     /** Is this a system key? System keys can not be used for menu shortcuts.
      * @hide
@@ -1833,6 +1961,10 @@ public class KeyEvent extends InputEvent implements Parcelable {
             case KeyEvent.KEYCODE_BRIGHTNESS_DOWN:
             case KeyEvent.KEYCODE_BRIGHTNESS_UP:
             case KeyEvent.KEYCODE_MEDIA_AUDIO_TRACK:
+            case KeyEvent.KEYCODE_SYSTEM_NAVIGATION_UP:
+            case KeyEvent.KEYCODE_SYSTEM_NAVIGATION_DOWN:
+            case KeyEvent.KEYCODE_SYSTEM_NAVIGATION_LEFT:
+            case KeyEvent.KEYCODE_SYSTEM_NAVIGATION_RIGHT:
                 return true;
         }
 
@@ -1842,13 +1974,13 @@ public class KeyEvent extends InputEvent implements Parcelable {
     /** @hide */
     public static final boolean isWakeKey(int keyCode) {
         switch (keyCode) {
-            case KeyEvent.KEYCODE_BACK:
+            case KeyEvent.KEYCODE_CAMERA:
             case KeyEvent.KEYCODE_MENU:
-            case KeyEvent.KEYCODE_WAKEUP:
             case KeyEvent.KEYCODE_PAIRING:
             case KeyEvent.KEYCODE_STEM_1:
             case KeyEvent.KEYCODE_STEM_2:
             case KeyEvent.KEYCODE_STEM_3:
+            case KeyEvent.KEYCODE_WAKEUP:
                 return true;
         }
         return false;
@@ -1857,6 +1989,11 @@ public class KeyEvent extends InputEvent implements Parcelable {
     /** @hide */
     public static final boolean isMetaKey(int keyCode) {
         return keyCode == KeyEvent.KEYCODE_META_LEFT || keyCode == KeyEvent.KEYCODE_META_RIGHT;
+    }
+
+    /** @hide */
+    public static final boolean isAltKey(int keyCode) {
+        return keyCode == KeyEvent.KEYCODE_ALT_LEFT || keyCode == KeyEvent.KEYCODE_ALT_RIGHT;
     }
 
     /** {@inheritDoc} */
@@ -1875,6 +2012,19 @@ public class KeyEvent extends InputEvent implements Parcelable {
     @Override
     public final void setSource(int source) {
         mSource = source;
+    }
+
+    /** @hide */
+    @Override
+    public final int getDisplayId() {
+        return mDisplayId;
+    }
+
+    /** @hide */
+    @TestApi
+    @Override
+    public final void setDisplayId(int displayId) {
+        mDisplayId = displayId;
     }
 
     /**
@@ -1936,6 +2086,16 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     /**
+     * Modifies the flags of the event.
+     *
+     * @param newFlags New flags for the event, replacing the entire value.
+     * @hide
+     */
+    public final void setFlags(int newFlags) {
+        mFlags = newFlags;
+    }
+
+    /**
      * Returns the flags for this key event.
      *
      * @see #FLAG_WOKE_HERE
@@ -1945,6 +2105,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     // Mask of all modifier key meta states.  Specifically excludes locked keys like caps lock.
+    @UnsupportedAppUsage
     private static final int META_MODIFIER_MASK =
             META_SHIFT_ON | META_SHIFT_LEFT_ON | META_SHIFT_RIGHT_ON
             | META_ALT_ON | META_ALT_LEFT_ON | META_ALT_RIGHT_ON
@@ -1953,19 +2114,23 @@ public class KeyEvent extends InputEvent implements Parcelable {
             | META_SYM_ON | META_FUNCTION_ON;
 
     // Mask of all lock key meta states.
+    @UnsupportedAppUsage
     private static final int META_LOCK_MASK =
             META_CAPS_LOCK_ON | META_NUM_LOCK_ON | META_SCROLL_LOCK_ON;
 
     // Mask of all valid meta states.
+    @UnsupportedAppUsage
     private static final int META_ALL_MASK = META_MODIFIER_MASK | META_LOCK_MASK;
 
     // Mask of all synthetic meta states that are reserved for API compatibility with
     // historical uses in MetaKeyKeyListener.
+    @UnsupportedAppUsage
     private static final int META_SYNTHETIC_MASK =
             META_CAP_LOCKED | META_ALT_LOCKED | META_SYM_LOCKED | META_SELECTING;
 
     // Mask of all meta states that are not valid use in specifying a modifier key.
     // These bits are known to be used for purposes other than specifying modifiers.
+    @UnsupportedAppUsage
     private static final int META_INVALID_MODIFIER_MASK =
             META_LOCK_MASK | META_SYNTHETIC_MASK;
 
@@ -2398,7 +2563,10 @@ public class KeyEvent extends InputEvent implements Parcelable {
      *
      * @return Returns a String of 1 or more characters associated with
      * the event.
+     *
+     * @deprecated no longer used by the input system.
      */
+    @Deprecated
     public final String getCharacters() {
         return mCharacters;
     }
@@ -2415,15 +2583,30 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     /**
-     * Retrieve the repeat count of the event.  For both key up and key down
-     * events, this is the number of times the key has repeated with the first
-     * down starting at 0 and counting up from there.  For multiple key
-     * events, this is the number of down/up pairs that have occurred.
+     * Retrieve the repeat count of the event.  For key down events,
+     * this is the number of times the key has repeated with the first
+     * down starting at 0 and counting up from there.  For key up events,
+     * this is always equal to zero. For multiple key events,
+     * this is the number of down/up pairs that have occurred.
      *
      * @return The number of times the key has repeated.
      */
     public final int getRepeatCount() {
         return mRepeatCount;
+    }
+
+    /**
+     * Modifies the down time and the event time of the event.
+     *
+     * @param downTime The new down time (in {@link android.os.SystemClock#uptimeMillis}) of the
+     *                 event.
+     * @param eventTime The new event time (in {@link android.os.SystemClock#uptimeMillis}) of the
+     *                  event.
+     * @hide
+     */
+    public final void setTime(long downTime, long eventTime) {
+        mDownTime = downTime;
+        mEventTime = eventTime;
     }
 
     /**
@@ -2812,6 +2995,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
         msg.append(", downTime=").append(mDownTime);
         msg.append(", deviceId=").append(mDeviceId);
         msg.append(", source=0x").append(Integer.toHexString(mSource));
+        msg.append(", displayId=").append(mDisplayId);
         msg.append(" }");
         return msg.toString();
     }
@@ -2824,6 +3008,7 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * @return The symbolic name of the specified action.
      * @hide
      */
+    @TestApi
     public static String actionToString(int action) {
         switch (action) {
             case ACTION_DOWN:
@@ -2842,6 +3027,9 @@ public class KeyEvent extends InputEvent implements Parcelable {
      * such as "KEYCODE_A", "KEYCODE_DPAD_UP", or an equivalent numeric constant
      * such as "1001" if unknown.
      *
+     * This function is intended to be used mostly for debugging, logging, and testing. It is not
+     * locale-specific and is not intended to be used in a user-facing manner.
+     *
      * @param keyCode The key code.
      * @return The symbolic name of the specified keycode.
      *
@@ -2854,25 +3042,34 @@ public class KeyEvent extends InputEvent implements Parcelable {
 
     /**
      * Gets a keycode by its symbolic name such as "KEYCODE_A" or an equivalent
-     * numeric constant such as "1001".
+     * numeric constant such as "29". For symbolic names,
+     * starting in {@link android.os.Build.VERSION_CODES#Q} the prefix "KEYCODE_" is optional.
      *
      * @param symbolicName The symbolic name of the keycode.
      * @return The keycode or {@link #KEYCODE_UNKNOWN} if not found.
-     * @see #keycodeToString(int)
+     * @see #keyCodeToString(int)
      */
-    public static int keyCodeFromString(String symbolicName) {
-        if (symbolicName.startsWith(LABEL_PREFIX)) {
-            symbolicName = symbolicName.substring(LABEL_PREFIX.length());
-            int keyCode = nativeKeyCodeFromString(symbolicName);
-            if (keyCode > 0) {
+    public static int keyCodeFromString(@NonNull String symbolicName) {
+        try {
+            int keyCode = Integer.parseInt(symbolicName);
+            if (keyCodeIsValid(keyCode)) {
                 return keyCode;
             }
-        }
-        try {
-            return Integer.parseInt(symbolicName, 10);
         } catch (NumberFormatException ex) {
-            return KEYCODE_UNKNOWN;
         }
+
+        if (symbolicName.startsWith(LABEL_PREFIX)) {
+            symbolicName = symbolicName.substring(LABEL_PREFIX.length());
+        }
+        int keyCode = nativeKeyCodeFromString(symbolicName);
+        if (keyCodeIsValid(keyCode)) {
+            return keyCode;
+        }
+        return KEYCODE_UNKNOWN;
+    }
+
+    private static boolean keyCodeIsValid(int keyCode) {
+        return keyCode >= KEYCODE_UNKNOWN && keyCode <= LAST_KEYCODE;
     }
 
     /**
@@ -2911,13 +3108,15 @@ public class KeyEvent extends InputEvent implements Parcelable {
         return result.toString();
     }
 
-    public static final Parcelable.Creator<KeyEvent> CREATOR
+    public static final @android.annotation.NonNull Parcelable.Creator<KeyEvent> CREATOR
             = new Parcelable.Creator<KeyEvent>() {
+        @Override
         public KeyEvent createFromParcel(Parcel in) {
             in.readInt(); // skip token, we already know this is a KeyEvent
             return KeyEvent.createFromParcelBody(in);
         }
 
+        @Override
         public KeyEvent[] newArray(int size) {
             return new KeyEvent[size];
         }
@@ -2929,8 +3128,11 @@ public class KeyEvent extends InputEvent implements Parcelable {
     }
 
     private KeyEvent(Parcel in) {
+        mId = in.readInt();
         mDeviceId = in.readInt();
         mSource = in.readInt();
+        mDisplayId = in.readInt();
+        mHmac = in.createByteArray();
         mAction = in.readInt();
         mKeyCode = in.readInt();
         mRepeatCount = in.readInt();
@@ -2939,13 +3141,18 @@ public class KeyEvent extends InputEvent implements Parcelable {
         mFlags = in.readInt();
         mDownTime = in.readLong();
         mEventTime = in.readLong();
+        mCharacters = in.readString();
     }
 
+    @Override
     public void writeToParcel(Parcel out, int flags) {
         out.writeInt(PARCEL_TOKEN_KEY_EVENT);
 
+        out.writeInt(mId);
         out.writeInt(mDeviceId);
         out.writeInt(mSource);
+        out.writeInt(mDisplayId);
+        out.writeByteArray(mHmac);
         out.writeInt(mAction);
         out.writeInt(mKeyCode);
         out.writeInt(mRepeatCount);
@@ -2954,5 +3161,6 @@ public class KeyEvent extends InputEvent implements Parcelable {
         out.writeInt(mFlags);
         out.writeLong(mDownTime);
         out.writeLong(mEventTime);
+        out.writeString(mCharacters);
     }
 }

@@ -22,7 +22,7 @@
     android:layout_height="wrap_content"
     android:orientation="vertical"
     android:elevation="@dimen/preview_controls_elevation"
-    android:background="?android:attr/colorPrimary">
+    style="?android:actionBarStyle">
 
     <LinearLayout
         android:id="@+id/draggable_content"
@@ -239,7 +239,8 @@
                     android:singleLine="true"
                     android:ellipsize="end"
                     android:visibility="visible"
-                    android:inputType="textNoSuggestions">
+                    android:inputType="textNoSuggestions"
+                    android:digits="0123456789 ,-">
                 </com.android.printspooler.widget.CustomErrorEditText>
 
             </LinearLayout>

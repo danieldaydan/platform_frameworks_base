@@ -16,15 +16,23 @@
 
 package com.android.vpndialogs;
 
+import static android.view.WindowManager.LayoutParams.SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS;
+
 import android.content.Context;
 import android.content.DialogInterface;
+import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
 import android.net.IConnectivityManager;
+import android.net.VpnManager;
+import android.os.Bundle;
+import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.UserHandle;
+import android.os.UserManager;
 import android.text.Html;
 import android.text.Html.ImageGetter;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.View;
 import android.widget.Button;
 import android.widget.TextView;
@@ -36,55 +44,98 @@ public class ConfirmDialog extends AlertActivity
         implements DialogInterface.OnClickListener, ImageGetter {
     private static final String TAG = "VpnConfirm";
 
+    @VpnManager.VpnType private final int mVpnType;
+
     private String mPackage;
 
     private IConnectivityManager mService;
 
-    private Button mButton;
+    public ConfirmDialog() {
+        this(VpnManager.TYPE_VPN_SERVICE);
+    }
+
+    public ConfirmDialog(@VpnManager.VpnType int vpnType) {
+        mVpnType = vpnType;
+    }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        try {
-            mPackage = getCallingPackage();
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        mPackage = getCallingPackage();
+        mService = IConnectivityManager.Stub.asInterface(
+                ServiceManager.getService(Context.CONNECTIVITY_SERVICE));
 
-            mService = IConnectivityManager.Stub.asInterface(
-                    ServiceManager.getService(Context.CONNECTIVITY_SERVICE));
-
-            if (mService.prepareVpn(mPackage, null, UserHandle.myUserId())) {
-                setResult(RESULT_OK);
-                finish();
-                return;
-            }
-
-            View view = View.inflate(this, R.layout.confirm, null);
-
-            ((TextView) view.findViewById(R.id.warning)).setText(
-                    Html.fromHtml(
-                            getString(R.string.warning, VpnConfig.getVpnLabel(this, mPackage)),
-                    this, null /* tagHandler */));
-
-            mAlertParams.mTitle = getText(R.string.prompt);
-            mAlertParams.mPositiveButtonText = getText(android.R.string.ok);
-            mAlertParams.mPositiveButtonListener = this;
-            mAlertParams.mNegativeButtonText = getText(android.R.string.cancel);
-            mAlertParams.mView = view;
-            setupAlert();
-
-            getWindow().setCloseOnTouchOutside(false);
-            mButton = mAlert.getButton(DialogInterface.BUTTON_POSITIVE);
-            mButton.setFilterTouchesWhenObscured(true);
-        } catch (Exception e) {
-            Log.e(TAG, "onResume", e);
+        if (prepareVpn()) {
+            setResult(RESULT_OK);
             finish();
+            return;
+        }
+        if (UserManager.get(this).hasUserRestriction(UserManager.DISALLOW_CONFIG_VPN)) {
+            finish();
+            return;
+        }
+        final String alwaysOnVpnPackage = getAlwaysOnVpnPackage();
+        // Can't prepare new vpn app when another vpn is always-on
+        if (alwaysOnVpnPackage != null && !alwaysOnVpnPackage.equals(mPackage)) {
+            finish();
+            return;
+        }
+        View view = View.inflate(this, R.layout.confirm, null);
+        ((TextView) view.findViewById(R.id.warning)).setText(
+                Html.fromHtml(getString(R.string.warning, getVpnLabel()),
+                        this, null /* tagHandler */));
+        mAlertParams.mTitle = getText(R.string.prompt);
+        mAlertParams.mPositiveButtonText = getText(android.R.string.ok);
+        mAlertParams.mPositiveButtonListener = this;
+        mAlertParams.mNegativeButtonText = getText(android.R.string.cancel);
+        mAlertParams.mView = view;
+        setupAlert();
+
+        getWindow().setCloseOnTouchOutside(false);
+        getWindow().addPrivateFlags(SYSTEM_FLAG_HIDE_NON_SYSTEM_OVERLAY_WINDOWS);
+        Button button = mAlert.getButton(DialogInterface.BUTTON_POSITIVE);
+        button.setFilterTouchesWhenObscured(true);
+    }
+
+    private String getAlwaysOnVpnPackage() {
+        try {
+           return mService.getAlwaysOnVpnPackage(UserHandle.myUserId());
+        } catch (RemoteException e) {
+            Log.e(TAG, "fail to call getAlwaysOnVpnPackage", e);
+            // Fallback to null to show the dialog
+            return null;
+        }
+    }
+
+    private boolean prepareVpn() {
+        try {
+            return mService.prepareVpn(mPackage, null, UserHandle.myUserId());
+        } catch (RemoteException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private CharSequence getVpnLabel() {
+        try {
+            return VpnConfig.getVpnLabel(this, mPackage);
+        } catch (PackageManager.NameNotFoundException e) {
+            throw new IllegalStateException(e);
         }
     }
 
     @Override
     public Drawable getDrawable(String source) {
         // Should only reach this when fetching the VPN icon for the warning string.
-        Drawable icon = getDrawable(R.drawable.ic_vpn_dialog);
+        final Drawable icon = getDrawable(R.drawable.ic_vpn_dialog);
         icon.setBounds(0, 0, icon.getIntrinsicWidth(), icon.getIntrinsicHeight());
+
+        final TypedValue tv = new TypedValue();
+        if (getTheme().resolveAttribute(android.R.attr.textColorPrimary, tv, true)) {
+            icon.setTint(getColor(tv.resourceId));
+        } else {
+            Log.w(TAG, "Unable to resolve theme color");
+        }
+
         return icon;
     }
 
@@ -98,7 +149,7 @@ public class ConfirmDialog extends AlertActivity
             if (mService.prepareVpn(null, mPackage, UserHandle.myUserId())) {
                 // Authorize this app to initiate VPN connections in the future without user
                 // intervention.
-                mService.setVpnPackageAuthorization(mPackage, UserHandle.myUserId(), true);
+                mService.setVpnPackageAuthorization(mPackage, UserHandle.myUserId(), mVpnType);
                 setResult(RESULT_OK);
             }
         } catch (Exception e) {

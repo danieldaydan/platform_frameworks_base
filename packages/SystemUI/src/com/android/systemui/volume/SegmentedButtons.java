@@ -35,18 +35,18 @@ public class SegmentedButtons extends LinearLayout {
     private static final Typeface MEDIUM = Typeface.create("sans-serif-medium", Typeface.NORMAL);
 
     private final Context mContext;
-    private final LayoutInflater mInflater;
-    private final SpTexts mSpTexts;
+    protected final LayoutInflater mInflater;
+    private final ConfigurableTexts mConfigurableTexts;
 
     private Callback mCallback;
-    private Object mSelectedValue;
+    protected Object mSelectedValue;
 
     public SegmentedButtons(Context context, AttributeSet attrs) {
         super(context, attrs);
         mContext = context;
         mInflater = LayoutInflater.from(mContext);
         setOrientation(HORIZONTAL);
-        mSpTexts = new SpTexts(mContext);
+        mConfigurableTexts = new ConfigurableTexts(mContext);
     }
 
     public void setCallback(Callback callback) {
@@ -65,13 +65,21 @@ public class SegmentedButtons extends LinearLayout {
             final Object tag = c.getTag();
             final boolean selected = Objects.equals(mSelectedValue, tag);
             c.setSelected(selected);
-            c.setTypeface(selected ? MEDIUM : REGULAR);
+            setSelectedStyle(c, selected);
         }
         fireOnSelected(fromClick);
     }
 
+    protected void setSelectedStyle(TextView textView, boolean selected) {
+        textView.setTypeface(selected ? MEDIUM : REGULAR);
+    }
+
+    public Button inflateButton() {
+        return (Button) mInflater.inflate(R.layout.segmented_button, this, false);
+    }
+
     public void addButton(int labelResId, int contentDescriptionResId, Object value) {
-        final Button b = (Button) mInflater.inflate(R.layout.segmented_button, this, false);
+        final Button b = inflateButton();
         b.setTag(LABEL_RES_KEY, labelResId);
         b.setText(labelResId);
         b.setContentDescription(getResources().getString(contentDescriptionResId));
@@ -89,15 +97,11 @@ public class SegmentedButtons extends LinearLayout {
                 fireInteraction();
             }
         });
-        mSpTexts.add(b);
+        mConfigurableTexts.add(b, labelResId);
     }
 
-    public void updateLocale() {
-        for (int i = 0; i < getChildCount(); i++) {
-            final Button b = (Button) getChildAt(i);
-            final int labelResId = (Integer) b.getTag(LABEL_RES_KEY);
-            b.setText(labelResId);
-        }
+    public void update() {
+        mConfigurableTexts.update();
     }
 
     private void fireOnSelected(boolean fromClick) {

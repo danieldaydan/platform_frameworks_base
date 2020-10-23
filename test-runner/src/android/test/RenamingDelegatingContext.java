@@ -16,27 +16,36 @@
 
 package android.test;
 
-import com.google.android.collect.Sets;
-
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.ContentProvider;
 import android.database.DatabaseErrorHandler;
 import android.database.sqlite.SQLiteDatabase;
-import android.os.FileUtils;
+import android.test.mock.MockContentProvider;
 import android.util.Log;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.Set;
 
 /**
  * This is a class which delegates to the given context, but performs database
  * and file operations with a renamed database/file name (prefixes default
  * names with a given prefix).
+ *
+ * @deprecated New tests should be written using the
+ * <a href="{@docRoot}tools/testing-support-library/index.html">Android Testing Support Library</a>.
  */
+@Deprecated
 public class RenamingDelegatingContext extends ContextWrapper {
 
     private Context mFileContext;
@@ -44,8 +53,8 @@ public class RenamingDelegatingContext extends ContextWrapper {
     private File mCacheDir;
     private final Object mSync = new Object();
 
-    private Set<String> mDatabaseNames = Sets.newHashSet();
-    private Set<String> mFileNames = Sets.newHashSet();
+    private Set<String> mDatabaseNames = new HashSet<>();
+    private Set<String> mFileNames = new HashSet<>();
 
     public static <T extends ContentProvider> T providerWithRenamedContext(
             Class<T> contentProvider, Context c, String filePrefix)
@@ -63,7 +72,7 @@ public class RenamingDelegatingContext extends ContextWrapper {
         if (allowAccessToExistingFilesAndDbs) {
             mContext.makeExistingFilesAndDbsAccessible();
         }
-        mProvider.attachInfoForTesting(mContext, null);
+        MockContentProvider.attachInfoForTesting(mProvider, mContext, null);
         return mProvider;
     }
 
@@ -168,7 +177,7 @@ public class RenamingDelegatingContext extends ContextWrapper {
             return false;
         }
     }
-    
+
     @Override
     public File getDatabasePath(String name) {
         return mFileContext.getDatabasePath(renamedFileName(name));
@@ -216,7 +225,7 @@ public class RenamingDelegatingContext extends ContextWrapper {
     public String[] fileList() {
         return mFileNames.toArray(new String[]{});
     }
-    
+
     /**
      * In order to support calls to getCacheDir(), we create a temp cache dir (inside the real
      * one) and return it instead.  This code is basically getCacheDir(), except it uses the real
@@ -233,29 +242,16 @@ public class RenamingDelegatingContext extends ContextWrapper {
                     Log.w("RenamingDelegatingContext", "Unable to create cache directory");
                     return null;
                 }
-                FileUtils.setPermissions(
-                        mCacheDir.getPath(),
-                        FileUtils.S_IRWXU|FileUtils.S_IRWXG|FileUtils.S_IXOTH,
-                        -1, -1);
+                try {
+                    // Give the directory all possible permissions.
+                    Files.setPosixFilePermissions(mCacheDir.toPath(),
+                            EnumSet.allOf(PosixFilePermission.class));
+                } catch (IOException e) {
+                    Log.e("RenamingDelegatingContext",
+                            "Could not set permissions of test cacheDir", e);
+                }
             }
         }
         return mCacheDir;
     }
-
-
-//    /**
-//     * Given an array of files returns only those whose names indicate that they belong to this
-//     * context.
-//     * @param allFiles the original list of files
-//     * @return the pruned list of files
-//     */
-//    private String[] prunedFileList(String[] allFiles) {
-//        List<String> files = Lists.newArrayList();
-//        for (String file : allFiles) {
-//            if (file.startsWith(mFilePrefix)) {
-//                files.add(file);
-//            }
-//        }
-//        return files.toArray(new String[]{});
-//    }
 }

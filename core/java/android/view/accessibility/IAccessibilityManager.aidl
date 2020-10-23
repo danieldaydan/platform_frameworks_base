@@ -1,5 +1,4 @@
-/* //device/java/android/android/app/INotificationManager.aidl
-**
+/*
 ** Copyright 2009, The Android Open Source Project
 **
 ** Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,7 @@
 
 package android.view.accessibility;
 
+import android.app.RemoteAction;
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.accessibilityservice.IAccessibilityServiceConnection;
 import android.accessibilityservice.IAccessibilityServiceClient;
@@ -25,38 +25,71 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.IAccessibilityInteractionConnection;
 import android.view.accessibility.IAccessibilityManagerClient;
+import android.view.accessibility.IWindowMagnificationConnection;
 import android.view.IWindow;
 
 /**
  * Interface implemented by the AccessibilityManagerService called by
- * the AccessibilityMasngers.
+ * the AccessibilityManagers.
  *
  * @hide
  */
 interface IAccessibilityManager {
 
-    int addClient(IAccessibilityManagerClient client, int userId);
+    oneway void interrupt(int userId);
 
-    boolean sendAccessibilityEvent(in AccessibilityEvent uiEvent, int userId);
+    oneway void sendAccessibilityEvent(in AccessibilityEvent uiEvent, int userId);
+
+    long addClient(IAccessibilityManagerClient client, int userId);
 
     List<AccessibilityServiceInfo> getInstalledAccessibilityServiceList(int userId);
 
+    @UnsupportedAppUsage
     List<AccessibilityServiceInfo> getEnabledAccessibilityServiceList(int feedbackType, int userId);
 
-    void interrupt(int userId);
-
-    int addAccessibilityInteractionConnection(IWindow windowToken,
-        in IAccessibilityInteractionConnection connection, int userId);
+    int addAccessibilityInteractionConnection(IWindow windowToken, IBinder leashToken,
+            in IAccessibilityInteractionConnection connection,
+            String packageName, int userId);
 
     void removeAccessibilityInteractionConnection(IWindow windowToken);
 
+    void setPictureInPictureActionReplacingConnection(
+            in IAccessibilityInteractionConnection connection);
+
     void registerUiTestAutomationService(IBinder owner, IAccessibilityServiceClient client,
-        in AccessibilityServiceInfo info);
+        in AccessibilityServiceInfo info, int flags);
 
     void unregisterUiTestAutomationService(IAccessibilityServiceClient client);
 
     void temporaryEnableAccessibilityStateUntilKeyguardRemoved(in ComponentName service,
             boolean touchExplorationEnabled);
 
-    IBinder getWindowToken(int windowId);
+    // Used by UiAutomation
+    IBinder getWindowToken(int windowId, int userId);
+
+    void notifyAccessibilityButtonClicked(int displayId, String targetName);
+
+    void notifyAccessibilityButtonVisibilityChanged(boolean available);
+
+    // Requires Manifest.permission.MANAGE_ACCESSIBILITY
+    void performAccessibilityShortcut(String targetName);
+
+    // Requires Manifest.permission.MANAGE_ACCESSIBILITY
+    List<String> getAccessibilityShortcutTargets(int shortcutType);
+
+    // System process only
+    boolean sendFingerprintGesture(int gestureKeyCode);
+
+    // System process only
+    int getAccessibilityWindowId(IBinder windowToken);
+
+    long getRecommendedTimeoutMillis();
+
+    oneway void registerSystemAction(in RemoteAction action, int actionId);
+    oneway void unregisterSystemAction(int actionId);
+    oneway void setWindowMagnificationConnection(in IWindowMagnificationConnection connection);
+
+    void associateEmbeddedHierarchy(IBinder host, IBinder embedded);
+
+    void disassociateEmbeddedHierarchy(IBinder token);
 }

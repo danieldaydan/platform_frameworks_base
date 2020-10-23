@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef DRAWPROFILER_H
-#define DRAWPROFILER_H
+
+#pragma once
 
 #include "FrameInfo.h"
 #include "Properties.h"
@@ -28,7 +28,7 @@
 namespace android {
 namespace uirenderer {
 
-class OpenGLRenderer;
+class IProfileRenderer;
 
 // TODO: This is a bit awkward as it needs to match the thing in CanvasContext
 // A better abstraction here would be nice but iterators are painful
@@ -39,14 +39,14 @@ typedef RingBuffer<FrameInfo, 120> FrameInfoSource;
 
 class FrameInfoVisualizer {
 public:
-    FrameInfoVisualizer(FrameInfoSource& source);
+    explicit FrameInfoVisualizer(FrameInfoSource& source, nsecs_t frameInterval);
     ~FrameInfoVisualizer();
 
     bool consumeProperties();
     void setDensity(float density);
 
     void unionDirty(SkRect* dirty);
-    void draw(OpenGLRenderer* canvas);
+    void draw(IProfileRenderer& renderer);
 
     void dumpData(int fd);
 
@@ -56,8 +56,8 @@ private:
 
     void initializeRects(const int baseline, const int width);
     void nextBarSegment(FrameInfoIndex start, FrameInfoIndex end);
-    void drawGraph(OpenGLRenderer* canvas);
-    void drawThreshold(OpenGLRenderer* canvas);
+    void drawGraph(IProfileRenderer& renderer);
+    void drawThreshold(IProfileRenderer& renderer);
 
     inline float durationMS(size_t index, FrameInfoIndex start, FrameInfoIndex end) {
         float duration = mFrameSource[index].duration(start, end) * 0.000001f;
@@ -71,6 +71,7 @@ private:
 
     FrameInfoSource& mFrameSource;
 
+    nsecs_t mFrameInterval;
     int mVerticalUnit = 0;
     int mThresholdStroke = 0;
 
@@ -87,5 +88,3 @@ private:
 
 } /* namespace uirenderer */
 } /* namespace android */
-
-#endif /* DRAWPROFILER_H */

@@ -23,10 +23,11 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.format.DateFormat;
 import android.util.AttributeSet;
+
 import java.util.Calendar;
 
 /**
- * Like AnalogClock, but digital.  Shows seconds.
+ * Like AnalogClock, but digital.
  *
  * @deprecated It is recommended you use {@link TextClock} instead.
  */
@@ -60,18 +61,18 @@ public class DigitalClock extends TextView {
         if (mCalendar == null) {
             mCalendar = Calendar.getInstance();
         }
-
-        mFormatChangeObserver = new FormatChangeObserver();
-        getContext().getContentResolver().registerContentObserver(
-                Settings.System.CONTENT_URI, true, mFormatChangeObserver);
-
-        setFormat();
     }
 
     @Override
     protected void onAttachedToWindow() {
         mTickerStopped = false;
         super.onAttachedToWindow();
+
+        mFormatChangeObserver = new FormatChangeObserver();
+        getContext().getContentResolver().registerContentObserver(
+                Settings.System.CONTENT_URI, true, mFormatChangeObserver);
+        setFormat();
+
         mHandler = new Handler();
 
         /**
@@ -95,6 +96,8 @@ public class DigitalClock extends TextView {
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         mTickerStopped = true;
+        getContext().getContentResolver().unregisterContentObserver(
+                mFormatChangeObserver);
     }
 
     private void setFormat() {

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2014, The Android Open Source Project
+ * Copyright (c) 2019, The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import android.service.notification.Condition;
 /** @hide */
 oneway interface IConditionProvider {
     void onConnected();
-    void onRequestConditions(int relevance);
     void onSubscribe(in Uri conditionId);
     void onUnsubscribe(in Uri conditionId);
 }

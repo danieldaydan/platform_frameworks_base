@@ -16,10 +16,17 @@
 
 package com.android.internal.statusbar;
 
+import android.app.Notification;
+import android.net.Uri;
+import android.content.ComponentName;
+import android.graphics.Rect;
 import android.os.Bundle;
+import android.os.UserHandle;
 import android.service.notification.StatusBarNotification;
+import android.hardware.biometrics.IBiometricServiceReceiverInternal;
 
 import com.android.internal.statusbar.IStatusBar;
+import com.android.internal.statusbar.RegisterStatusBarResult;
 import com.android.internal.statusbar.StatusBarIcon;
 import com.android.internal.statusbar.StatusBarIconList;
 import com.android.internal.statusbar.NotificationVisibility;
@@ -27,67 +34,117 @@ import com.android.internal.statusbar.NotificationVisibility;
 /** @hide */
 interface IStatusBarService
 {
+    @UnsupportedAppUsage
     void expandNotificationsPanel();
+    @UnsupportedAppUsage
     void collapsePanels();
+    void togglePanel();
+    @UnsupportedAppUsage
     void disable(int what, IBinder token, String pkg);
     void disableForUser(int what, IBinder token, String pkg, int userId);
     void disable2(int what, IBinder token, String pkg);
     void disable2ForUser(int what, IBinder token, String pkg, int userId);
+    int[] getDisableFlags(IBinder token, int userId);
     void setIcon(String slot, String iconPackage, int iconId, int iconLevel, String contentDescription);
+    @UnsupportedAppUsage
     void setIconVisibility(String slot, boolean visible);
+    @UnsupportedAppUsage
     void removeIcon(String slot);
-    void topAppWindowChanged(boolean menuVisible);
-    void setImeWindowStatus(in IBinder token, int vis, int backDisposition,
-            boolean showImeSwitcher);
-    void expandSettingsPanel();
-    void setCurrentUser(int newUserId);
+    void setImeWindowStatus(int displayId, in IBinder token, int vis, int backDisposition,
+            boolean showImeSwitcher, boolean isMultiClientImeEnabled);
+    void expandSettingsPanel(String subPanel);
 
     // ---- Methods below are for use by the status bar policy services ----
     // You need the STATUS_BAR_SERVICE permission
-    void registerStatusBar(IStatusBar callbacks, out StatusBarIconList iconList,
-            out int[] switches, out List<IBinder> binders);
+    RegisterStatusBarResult registerStatusBar(IStatusBar callbacks);
     void onPanelRevealed(boolean clearNotificationEffects, int numItems);
     void onPanelHidden();
     // Mark current notifications as "seen" and stop ringing, vibrating, blinking.
     void clearNotificationEffects();
-    void onNotificationClick(String key);
-    void onNotificationActionClick(String key, int actionIndex);
+    void onNotificationClick(String key, in NotificationVisibility nv);
+    void onNotificationActionClick(String key, int actionIndex, in Notification.Action action, in NotificationVisibility nv, boolean generatedByAssistant);
     void onNotificationError(String pkg, String tag, int id,
             int uid, int initialPid, String message, int userId);
     void onClearAllNotifications(int userId);
-    void onNotificationClear(String pkg, String tag, int id, int userId);
+    void onNotificationClear(String pkg, String tag, int id, int userId, String key,
+            int dismissalSurface, int dismissalSentiment, in NotificationVisibility nv);
     void onNotificationVisibilityChanged( in NotificationVisibility[] newlyVisibleKeys,
             in NotificationVisibility[] noLongerVisibleKeys);
-    void onNotificationExpansionChanged(in String key, in boolean userAction, in boolean expanded);
-    void setSystemUiVisibility(int vis, int mask, String cause);
-    void setWindowState(int window, int state);
+    void onNotificationExpansionChanged(in String key, in boolean userAction, in boolean expanded, in int notificationLocation);
+    void onNotificationDirectReplied(String key);
+    void onNotificationSmartSuggestionsAdded(String key, int smartReplyCount, int smartActionCount,
+            boolean generatedByAsssistant, boolean editBeforeSending);
+    void onNotificationSmartReplySent(in String key, in int replyIndex, in CharSequence reply,
+            in int notificationLocation, boolean modifiedBeforeSending);
+    void onNotificationSettingsViewed(String key);
+    void onNotificationBubbleChanged(String key, boolean isBubble, int flags);
+    void onBubbleNotificationSuppressionChanged(String key, boolean isSuppressed);
+    void hideCurrentInputMethodForBubbles();
+    void grantInlineReplyUriPermission(String key, in Uri uri, in UserHandle user, String packageName);
+    void clearInlineReplyUriPermissions(String key);
 
-    void showRecentApps(boolean triggeredFromAltTab);
-    void hideRecentApps(boolean triggeredFromAltTab, boolean triggeredFromHomeKey);
-    void toggleRecentApps();
-    void preloadRecentApps();
-    void cancelPreloadRecentApps();
-
-    /**
-     * Notifies the status bar that an app transition is pending to delay applying some flags with
-     * visual impact until {@link #appTransitionReady} is called.
-     */
-    void appTransitionPending();
-
-    /**
-     * Notifies the status bar that a pending app transition has been cancelled.
-     */
-    void appTransitionCancelled();
+    void onGlobalActionsShown();
+    void onGlobalActionsHidden();
 
     /**
-     * Notifies the status bar that an app transition is now being executed.
-     *
-     * @param statusBarAnimationsStartTime the desired start time for all visual animations in the
-     *        status bar caused by this app transition in uptime millis
-     * @param statusBarAnimationsDuration the duration for all visual animations in the status
-     *        bar caused by this app transition in millis
+     * These methods are needed for global actions control which the UI is shown in sysui.
      */
-    void appTransitionStarting(long statusBarAnimationsStartTime, long statusBarAnimationsDuration);
+    void shutdown();
+    void reboot(boolean safeMode);
 
-    void startAssist(in Bundle args);
+    void addTile(in ComponentName tile);
+    void remTile(in ComponentName tile);
+    void clickTile(in ComponentName tile);
+    @UnsupportedAppUsage
+    void handleSystemKey(in int key);
+
+    /**
+     * Methods to show toast messages for screen pinning
+     */
+    void showPinningEnterExitToast(boolean entering);
+    void showPinningEscapeToast();
+
+    // Used to show the authentication dialog (Biometrics, Device Credential)
+    void showAuthenticationDialog(in Bundle bundle, IBiometricServiceReceiverInternal receiver,
+            int biometricModality, boolean requireConfirmation, int userId, String opPackageName,
+            long operationId, int sysUiSessionId);
+    // Used to notify the authentication dialog that a biometric has been authenticated
+    void onBiometricAuthenticated();
+    // Used to set a temporary message, e.g. fingerprint not recognized, finger moved too fast, etc
+    void onBiometricHelp(String message);
+    // Used to show an error - the dialog will dismiss after a certain amount of time
+    void onBiometricError(int modality, int error, int vendorCode);
+    // Used to hide the authentication dialog, e.g. when the application cancels authentication
+    void hideAuthenticationDialog();
+
+    /**
+     * Show a warning that the device is about to go to sleep due to user inactivity.
+     */
+    void showInattentiveSleepWarning();
+
+    /**
+     * Dismiss the warning that the device is about to go to sleep due to user inactivity.
+     */
+    void dismissInattentiveSleepWarning(boolean animated);
+
+    /**
+     * Notifies SystemUI to start tracing.
+     */
+    void startTracing();
+
+    /**
+     * Notifies SystemUI to stop tracing.
+     */
+    void stopTracing();
+
+    /**
+     * Returns whether SystemUI tracing is enabled.
+     */
+    boolean isTracing();
+
+    /**
+     * If true, suppresses the ambient display from showing. If false, re-enables the ambient
+     * display.
+     */
+    void suppressAmbientDisplay(boolean suppress);
 }

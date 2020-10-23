@@ -16,8 +16,11 @@
 
 package android.security.net.config;
 
+import android.content.pm.ApplicationInfo;
+import android.os.Build;
 import android.util.ArrayMap;
 import android.util.ArraySet;
+
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -27,8 +30,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import javax.net.ssl.X509TrustManager;
-
 /**
  * @hide
  */
@@ -37,7 +38,6 @@ public final class NetworkSecurityConfig {
     public static final boolean DEFAULT_CLEARTEXT_TRAFFIC_PERMITTED = true;
     /** @hide */
     public static final boolean DEFAULT_HSTS_ENFORCED = false;
-    public static final NetworkSecurityConfig DEFAULT = getDefaultBuilder().build();
 
     private final boolean mCleartextTrafficPermitted;
     private final boolean mHstsEnforced;
@@ -117,12 +117,6 @@ public final class NetworkSecurityConfig {
         }
     }
 
-    void onTrustStoreChange() {
-        synchronized (mAnchorsLock) {
-            mAnchors = null;
-        }
-    }
-
     /** @hide */
     public TrustAnchor findTrustAnchorBySubjectAndPublicKey(X509Certificate cert) {
         for (CertificatesEntryRef ref : mCertificatesEntryRefs) {
@@ -145,30 +139,62 @@ public final class NetworkSecurityConfig {
         return null;
     }
 
+    /** @hide */
+    public Set<X509Certificate> findAllCertificatesByIssuerAndSignature(X509Certificate cert) {
+        Set<X509Certificate> certs = new ArraySet<X509Certificate>();
+        for (CertificatesEntryRef ref : mCertificatesEntryRefs) {
+            certs.addAll(ref.findAllCertificatesByIssuerAndSignature(cert));
+        }
+        return certs;
+    }
+
+    public void handleTrustStorageUpdate() {
+        synchronized (mAnchorsLock) {
+            mAnchors = null;
+            for (CertificatesEntryRef ref : mCertificatesEntryRefs) {
+                ref.handleTrustStorageUpdate();
+            }
+        }
+        getTrustManager().handleTrustStorageUpdate();
+    }
+
     /**
      * Return a {@link Builder} for the default {@code NetworkSecurityConfig}.
      *
      * <p>
      * The default configuration has the following properties:
      * <ol>
-     * <li>Cleartext traffic is permitted.</li>
+     * <li>If the application targets API level 27 (Android O MR1) or lower then cleartext traffic
+     * is allowed by default.</li>
+     * <li>Cleartext traffic is not permitted for ephemeral apps.</li>
      * <li>HSTS is not enforced.</li>
      * <li>No certificate pinning is used.</li>
-     * <li>The system and user added trusted certificate stores are trusted for connections.</li>
+     * <li>The system certificate store is trusted for connections.</li>
+     * <li>If the application targets API level 23 (Android M) or lower then the user certificate
+     * store is trusted by default as well for non-privileged applications.</li>
+     * <li>Privileged applications do not trust the user certificate store on Android P and higher.
+     * </li>
      * </ol>
      *
      * @hide
      */
-    public static final Builder getDefaultBuilder() {
-        return new Builder()
-                .setCleartextTrafficPermitted(DEFAULT_CLEARTEXT_TRAFFIC_PERMITTED)
+    public static Builder getDefaultBuilder(ApplicationInfo info) {
+        Builder builder = new Builder()
                 .setHstsEnforced(DEFAULT_HSTS_ENFORCED)
                 // System certificate store, does not bypass static pins.
                 .addCertificatesEntryRef(
-                        new CertificatesEntryRef(SystemCertificateSource.getInstance(), false))
-                // User certificate store, does not bypass static pins.
-                .addCertificatesEntryRef(
-                        new CertificatesEntryRef(UserCertificateSource.getInstance(), false));
+                        new CertificatesEntryRef(SystemCertificateSource.getInstance(), false));
+        final boolean cleartextTrafficPermitted = info.targetSdkVersion < Build.VERSION_CODES.P
+                && !info.isInstantApp();
+        builder.setCleartextTrafficPermitted(cleartextTrafficPermitted);
+        // Applications targeting N and above must opt in into trusting the user added certificate
+        // store.
+        if (info.targetSdkVersion <= Build.VERSION_CODES.M && !info.isPrivilegedApp()) {
+            // User certificate store, does not bypass static pins.
+            builder.addCertificatesEntryRef(
+                    new CertificatesEntryRef(UserCertificateSource.getInstance(), false));
+        }
+        return builder;
     }
 
     /**
@@ -190,7 +216,7 @@ public final class NetworkSecurityConfig {
          * in {@link Builder#build()}, recursively if needed.
          */
         public Builder setParent(Builder parent) {
-            // Sanity check to avoid adding loops.
+            // Quick check to avoid adding loops.
             Builder current = parent;
             while (current != null) {
                 if (current == this) {

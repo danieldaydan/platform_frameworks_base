@@ -15,11 +15,9 @@
  */
 
 #include <android/bitmap.h>
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#include <GraphicsJNI.h>
-#pragma GCC diagnostic pop
+#include <android/data_space.h>
+#include <android/graphics/bitmap.h>
+#include <android/data_space.h>
 
 int AndroidBitmap_getInfo(JNIEnv* env, jobject jbitmap,
                           AndroidBitmapInfo* info) {
@@ -27,34 +25,23 @@ int AndroidBitmap_getInfo(JNIEnv* env, jobject jbitmap,
         return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
     }
 
-    SkBitmap bm;
-    GraphicsJNI::getSkBitmap(env, jbitmap, &bm);
-
     if (info) {
-        info->width     = bm.width();
-        info->height    = bm.height();
-        info->stride    = bm.rowBytes();
-        info->flags     = 0;
-
-        switch (bm.colorType()) {
-            case kN32_SkColorType:
-                info->format = ANDROID_BITMAP_FORMAT_RGBA_8888;
-                break;
-            case kRGB_565_SkColorType:
-                info->format = ANDROID_BITMAP_FORMAT_RGB_565;
-                break;
-            case kARGB_4444_SkColorType:
-                info->format = ANDROID_BITMAP_FORMAT_RGBA_4444;
-                break;
-            case kAlpha_8_SkColorType:
-                info->format = ANDROID_BITMAP_FORMAT_A_8;
-                break;
-            default:
-                info->format = ANDROID_BITMAP_FORMAT_NONE;
-                break;
-        }
+        *info = ABitmap_getInfoFromJava(env, jbitmap);
     }
     return ANDROID_BITMAP_RESULT_SUCCESS;
+}
+
+int32_t AndroidBitmap_getDataSpace(JNIEnv* env, jobject jbitmap) {
+    if (NULL == env || NULL == jbitmap) {
+        return ADATASPACE_UNKNOWN;
+    }
+
+    android::graphics::Bitmap bitmap(env, jbitmap);
+    if (!bitmap.isValid()) {
+        return ADATASPACE_UNKNOWN;
+    }
+
+    return bitmap.getDataSpace();
 }
 
 int AndroidBitmap_lockPixels(JNIEnv* env, jobject jbitmap, void** addrPtr) {
@@ -62,18 +49,14 @@ int AndroidBitmap_lockPixels(JNIEnv* env, jobject jbitmap, void** addrPtr) {
         return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
     }
 
-    SkPixelRef* pixelRef = GraphicsJNI::refSkPixelRef(env, jbitmap);
-    if (!pixelRef) {
+    android::graphics::Bitmap bitmap(env, jbitmap);
+    void* addr = bitmap.isValid() ? bitmap.getPixels() : nullptr;
+
+    if (!addr) {
         return ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
     }
 
-    pixelRef->lockPixels();
-    void* addr = pixelRef->pixels();
-    if (NULL == addr) {
-        pixelRef->unlockPixels();
-        pixelRef->unref();
-        return ANDROID_BITMAP_RESULT_ALLOCATION_FAILED;
-    }
+    ABitmap_acquireRef(bitmap.get());
 
     if (addrPtr) {
         *addrPtr = addr;
@@ -86,26 +69,45 @@ int AndroidBitmap_unlockPixels(JNIEnv* env, jobject jbitmap) {
         return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
     }
 
-    SkPixelRef* pixelRef = GraphicsJNI::refSkPixelRef(env, jbitmap);
-    if (!pixelRef) {
+    android::graphics::Bitmap bitmap(env, jbitmap);
+
+    if (!bitmap.isValid()) {
         return ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
     }
 
-    // notifyPixelsChanged() needs be called to apply writes to GL-backed
-    // bitmaps.  Note that this will slow down read-only accesses to the
-    // bitmaps, but the NDK methods are primarily intended to be used for
-    // writes.
-    pixelRef->notifyPixelsChanged();
-
-    pixelRef->unlockPixels();
-    // Awkward in that we need to double-unref as the call to get the SkPixelRef
-    // did a ref(), so we need to unref() for the local ref and for the previous
-    // AndroidBitmap_lockPixels(). However this keeps GraphicsJNI a bit safer
-    // if others start using it without knowing about android::Bitmap's "fun"
-    // ref counting mechanism(s).
-    pixelRef->unref();
-    pixelRef->unref();
-
+    bitmap.notifyPixelsChanged();
+    ABitmap_releaseRef(bitmap.get());
     return ANDROID_BITMAP_RESULT_SUCCESS;
 }
 
+int AndroidBitmap_getHardwareBuffer(JNIEnv* env, jobject jbitmap, AHardwareBuffer** outBuffer) {
+    if (NULL == env || NULL == jbitmap || NULL == outBuffer) {
+        return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
+    }
+
+    android::graphics::Bitmap bitmap(env, jbitmap);
+
+    if (!bitmap.isValid()) {
+        return ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
+    }
+
+    *outBuffer = bitmap.getHardwareBuffer();
+    return *outBuffer == NULL ? ANDROID_BITMAP_RESULT_BAD_PARAMETER : ANDROID_BITMAP_RESULT_SUCCESS;
+}
+
+int AndroidBitmap_compress(const AndroidBitmapInfo* info,
+                           int32_t dataSpace,
+                           const void* pixels,
+                           int32_t format, int32_t quality,
+                           void* userContext,
+                           AndroidBitmap_CompressWriteFunc fn) {
+    if (NULL == info || NULL == pixels || NULL == fn) {
+        return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
+    }
+    if (quality < 0 || quality > 100) {
+        return ANDROID_BITMAP_RESULT_BAD_PARAMETER;
+    }
+
+    return ABitmap_compress(info, (ADataSpace) dataSpace, pixels,
+            (AndroidBitmapCompressFormat) format, quality, userContext, fn);
+}

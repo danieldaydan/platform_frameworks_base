@@ -20,17 +20,29 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.LayoutInflater;
+import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
-import android.widget.ImageView;
 
 import com.android.internal.logging.MetricsLogger;
+import com.android.internal.logging.nano.MetricsProto.MetricsEvent;
 import com.android.systemui.R;
+import com.android.systemui.broadcast.BroadcastDispatcher;
+
+import javax.inject.Inject;
 
 /** A dialog that provides controls for adjusting the screen brightness. */
 public class BrightnessDialog extends Activity {
 
     private BrightnessController mBrightnessController;
+    private final BroadcastDispatcher mBroadcastDispatcher;
+
+    @Inject
+    public BrightnessDialog(BroadcastDispatcher broadcastDispatcher) {
+        mBroadcastDispatcher = broadcastDispatcher;
+    }
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -42,24 +54,25 @@ public class BrightnessDialog extends Activity {
         window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
         window.requestFeature(Window.FEATURE_NO_TITLE);
 
-        setContentView(R.layout.quick_settings_brightness_dialog);
+        View v = LayoutInflater.from(this).inflate(
+                R.layout.quick_settings_brightness_dialog, null);
+        setContentView(v);
 
-        final ImageView icon = (ImageView) findViewById(R.id.brightness_icon);
-        final ToggleSlider slider = (ToggleSlider) findViewById(R.id.brightness_slider);
-        mBrightnessController = new BrightnessController(this, icon, slider);
+        final ToggleSliderView slider = findViewById(R.id.brightness_slider);
+        mBrightnessController = new BrightnessController(this, slider, mBroadcastDispatcher);
     }
 
     @Override
     protected void onStart() {
         super.onStart();
         mBrightnessController.registerCallbacks();
-        MetricsLogger.visible(this, MetricsLogger.BRIGHTNESS_DIALOG);
+        MetricsLogger.visible(this, MetricsEvent.BRIGHTNESS_DIALOG);
     }
 
     @Override
     protected void onStop() {
         super.onStop();
-        MetricsLogger.hidden(this, MetricsLogger.BRIGHTNESS_DIALOG);
+        MetricsLogger.hidden(this, MetricsEvent.BRIGHTNESS_DIALOG);
         mBrightnessController.unregisterCallbacks();
     }
 

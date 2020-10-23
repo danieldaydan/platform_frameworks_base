@@ -1,0 +1,17 @@
+{
+  "presubmit": [
+    {
+      "name": "FrameworksNetIntegrationTests"
+    }
+  ],
+  "postsubmit": [
+    {
+      "name": "FrameworksNetDeflakeTest"
+    }
+  ],
+  "imports": [
+    {
+      "path": "cts/tests/tests/net"
+    }
+  ]
+}

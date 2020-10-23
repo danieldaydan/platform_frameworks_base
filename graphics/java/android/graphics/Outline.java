@@ -17,8 +17,13 @@
 package android.graphics;
 
 import android.annotation.FloatRange;
+import android.annotation.IntDef;
 import android.annotation.NonNull;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.graphics.drawable.Drawable;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 /**
  * Defines a simple shape, used for bounding graphical regions.
@@ -31,13 +36,41 @@ import android.graphics.drawable.Drawable;
  * @see Drawable#getOutline(Outline)
  */
 public final class Outline {
+    private static final float RADIUS_UNDEFINED = Float.NEGATIVE_INFINITY;
+
     /** @hide */
+    public static final int MODE_EMPTY = 0;
+    /** @hide */
+    public static final int MODE_ROUND_RECT = 1;
+    /** @hide */
+    public static final int MODE_PATH = 2;
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(flag = false,
+            value = {
+                    MODE_EMPTY,
+                    MODE_ROUND_RECT,
+                    MODE_PATH,
+            })
+    public @interface Mode {}
+
+    /** @hide */
+    @Mode
+    public int mMode = MODE_EMPTY;
+
+    /**
+     * Only guaranteed to be non-null when mode == MODE_PATH
+     *
+     * @hide
+     */
     public Path mPath;
 
     /** @hide */
-    public Rect mRect;
+    @UnsupportedAppUsage
+    public final Rect mRect = new Rect();
     /** @hide */
-    public float mRadius;
+    public float mRadius = RADIUS_UNDEFINED;
     /** @hide */
     public float mAlpha;
 
@@ -60,9 +93,13 @@ public final class Outline {
      * @see #isEmpty()
      */
     public void setEmpty() {
-        mPath = null;
-        mRect = null;
-        mRadius = 0;
+        if (mPath != null) {
+            // rewind here to avoid thrashing the allocations, but could alternately clear ref
+            mPath.rewind();
+        }
+        mMode = MODE_EMPTY;
+        mRect.setEmpty();
+        mRadius = RADIUS_UNDEFINED;
     }
 
     /**
@@ -74,7 +111,7 @@ public final class Outline {
      * @see #setEmpty()
      */
     public boolean isEmpty() {
-        return mRect == null && mPath == null;
+        return mMode == MODE_EMPTY;
     }
 
 
@@ -84,10 +121,10 @@ public final class Outline {
      * Currently, only Outlines that can be represented as a rectangle, circle,
      * or round rect support clipping.
      *
-     * @see {@link android.view.View#setClipToOutline(boolean)}
+     * @see android.view.View#setClipToOutline(boolean)
      */
     public boolean canClip() {
-        return !isEmpty() && mRect != null;
+        return mMode != MODE_PATH;
     }
 
     /**
@@ -119,19 +156,14 @@ public final class Outline {
      * @param src Source outline to copy from.
      */
     public void set(@NonNull Outline src) {
-        if (src.mPath != null) {
+        mMode = src.mMode;
+        if (src.mMode == MODE_PATH) {
             if (mPath == null) {
                 mPath = new Path();
             }
             mPath.set(src.mPath);
-            mRect = null;
         }
-        if (src.mRect != null) {
-            if (mRect == null) {
-                mRect = new Rect();
-            }
-            mRect.set(src.mRect);
-        }
+        mRect.set(src.mRect);
         mRadius = src.mRadius;
         mAlpha = src.mAlpha;
     }
@@ -162,10 +194,13 @@ public final class Outline {
             return;
         }
 
-        if (mRect == null) mRect = new Rect();
+        if (mMode == MODE_PATH) {
+            // rewind here to avoid thrashing the allocations, but could alternately clear ref
+            mPath.rewind();
+        }
+        mMode = MODE_ROUND_RECT;
         mRect.set(left, top, right, bottom);
         mRadius = radius;
-        mPath = null;
     }
 
     /**
@@ -173,6 +208,34 @@ public final class Outline {
      */
     public void setRoundRect(@NonNull Rect rect, float radius) {
         setRoundRect(rect.left, rect.top, rect.right, rect.bottom, radius);
+    }
+
+    /**
+     * Populates {@code outBounds} with the outline bounds, if set, and returns
+     * {@code true}. If no outline bounds are set, or if a path has been set
+     * via {@link #setPath(Path)}, returns {@code false}.
+     *
+     * @param outRect the rect to populate with the outline bounds, if set
+     * @return {@code true} if {@code outBounds} was populated with outline
+     *         bounds, or {@code false} if no outline bounds are set
+     */
+    public boolean getRect(@NonNull Rect outRect) {
+        if (mMode != MODE_ROUND_RECT) {
+            return false;
+        }
+        outRect.set(mRect);
+        return true;
+    }
+
+    /**
+     * Returns the rounded rect radius, if set, or a value less than 0 if a path has
+     * been set via {@link #setPath(Path)}. A return value of {@code 0}
+     * indicates a non-rounded rect.
+     *
+     * @return the rounded rect radius, or value < 0
+     */
+    public float getRadius() {
+        return mRadius;
     }
 
     /**
@@ -190,10 +253,16 @@ public final class Outline {
             return;
         }
 
-        if (mPath == null) mPath = new Path();
-        mPath.reset();
+        if (mPath == null) {
+            mPath = new Path();
+        } else {
+            mPath.rewind();
+        }
+
+        mMode = MODE_PATH;
         mPath.addOval(left, top, right, bottom, Path.Direction.CW);
-        mRect = null;
+        mRect.setEmpty();
+        mRadius = RADIUS_UNDEFINED;
     }
 
     /**
@@ -204,32 +273,51 @@ public final class Outline {
     }
 
     /**
-     * Sets the Constructs an Outline from a
+     * Sets the Outline to a
      * {@link android.graphics.Path#isConvex() convex path}.
+     *
+     * @param convexPath used to construct the Outline. As of
+     * {@link android.os.Build.VERSION_CODES#Q}, it is no longer required to be
+     * convex.
+     *
+     * @deprecated As of {@link android.os.Build.VERSION_CODES#Q}, the restriction
+     * that the path must be convex is removed. However, the API is misnamed until
+     * {@link android.os.Build.VERSION_CODES#R}, when {@link #setPath} is
+     * introduced. Use {@link #setPath} instead.
      */
+    @Deprecated
     public void setConvexPath(@NonNull Path convexPath) {
-        if (convexPath.isEmpty()) {
+        setPath(convexPath);
+    }
+
+    /**
+     * Sets the Outline to a {@link android.graphics.Path path}.
+     *
+     * @param path used to construct the Outline.
+     */
+    public void setPath(@NonNull Path path) {
+        if (path.isEmpty()) {
             setEmpty();
             return;
         }
 
-        if (!convexPath.isConvex()) {
-            throw new IllegalArgumentException("path must be convex");
+        if (mPath == null) {
+            mPath = new Path();
         }
-        if (mPath == null) mPath = new Path();
 
-        mPath.set(convexPath);
-        mRect = null;
-        mRadius = -1.0f;
+        mMode = MODE_PATH;
+        mPath.set(path);
+        mRect.setEmpty();
+        mRadius = RADIUS_UNDEFINED;
     }
 
     /**
      * Offsets the Outline by (dx,dy)
      */
     public void offset(int dx, int dy) {
-        if (mRect != null) {
+        if (mMode == MODE_ROUND_RECT) {
             mRect.offset(dx, dy);
-        } else if (mPath != null) {
+        } else if (mMode == MODE_PATH) {
             mPath.offset(dx, dy);
         }
     }

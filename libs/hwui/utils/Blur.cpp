@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "OpenGLRenderer"
-
 #include <math.h>
 
 #include "Blur.h"
@@ -40,7 +38,7 @@ float Blur::convertSigmaToRadius(float sigma) {
 // is within the conversion error tolerance then we attempt to snap to the
 // original integer boundary.
 uint32_t Blur::convertRadiusToInt(float radius) {
-    const float radiusCeil  = ceilf(radius);
+    const float radiusCeil = ceilf(radius);
     if (MathUtils::areEqual(radiusCeil, radius)) {
         return radiusCeil;
     }
@@ -60,7 +58,9 @@ static float legacyConvertRadiusToSigma(float radius) {
     return radius > 0 ? 0.3f * radius + 0.6f : 0.0f;
 }
 
-void Blur::generateGaussianWeights(float* weights, int32_t radius) {
+void Blur::generateGaussianWeights(float* weights, float radius) {
+    int32_t intRadius = convertRadiusToInt(radius);
+
     // Compute gaussian weights for the blur
     // e is the euler's number
     static float e = 2.718281828459045f;
@@ -68,53 +68,52 @@ void Blur::generateGaussianWeights(float* weights, int32_t radius) {
     // g(x) = ( 1 / sqrt( 2 * pi ) * sigma) * e ^ ( -x^2 / 2 * sigma^2 )
     // x is of the form [-radius .. 0 .. radius]
     // and sigma varies with radius.
-    float sigma = legacyConvertRadiusToSigma((float) radius);
+    float sigma = legacyConvertRadiusToSigma(radius);
 
     // Now compute the coefficints
     // We will store some redundant values to save some math during
     // the blur calculations
     // precompute some values
     float coeff1 = 1.0f / (sqrt(2.0f * pi) * sigma);
-    float coeff2 = - 1.0f / (2.0f * sigma * sigma);
+    float coeff2 = -1.0f / (2.0f * sigma * sigma);
 
     float normalizeFactor = 0.0f;
-    for (int32_t r = -radius; r <= radius; r ++) {
-        float floatR = (float) r;
-        weights[r + radius] = coeff1 * pow(e, floatR * floatR * coeff2);
-        normalizeFactor += weights[r + radius];
+    for (int32_t r = -intRadius; r <= intRadius; r++) {
+        float floatR = (float)r;
+        weights[r + intRadius] = coeff1 * pow(e, floatR * floatR * coeff2);
+        normalizeFactor += weights[r + intRadius];
     }
 
-    //Now we need to normalize the weights because all our coefficients need to add up to one
+    // Now we need to normalize the weights because all our coefficients need to add up to one
     normalizeFactor = 1.0f / normalizeFactor;
-    for (int32_t r = -radius; r <= radius; r ++) {
-        weights[r + radius] *= normalizeFactor;
+    for (int32_t r = -intRadius; r <= intRadius; r++) {
+        weights[r + intRadius] *= normalizeFactor;
     }
 }
 
-void Blur::horizontal(float* weights, int32_t radius,
-        const uint8_t* source, uint8_t* dest, int32_t width, int32_t height) {
+void Blur::horizontal(float* weights, int32_t radius, const uint8_t* source, uint8_t* dest,
+                      int32_t width, int32_t height) {
     float blurredPixel = 0.0f;
     float currentPixel = 0.0f;
 
-    for (int32_t y = 0; y < height; y ++) {
-
+    for (int32_t y = 0; y < height; y++) {
         const uint8_t* input = source + y * width;
         uint8_t* output = dest + y * width;
 
-        for (int32_t x = 0; x < width; x ++) {
+        for (int32_t x = 0; x < width; x++) {
             blurredPixel = 0.0f;
             const float* gPtr = weights;
             // Optimization for non-border pixels
             if (x > radius && x < (width - radius)) {
-                const uint8_t *i = input + (x - radius);
-                for (int r = -radius; r <= radius; r ++) {
-                    currentPixel = (float) (*i);
+                const uint8_t* i = input + (x - radius);
+                for (int r = -radius; r <= radius; r++) {
+                    currentPixel = (float)(*i);
                     blurredPixel += currentPixel * gPtr[0];
                     gPtr++;
                     i++;
                 }
             } else {
-                for (int32_t r = -radius; r <= radius; r ++) {
+                for (int32_t r = -radius; r <= radius; r++) {
                     // Stepping left and right away from the pixel
                     int validW = x + r;
                     if (validW < 0) {
@@ -124,40 +123,40 @@ void Blur::horizontal(float* weights, int32_t radius,
                         validW = width - 1;
                     }
 
-                    currentPixel = (float) input[validW];
+                    currentPixel = (float)input[validW];
                     blurredPixel += currentPixel * gPtr[0];
                     gPtr++;
                 }
             }
             *output = (uint8_t)blurredPixel;
-            output ++;
+            output++;
         }
     }
 }
 
-void Blur::vertical(float* weights, int32_t radius,
-        const uint8_t* source, uint8_t* dest, int32_t width, int32_t height) {
+void Blur::vertical(float* weights, int32_t radius, const uint8_t* source, uint8_t* dest,
+                    int32_t width, int32_t height) {
     float blurredPixel = 0.0f;
     float currentPixel = 0.0f;
 
-    for (int32_t y = 0; y < height; y ++) {
+    for (int32_t y = 0; y < height; y++) {
         uint8_t* output = dest + y * width;
 
-        for (int32_t x = 0; x < width; x ++) {
+        for (int32_t x = 0; x < width; x++) {
             blurredPixel = 0.0f;
             const float* gPtr = weights;
             const uint8_t* input = source + x;
             // Optimization for non-border pixels
             if (y > radius && y < (height - radius)) {
-                const uint8_t *i = input + ((y - radius) * width);
-                for (int32_t r = -radius; r <= radius; r ++) {
-                    currentPixel = (float) (*i);
+                const uint8_t* i = input + ((y - radius) * width);
+                for (int32_t r = -radius; r <= radius; r++) {
+                    currentPixel = (float)(*i);
                     blurredPixel += currentPixel * gPtr[0];
                     gPtr++;
                     i += width;
                 }
             } else {
-                for (int32_t r = -radius; r <= radius; r ++) {
+                for (int32_t r = -radius; r <= radius; r++) {
                     int validH = y + r;
                     // Clamp to zero and width
                     if (validH < 0) {
@@ -167,17 +166,17 @@ void Blur::vertical(float* weights, int32_t radius,
                         validH = height - 1;
                     }
 
-                    const uint8_t *i = input + validH * width;
-                    currentPixel = (float) (*i);
+                    const uint8_t* i = input + validH * width;
+                    currentPixel = (float)(*i);
                     blurredPixel += currentPixel * gPtr[0];
                     gPtr++;
                 }
             }
-            *output = (uint8_t) blurredPixel;
+            *output = (uint8_t)blurredPixel;
             output++;
         }
     }
 }
 
-}; // namespace uirenderer
-}; // namespace android
+}  // namespace uirenderer
+}  // namespace android

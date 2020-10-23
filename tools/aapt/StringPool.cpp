@@ -12,17 +12,6 @@
 
 #include "ResourceTable.h"
 
-// SSIZE: mingw does not have signed size_t == ssize_t.
-#if !defined(_WIN32)
-#  define ZD "%zd"
-#  define ZD_TYPE ssize_t
-#  define SSIZE(x) x
-#else
-#  define ZD "%ld"
-#  define ZD_TYPE long
-#  define SSIZE(x) (signed size_t)x
-#endif
-
 // Set to true for noisy debug output.
 static const bool kIsDebug = false;
 
@@ -206,7 +195,7 @@ ssize_t StringPool::add(const String16& value,
 
     if (kIsDebug) {
         printf("Adding string %s to pool: pos=%zd eidx=%zd vidx=%zd\n",
-                String8(value).string(), SSIZE(pos), SSIZE(eidx), SSIZE(vidx));
+                String8(value).string(), pos, eidx, vidx);
     }
 
     return pos;
@@ -390,12 +379,12 @@ sp<AaptFile> StringPool::createStringBlock()
 
 #define ENCODE_LENGTH(str, chrsz, strSize) \
 { \
-    size_t maxMask = 1 << ((chrsz*8)-1); \
+    size_t maxMask = 1 << (((chrsz)*8)-1); \
     size_t maxSize = maxMask-1; \
-    if (strSize > maxSize) { \
-        *str++ = maxMask | ((strSize>>(chrsz*8))&maxSize); \
+    if ((strSize) > maxSize) { \
+        *(str)++ = maxMask | (((strSize)>>((chrsz)*8))&maxSize); \
     } \
-    *str++ = strSize; \
+    *(str)++ = strSize; \
 }
 
 status_t StringPool::writeStringBlock(const sp<AaptFile>& pool)
@@ -602,7 +591,7 @@ ssize_t StringPool::offsetForString(const String16& val) const
     const Vector<size_t>* indices = offsetsForString(val);
     ssize_t res = indices != NULL && indices->size() > 0 ? indices->itemAt(0) : -1;
     if (kIsDebug) {
-        printf("Offset for string %s: %zd (%s)\n", String8(val).string(), SSIZE(res),
+        printf("Offset for string %s: %zd (%s)\n", String8(val).string(), res,
                 res >= 0 ? String8(mEntries[mEntryArray[res]].value).string() : String8());
     }
     return res;

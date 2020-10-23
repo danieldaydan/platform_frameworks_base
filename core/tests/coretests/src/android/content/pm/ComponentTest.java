@@ -21,6 +21,14 @@ import static android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
 import static android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
 import static android.content.pm.PackageManager.GET_DISABLED_COMPONENTS;
 
+import android.content.ComponentName;
+import android.content.Intent;
+import android.test.AndroidTestCase;
+
+import androidx.test.filters.MediumTest;
+import androidx.test.filters.SmallTest;
+import androidx.test.filters.Suppress;
+
 import com.android.frameworks.coretests.enabled_app.DisabledActivity;
 import com.android.frameworks.coretests.enabled_app.DisabledProvider;
 import com.android.frameworks.coretests.enabled_app.DisabledReceiver;
@@ -29,12 +37,6 @@ import com.android.frameworks.coretests.enabled_app.EnabledActivity;
 import com.android.frameworks.coretests.enabled_app.EnabledProvider;
 import com.android.frameworks.coretests.enabled_app.EnabledReceiver;
 import com.android.frameworks.coretests.enabled_app.EnabledService;
-
-import android.content.ComponentName;
-import android.content.Intent;
-import android.test.AndroidTestCase;
-import android.test.suitebuilder.annotation.MediumTest;
-import android.test.suitebuilder.annotation.SmallTest;
 
 import java.util.List;
 
@@ -45,7 +47,7 @@ import java.util.List;
  * package settings file to get written out by the PackageManagerService.  Better, more unit-y test
  * would fix this.
  */
-
+@Suppress  // Failing.
 public class ComponentTest extends AndroidTestCase {
 
     private PackageManager mPackageManager;

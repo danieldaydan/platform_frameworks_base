@@ -16,24 +16,37 @@
 
 package android.test;
 
+import static android.view.WindowInsets.Type.displayCutout;
+import static android.view.WindowInsets.Type.navigationBars;
+
 import android.app.Activity;
 import android.app.Instrumentation;
-import android.graphics.Point;
+import android.graphics.Insets;
+import android.graphics.Rect;
 import android.os.SystemClock;
-import android.view.Display;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.view.WindowMetrics;
 
 /**
  * Reusable methods for generating touch events. These methods can be used with
  * InstrumentationTestCase or ActivityInstrumentationTestCase2 to simulate user interaction with
  * the application through a touch screen.
+ *
+ * @deprecated Use
+ * <a href="{@docRoot}training/testing/ui-testing/espresso-testing.html">Espresso UI testing
+ * framework</a> instead. New tests should be written using the
+ * <a href="{@docRoot}tools/testing-support-library/index.html">Android Testing Support Library</a>.
  */
+@Deprecated
 public class TouchUtils {
-    
+
     /**
      * Simulate touching in the center of the screen and dragging one quarter of the way down
      * @param test The test case that is being run
@@ -46,24 +59,23 @@ public class TouchUtils {
     public static void dragQuarterScreenDown(ActivityInstrumentationTestCase test) {
         dragQuarterScreenDown(test, test.getActivity());
     }
-    
+
     /**
      * Simulate touching in the center of the screen and dragging one quarter of the way down
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      */
     public static void dragQuarterScreenDown(InstrumentationTestCase test, Activity activity) {
-        Display display = activity.getWindowManager().getDefaultDisplay();
-        final Point size = new Point();
-        display.getSize(size);
-        
-        final float x = size.x / 2.0f;
-        final float fromY = size.y * 0.5f;
-        final float toY = size.y * 0.75f;
-      
+        WindowManager wm = activity.getWindowManager();
+        final Size size = getSizeExcludingNavigationBarAndCutout(wm.getCurrentWindowMetrics());
+
+        final float x = size.getWidth() / 2.0f;
+        final float fromY = size.getHeight() * 0.5f;
+        final float toY = size.getHeight() * 0.75f;
+
         drag(test, x, x, fromY, toY, 4);
     }
-    
+
     /**
      * Simulate touching in the center of the screen and dragging one quarter of the way up
      * @param test The test case that is being run
@@ -76,28 +88,38 @@ public class TouchUtils {
     public static void dragQuarterScreenUp(ActivityInstrumentationTestCase test) {
         dragQuarterScreenUp(test, test.getActivity());
     }
-    
+
     /**
      * Simulate touching in the center of the screen and dragging one quarter of the way up
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      */
     public static void dragQuarterScreenUp(InstrumentationTestCase test, Activity activity) {
-        Display display = activity.getWindowManager().getDefaultDisplay();
-        final Point size = new Point();
-        display.getSize(size);
-        
-        final float x = size.x / 2.0f;
-        final float fromY = size.y * 0.5f;
-        final float toY = size.y * 0.25f;
-      
+        WindowManager wm = activity.getWindowManager();
+        final Size size = getSizeExcludingNavigationBarAndCutout(wm.getCurrentWindowMetrics());
+
+        final float x = size.getWidth() / 2.0f;
+        final float fromY = size.getHeight() * 0.5f;
+        final float toY = size.getHeight() * 0.25f;
+
         drag(test, x, x, fromY, toY, 4);
     }
-    
+
+    private static Size getSizeExcludingNavigationBarAndCutout(WindowMetrics windowMetrics) {
+        WindowInsets windowInsets = windowMetrics.getWindowInsets();
+        final Insets insetsWithCutout = windowInsets
+                .getInsetsIgnoringVisibility(navigationBars() | displayCutout());
+        final int insetsWidth = insetsWithCutout.left + insetsWithCutout.right;
+        final int insetsHeight = insetsWithCutout.top + insetsWithCutout.bottom;
+
+        Rect bounds = windowMetrics.getBounds();
+        return new Size(bounds.width() - insetsWidth, bounds.height() - insetsHeight);
+    }
+
     /**
      * Scroll a ViewGroup to the bottom by repeatedly calling
      * {@link #dragQuarterScreenUp(InstrumentationTestCase, Activity)}
-     * 
+     *
      * @param test The test case that is being run
      * @param v The ViewGroup that should be dragged
      *
@@ -109,11 +131,11 @@ public class TouchUtils {
     public static void scrollToBottom(ActivityInstrumentationTestCase test, ViewGroup v) {
         scrollToBottom(test, test.getActivity(), v);
     }
-    
+
     /**
      * Scroll a ViewGroup to the bottom by repeatedly calling
      * {@link #dragQuarterScreenUp(InstrumentationTestCase, Activity)}
-     * 
+     *
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      * @param v The ViewGroup that should be dragged
@@ -132,7 +154,7 @@ public class TouchUtils {
     /**
      * Scroll a ViewGroup to the top by repeatedly calling
      * {@link #dragQuarterScreenDown(InstrumentationTestCase, Activity)}
-     * 
+     *
      * @param test The test case that is being run
      * @param v The ViewGroup that should be dragged
      *
@@ -144,11 +166,11 @@ public class TouchUtils {
     public static void scrollToTop(ActivityInstrumentationTestCase test, ViewGroup v) {
         scrollToTop(test, test.getActivity(), v);
     }
-    
+
     /**
      * Scroll a ViewGroup to the top by repeatedly calling
      * {@link #dragQuarterScreenDown(InstrumentationTestCase, Activity)}
-     * 
+     *
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      * @param v The ViewGroup that should be dragged
@@ -162,10 +184,10 @@ public class TouchUtils {
             next = new ViewStateSnapshot(v);
         } while (!prev.equals(next));
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the bottom of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      *
@@ -177,10 +199,10 @@ public class TouchUtils {
     public static void dragViewToBottom(ActivityInstrumentationTestCase test, View v) {
         dragViewToBottom(test, test.getActivity(), v, 4);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the bottom of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      * @param v The view that should be dragged
@@ -188,10 +210,10 @@ public class TouchUtils {
     public static void dragViewToBottom(InstrumentationTestCase test, Activity activity, View v) {
         dragViewToBottom(test, activity, v, 4);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the bottom of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param stepCount How many move steps to include in the drag
@@ -205,10 +227,10 @@ public class TouchUtils {
             int stepCount) {
         dragViewToBottom(test, test.getActivity(), v, stepCount);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the bottom of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param activity The activity that is in the foreground of the test case
      * @param v The view that should be dragged
@@ -216,42 +238,44 @@ public class TouchUtils {
      */
     public static void dragViewToBottom(InstrumentationTestCase test, Activity activity, View v,
             int stepCount) {
-        int screenHeight = activity.getWindowManager().getDefaultDisplay().getHeight();
+        WindowManager wm = activity.getWindowManager();
+        final int screenHeight = getSizeExcludingNavigationBarAndCutout(
+                wm.getCurrentWindowMetrics()).getHeight();
 
         int[] xy = new int[2];
         v.getLocationOnScreen(xy);
-        
+
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         final float x = xy[0] + (viewWidth / 2.0f);
         float fromY = xy[1] + (viewHeight / 2.0f);
         float toY = screenHeight - 1;
-        
+
         drag(test, x, x, fromY, toY, stepCount);
     }
 
     /**
      * Simulate touching the center of a view and releasing quickly (before the tap timeout).
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be clicked
      */
     public static void tapView(InstrumentationTestCase test, View v) {
         int[] xy = new int[2];
         v.getLocationOnScreen(xy);
-        
+
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         final float x = xy[0] + (viewWidth / 2.0f);
         float y = xy[1] + (viewHeight / 2.0f);
-        
+
         Instrumentation inst = test.getInstrumentation();
 
         long downTime = SystemClock.uptimeMillis();
         long eventTime = SystemClock.uptimeMillis();
-        
+
         MotionEvent event = MotionEvent.obtain(downTime, eventTime,
                 MotionEvent.ACTION_DOWN, x, y, 0);
         inst.sendPointerSync(event);
@@ -308,30 +332,30 @@ public class TouchUtils {
 
     /**
      * Simulate touching the center of a view and releasing.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be clicked
      */
     public static void clickView(InstrumentationTestCase test, View v) {
         int[] xy = new int[2];
         v.getLocationOnScreen(xy);
-        
+
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         final float x = xy[0] + (viewWidth / 2.0f);
         float y = xy[1] + (viewHeight / 2.0f);
-        
+
         Instrumentation inst = test.getInstrumentation();
 
         long downTime = SystemClock.uptimeMillis();
         long eventTime = SystemClock.uptimeMillis();
-        
+
         MotionEvent event = MotionEvent.obtain(downTime, eventTime,
                 MotionEvent.ACTION_DOWN, x, y, 0);
         inst.sendPointerSync(event);
         inst.waitForIdleSync();
-        
+
 
         eventTime = SystemClock.uptimeMillis();
         final int touchSlop = ViewConfiguration.get(v.getContext()).getScaledTouchSlop();
@@ -344,7 +368,7 @@ public class TouchUtils {
         event = MotionEvent.obtain(downTime, eventTime, MotionEvent.ACTION_UP, x, y, 0);
         inst.sendPointerSync(event);
         inst.waitForIdleSync();
-        
+
         try {
             Thread.sleep(1000);
         } catch (InterruptedException e) {
@@ -354,7 +378,7 @@ public class TouchUtils {
 
     /**
      * Simulate touching the center of a view, holding until it is a long press, and then releasing.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be clicked
      *
@@ -369,20 +393,20 @@ public class TouchUtils {
 
     /**
      * Simulate touching the center of a view, holding until it is a long press, and then releasing.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be clicked
      */
     public static void longClickView(InstrumentationTestCase test, View v) {
         int[] xy = new int[2];
         v.getLocationOnScreen(xy);
-        
+
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         final float x = xy[0] + (viewWidth / 2.0f);
         float y = xy[1] + (viewHeight / 2.0f);
-        
+
         Instrumentation inst = test.getInstrumentation();
 
         long downTime = SystemClock.uptimeMillis();
@@ -399,7 +423,7 @@ public class TouchUtils {
                 x + touchSlop / 2, y + touchSlop / 2, 0);
         inst.sendPointerSync(event);
         inst.waitForIdleSync();
-        
+
         try {
             Thread.sleep((long)(ViewConfiguration.getLongPressTimeout() * 1.5f));
         } catch (InterruptedException e) {
@@ -414,7 +438,7 @@ public class TouchUtils {
 
     /**
      * Simulate touching the center of a view and dragging to the top of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      *
@@ -426,10 +450,10 @@ public class TouchUtils {
     public static void dragViewToTop(ActivityInstrumentationTestCase test, View v) {
         dragViewToTop((InstrumentationTestCase) test, v, 4);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the top of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param stepCount How many move steps to include in the drag
@@ -442,20 +466,20 @@ public class TouchUtils {
     public static void dragViewToTop(ActivityInstrumentationTestCase test, View v, int stepCount) {
         dragViewToTop((InstrumentationTestCase) test, v, stepCount);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the top of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      */
     public static void dragViewToTop(InstrumentationTestCase test, View v) {
         dragViewToTop(test, v, 4);
     }
-    
+
     /**
      * Simulate touching the center of a view and dragging to the top of the screen.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param stepCount How many move steps to include in the drag
@@ -463,21 +487,21 @@ public class TouchUtils {
     public static void dragViewToTop(InstrumentationTestCase test, View v, int stepCount) {
         int[] xy = new int[2];
         v.getLocationOnScreen(xy);
-        
+
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         final float x = xy[0] + (viewWidth / 2.0f);
         float fromY = xy[1] + (viewHeight / 2.0f);
         float toY = 0;
-        
+
         drag(test, x, x, fromY, toY, stepCount);
     }
-    
+
     /**
      * Get the location of a view. Use the gravity param to specify which part of the view to
      * return.
-     * 
+     *
      * @param v View to find
      * @param gravity A combination of (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL,
      *        RIGHT)
@@ -488,7 +512,7 @@ public class TouchUtils {
 
         final int viewWidth = v.getWidth();
         final int viewHeight = v.getHeight();
-        
+
         switch (gravity & Gravity.VERTICAL_GRAVITY_MASK) {
         case Gravity.TOP:
             break;
@@ -501,7 +525,7 @@ public class TouchUtils {
         default:
             // Same as top -- do nothing
         }
-        
+
         switch (gravity & Gravity.HORIZONTAL_GRAVITY_MASK) {
         case Gravity.LEFT:
             break;
@@ -518,14 +542,14 @@ public class TouchUtils {
 
     /**
      * Simulate touching a view and dragging it by the specified amount.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param deltaX Amount to drag horizontally in pixels
      * @param deltaY Amount to drag vertically in pixels
-     * 
+     *
      * @return distance in pixels covered by the drag
      *
      * @deprecated {@link android.test.ActivityInstrumentationTestCase} is deprecated in favor of
@@ -537,17 +561,17 @@ public class TouchUtils {
             int deltaX, int deltaY) {
         return dragViewBy((InstrumentationTestCase) test, v, gravity, deltaX, deltaY);
     }
-    
+
     /**
      * Simulate touching a view and dragging it by the specified amount.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param deltaX Amount to drag horizontally in pixels
      * @param deltaY Amount to drag vertically in pixels
-     * 
+     *
      * @return distance in pixels covered by the drag
      *
      * @deprecated {@link android.test.ActivityInstrumentationTestCase} is deprecated in favor of
@@ -558,29 +582,29 @@ public class TouchUtils {
     public static int dragViewBy(InstrumentationTestCase test, View v, int gravity, int deltaX,
             int deltaY) {
         int[] xy = new int[2];
-        
+
         getStartLocation(v, gravity, xy);
 
         final int fromX = xy[0];
         final int fromY = xy[1];
-        
+
         int distance = (int) Math.hypot(deltaX, deltaY);
 
         drag(test, fromX, fromX + deltaX, fromY, fromY + deltaY, distance);
 
         return distance;
     }
-    
+
     /**
      * Simulate touching a view and dragging it to a specified location.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toX Final location of the view after dragging
      * @param toY Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      *
      * @deprecated {@link android.test.ActivityInstrumentationTestCase} is deprecated in favor of
@@ -595,14 +619,14 @@ public class TouchUtils {
 
     /**
      * Simulate touching a view and dragging it to a specified location.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toX Final location of the view after dragging
      * @param toY Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      */
     public static int dragViewTo(InstrumentationTestCase test, View v, int gravity, int toX,
@@ -610,28 +634,28 @@ public class TouchUtils {
         int[] xy = new int[2];
 
         getStartLocation(v, gravity, xy);
-        
+
         final int fromX = xy[0];
         final int fromY = xy[1];
-        
+
         int deltaX = fromX - toX;
         int deltaY = fromY - toY;
-        
+
         int distance = (int)Math.hypot(deltaX, deltaY);
         drag(test, fromX, toX, fromY, toY, distance);
-        
+
         return distance;
     }
 
     /**
      * Simulate touching a view and dragging it to a specified location. Only moves horizontally.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toX Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      *
      * @deprecated {@link android.test.ActivityInstrumentationTestCase} is deprecated in favor of
@@ -646,39 +670,39 @@ public class TouchUtils {
 
     /**
      * Simulate touching a view and dragging it to a specified location. Only moves horizontally.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toX Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      */
     public static int dragViewToX(InstrumentationTestCase test, View v, int gravity, int toX) {
         int[] xy = new int[2];
 
         getStartLocation(v, gravity, xy);
-        
+
         final int fromX = xy[0];
         final int fromY = xy[1];
-        
+
         int deltaX = fromX - toX;
 
         drag(test, fromX, toX, fromY, fromY, deltaX);
-        
+
         return deltaX;
     }
-    
+
     /**
      * Simulate touching a view and dragging it to a specified location. Only moves vertically.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toY Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      *
      * @deprecated {@link android.test.ActivityInstrumentationTestCase} is deprecated in favor of
@@ -690,37 +714,37 @@ public class TouchUtils {
             int toY) {
         return dragViewToY((InstrumentationTestCase) test, v, gravity, toY);
     }
-    
+
     /**
      * Simulate touching a view and dragging it to a specified location. Only moves vertically.
-     * 
+     *
      * @param test The test case that is being run
      * @param v The view that should be dragged
      * @param gravity Which part of the view to use for the initial down event. A combination of
      *        (TOP, CENTER_VERTICAL, BOTTOM) and (LEFT, CENTER_HORIZONTAL, RIGHT)
      * @param toY Final location of the view after dragging
-     * 
+     *
      * @return distance in pixels covered by the drag
      */
     public static int dragViewToY(InstrumentationTestCase test, View v, int gravity, int toY) {
         int[] xy = new int[2];
 
         getStartLocation(v, gravity, xy);
-       
+
         final int fromX = xy[0];
         final int fromY = xy[1];
-        
+
         int deltaY = fromY - toY;
 
         drag(test, fromX, fromX, fromY, toY, deltaY);
-        
+
         return deltaY;
     }
-    
+
 
     /**
      * Simulate touching a specific location and dragging to a new location.
-     * 
+     *
      * @param test The test case that is being run
      * @param fromX X coordinate of the initial touch, in screen coordinates
      * @param toX Xcoordinate of the drag destination, in screen coordinates
@@ -737,10 +761,10 @@ public class TouchUtils {
             float fromY, float toY, int stepCount) {
         drag((InstrumentationTestCase) test, fromX, toX, fromY, toY, stepCount);
     }
-    
+
     /**
      * Simulate touching a specific location and dragging to a new location.
-     * 
+     *
      * @param test The test case that is being run
      * @param fromX X coordinate of the initial touch, in screen coordinates
      * @param toX Xcoordinate of the drag destination, in screen coordinates
@@ -757,7 +781,7 @@ public class TouchUtils {
 
         float y = fromY;
         float x = fromX;
-        
+
         float yStep = (toY - fromY) / stepCount;
         float xStep = (toX - fromX) / stepCount;
 

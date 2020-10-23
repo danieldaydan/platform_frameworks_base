@@ -20,8 +20,9 @@ import java.util.List;
 /**
  * This interface abstracts a collection of Keyframe objects and is called by
  * ValueAnimator to calculate values between those keyframes for a given animation.
+ * @hide
  */
-interface Keyframes extends Cloneable {
+public interface Keyframes extends Cloneable {
 
     /**
      * Sets the TypeEvaluator to be used when calculating animated values. This object
@@ -51,12 +52,6 @@ interface Keyframes extends Cloneable {
      * @return The animated value.
      */
     Object getValue(float fraction);
-
-    /**
-     * If subclass has variables that it calculates based on the Keyframes, it should reset them
-     * when this method is called because Keyframe contents might have changed.
-     */
-    void invalidateCache();
 
     /**
      * @return A list of all Keyframes contained by this. This may return null if this is

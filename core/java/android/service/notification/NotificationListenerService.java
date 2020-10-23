@@ -16,34 +16,55 @@
 
 package android.service.notification;
 
-import android.annotation.SystemApi;
+import android.annotation.CurrentTimeMillisLong;
+import android.annotation.IntDef;
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.annotation.SdkConstant;
+import android.annotation.SystemApi;
+import android.app.ActivityManager;
 import android.app.INotificationManager;
 import android.app.Notification;
 import android.app.Notification.Builder;
+import android.app.NotificationChannel;
+import android.app.NotificationChannelGroup;
 import android.app.NotificationManager;
+import android.app.Person;
 import android.app.Service;
+import android.companion.CompanionDeviceManager;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ParceledListSlice;
+import android.content.pm.ShortcutInfo;
+import android.graphics.Bitmap;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.Icon;
-import android.graphics.Bitmap;
-import android.os.Bundle;
+import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.Message;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.os.RemoteException;
 import android.os.ServiceManager;
+import android.os.UserHandle;
 import android.util.ArrayMap;
-import android.util.ArraySet;
 import android.util.Log;
+import android.widget.RemoteViews;
 
+import com.android.internal.annotations.GuardedBy;
+import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.os.SomeArgs;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * A service that receives calls from the system when new notifications are
@@ -59,11 +80,26 @@ import java.util.List;
  *         &lt;action android:name="android.service.notification.NotificationListenerService" />
  *     &lt;/intent-filter>
  * &lt;/service></pre>
+ *
+ * <p>The service should wait for the {@link #onListenerConnected()} event
+ * before performing any operations. The {@link #requestRebind(ComponentName)}
+ * method is the <i>only</i> one that is safe to call before {@link #onListenerConnected()}
+ * or after {@link #onListenerDisconnected()}.
+ * </p>
+ * <p> Notification listeners cannot get notification access or be bound by the system on
+ * {@linkplain ActivityManager#isLowRamDevice() low-RAM} devices running Android Q (and below).
+ * The system also ignores notification listeners running in a work profile. A
+ * {@link android.app.admin.DevicePolicyManager} might block notifications originating from a work
+ * profile.</p>
+ * <p>
+ *     From {@link Build.VERSION_CODES#N} onward all callbacks are called on the main thread. Prior
+ *     to N, there is no guarantee on what thread the callback will happen.
+ * </p>
  */
 public abstract class NotificationListenerService extends Service {
-    // TAG = "NotificationListenerService[MySubclass]"
-    private final String TAG = NotificationListenerService.class.getSimpleName()
-            + "[" + getClass().getSimpleName() + "]";
+
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
+    private final String TAG = getClass().getSimpleName();
 
     /**
      * {@link #getCurrentInterruptionFilter() Interruption filter} constant -
@@ -107,10 +143,108 @@ public abstract class NotificationListenerService extends Service {
      * This does not change the interruption filter, only the effects. **/
     public static final int HINT_HOST_DISABLE_EFFECTS = 1;
 
+    /** {@link #getCurrentListenerHints() Listener hints} constant - the primary device UI
+     * should disable notification sound, but not phone calls.
+     * This does not change the interruption filter, only the effects. **/
+    public static final int HINT_HOST_DISABLE_NOTIFICATION_EFFECTS = 1 << 1;
+
+    /** {@link #getCurrentListenerHints() Listener hints} constant - the primary device UI
+     * should disable phone call sounds, buyt not notification sound.
+     * This does not change the interruption filter, only the effects. **/
+    public static final int HINT_HOST_DISABLE_CALL_EFFECTS = 1 << 2;
+
+    /**
+     * Whether notification suppressed by DND should not interruption visually when the screen is
+     * off.
+     *
+     * @deprecated Use the more specific visual effects in {@link NotificationManager.Policy}.
+     */
+    @Deprecated
+    public static final int SUPPRESSED_EFFECT_SCREEN_OFF =
+            NotificationManager.Policy.SUPPRESSED_EFFECT_SCREEN_OFF;
+    /**
+     * Whether notification suppressed by DND should not interruption visually when the screen is
+     * on.
+     *
+     * @deprecated Use the more specific visual effects in {@link NotificationManager.Policy}.
+     */
+    @Deprecated
+    public static final int SUPPRESSED_EFFECT_SCREEN_ON =
+            NotificationManager.Policy.SUPPRESSED_EFFECT_SCREEN_ON;
+
+
+    // Notification cancellation reasons
+
+    /** Notification was canceled by the status bar reporting a notification click. */
+    public static final int REASON_CLICK = 1;
+    /** Notification was canceled by the status bar reporting a user dismissal. */
+    public static final int REASON_CANCEL = 2;
+    /** Notification was canceled by the status bar reporting a user dismiss all. */
+    public static final int REASON_CANCEL_ALL = 3;
+    /** Notification was canceled by the status bar reporting an inflation error. */
+    public static final int REASON_ERROR = 4;
+    /** Notification was canceled by the package manager modifying the package. */
+    public static final int REASON_PACKAGE_CHANGED = 5;
+    /** Notification was canceled by the owning user context being stopped. */
+    public static final int REASON_USER_STOPPED = 6;
+    /** Notification was canceled by the user banning the package. */
+    public static final int REASON_PACKAGE_BANNED = 7;
+    /** Notification was canceled by the app canceling this specific notification. */
+    public static final int REASON_APP_CANCEL = 8;
+    /** Notification was canceled by the app cancelling all its notifications. */
+    public static final int REASON_APP_CANCEL_ALL = 9;
+    /** Notification was canceled by a listener reporting a user dismissal. */
+    public static final int REASON_LISTENER_CANCEL = 10;
+    /** Notification was canceled by a listener reporting a user dismiss all. */
+    public static final int REASON_LISTENER_CANCEL_ALL = 11;
+    /** Notification was canceled because it was a member of a canceled group. */
+    public static final int REASON_GROUP_SUMMARY_CANCELED = 12;
+    /** Notification was canceled because it was an invisible member of a group. */
+    public static final int REASON_GROUP_OPTIMIZATION = 13;
+    /** Notification was canceled by the device administrator suspending the package. */
+    public static final int REASON_PACKAGE_SUSPENDED = 14;
+    /** Notification was canceled by the owning managed profile being turned off. */
+    public static final int REASON_PROFILE_TURNED_OFF = 15;
+    /** Autobundled summary notification was canceled because its group was unbundled */
+    public static final int REASON_UNAUTOBUNDLED = 16;
+    /** Notification was canceled by the user banning the channel. */
+    public static final int REASON_CHANNEL_BANNED = 17;
+    /** Notification was snoozed. */
+    public static final int REASON_SNOOZED = 18;
+    /** Notification was canceled due to timeout */
+    public static final int REASON_TIMEOUT = 19;
+
+    /**
+     * @hide
+     */
+    @IntDef(prefix = "REASON_", value = {
+            REASON_CLICK,
+            REASON_CANCEL,
+            REASON_CANCEL_ALL,
+            REASON_ERROR,
+            REASON_PACKAGE_CHANGED,
+            REASON_USER_STOPPED,
+            REASON_PACKAGE_BANNED,
+            REASON_APP_CANCEL,
+            REASON_APP_CANCEL_ALL,
+            REASON_LISTENER_CANCEL,
+            REASON_LISTENER_CANCEL_ALL,
+            REASON_GROUP_SUMMARY_CANCELED,
+            REASON_GROUP_OPTIMIZATION,
+            REASON_PACKAGE_SUSPENDED,
+            REASON_PROFILE_TURNED_OFF,
+            REASON_UNAUTOBUNDLED,
+            REASON_CHANNEL_BANNED,
+            REASON_SNOOZED,
+            REASON_TIMEOUT
+    })
+    public @interface NotificationCancelReason{};
+
     /**
      * The full trim of the StatusBarNotification including all its features.
      *
      * @hide
+     * @removed
      */
     @SystemApi
     public static final int TRIM_FULL = 0;
@@ -131,22 +265,76 @@ public abstract class NotificationListenerService extends Service {
      * </ol>
      *
      * @hide
+     * @removed
      */
     @SystemApi
     public static final int TRIM_LIGHT = 1;
 
-    private INotificationListenerWrapper mWrapper = null;
+
+    /** @hide */
+    @IntDef(prefix = { "NOTIFICATION_CHANNEL_OR_GROUP_" }, value = {
+            NOTIFICATION_CHANNEL_OR_GROUP_ADDED,
+            NOTIFICATION_CHANNEL_OR_GROUP_UPDATED,
+            NOTIFICATION_CHANNEL_OR_GROUP_DELETED
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface ChannelOrGroupModificationTypes {}
+
+    /**
+     * Channel or group modification reason provided to
+     * {@link #onNotificationChannelModified(String, UserHandle,NotificationChannel, int)} or
+     * {@link #onNotificationChannelGroupModified(String, UserHandle, NotificationChannelGroup,
+     * int)}- the provided object was created.
+     */
+    public static final int NOTIFICATION_CHANNEL_OR_GROUP_ADDED = 1;
+
+    /**
+     * Channel or group modification reason provided to
+     * {@link #onNotificationChannelModified(String, UserHandle, NotificationChannel, int)} or
+     * {@link #onNotificationChannelGroupModified(String, UserHandle,NotificationChannelGroup, int)}
+     * - the provided object was updated.
+     */
+    public static final int NOTIFICATION_CHANNEL_OR_GROUP_UPDATED = 2;
+
+    /**
+     * Channel or group modification reason provided to
+     * {@link #onNotificationChannelModified(String, UserHandle, NotificationChannel, int)} or
+     * {@link #onNotificationChannelGroupModified(String, UserHandle, NotificationChannelGroup,
+     * int)}- the provided object was deleted.
+     */
+    public static final int NOTIFICATION_CHANNEL_OR_GROUP_DELETED = 3;
+
+    private final Object mLock = new Object();
+
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
+    private Handler mHandler;
+
+    /** @hide */
+    @UnsupportedAppUsage
+    protected NotificationListenerWrapper mWrapper = null;
+    private boolean isConnected = false;
+
+    @GuardedBy("mLock")
     private RankingMap mRankingMap;
 
-    private INotificationManager mNoMan;
+    /**
+     * @hide
+     */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
+    protected INotificationManager mNoMan;
 
-    /** Only valid after a successful call to (@link registerAsService}. */
-    private int mCurrentUser;
+    /**
+     * Only valid after a successful call to (@link registerAsService}.
+     * @hide
+     */
+    protected int mCurrentUser;
 
-
-    // This context is required for system services since NotificationListenerService isn't
-    // started as a real Service and hence no context is available.
-    private Context mSystemContext;
+    /**
+     * This context is required for system services since NotificationListenerService isn't
+     * started as a real Service and hence no context is available..
+     * @hide
+     */
+    protected Context mSystemContext;
 
     /**
      * The {@link Intent} that must be declared as handled by the service.
@@ -154,6 +342,12 @@ public abstract class NotificationListenerService extends Service {
     @SdkConstant(SdkConstant.SdkConstantType.SERVICE_ACTION)
     public static final String SERVICE_INTERFACE
             = "android.service.notification.NotificationListenerService";
+
+    @Override
+    protected void attachBaseContext(Context base) {
+        super.attachBaseContext(base);
+        mHandler = new MyHandler(getMainLooper());
+    }
 
     /**
      * Implement this method to learn about new notifications as they are posted by apps.
@@ -181,10 +375,10 @@ public abstract class NotificationListenerService extends Service {
 
     /**
      * Implement this method to learn when notifications are removed.
-     * <P>
+     * <p>
      * This might occur because the user has dismissed the notification using system UI (or another
      * notification listener) or because the app has withdrawn the notification.
-     * <P>
+     * <p>
      * NOTE: The {@link StatusBarNotification} object you receive will be "light"; that is, the
      * result from {@link StatusBarNotification#getNotification} may be missing some heavyweight
      * fields such as {@link android.app.Notification#contentView} and
@@ -202,10 +396,10 @@ public abstract class NotificationListenerService extends Service {
 
     /**
      * Implement this method to learn when notifications are removed.
-     * <P>
+     * <p>
      * This might occur because the user has dismissed the notification using system UI (or another
      * notification listener) or because the app has withdrawn the notification.
-     * <P>
+     * <p>
      * NOTE: The {@link StatusBarNotification} object you receive will be "light"; that is, the
      * result from {@link StatusBarNotification#getNotification} may be missing some heavyweight
      * fields such as {@link android.app.Notification#contentView} and
@@ -224,12 +418,59 @@ public abstract class NotificationListenerService extends Service {
         onNotificationRemoved(sbn);
     }
 
+
+    /**
+     * Implement this method to learn when notifications are removed and why.
+     * <p>
+     * This might occur because the user has dismissed the notification using system UI (or another
+     * notification listener) or because the app has withdrawn the notification.
+     * <p>
+     * NOTE: The {@link StatusBarNotification} object you receive will be "light"; that is, the
+     * result from {@link StatusBarNotification#getNotification} may be missing some heavyweight
+     * fields such as {@link android.app.Notification#contentView} and
+     * {@link android.app.Notification#largeIcon}. However, all other fields on
+     * {@link StatusBarNotification}, sufficient to match this call with a prior call to
+     * {@link #onNotificationPosted(StatusBarNotification)}, will be intact.
+     *
+     ** @param sbn A data structure encapsulating at least the original information (tag and id)
+     *            and source (package name) used to post the {@link android.app.Notification} that
+     *            was just removed.
+     * @param rankingMap The current ranking map that can be used to retrieve ranking information
+     *                   for active notifications.
+     * @param reason see {@link #REASON_LISTENER_CANCEL}, etc.
+     */
+    public void onNotificationRemoved(StatusBarNotification sbn, RankingMap rankingMap,
+            int reason) {
+        onNotificationRemoved(sbn, rankingMap);
+    }
+
+    /**
+     * NotificationStats are not populated for notification listeners, so fall back to
+     * {@link #onNotificationRemoved(StatusBarNotification, RankingMap, int)}.
+     *
+     * @hide
+     */
+    @SystemApi
+    public void onNotificationRemoved(@NonNull StatusBarNotification sbn,
+            @NonNull RankingMap rankingMap, @NonNull NotificationStats stats, int reason) {
+        onNotificationRemoved(sbn, rankingMap, reason);
+    }
+
     /**
      * Implement this method to learn about when the listener is enabled and connected to
      * the notification manager.  You are safe to call {@link #getActiveNotifications()}
      * at this time.
      */
     public void onListenerConnected() {
+        // optional
+    }
+
+    /**
+     * Implement this method to learn about when the listener is disconnected from the
+     * notification manager.You will not receive any events after this call, and may only
+     * call {@link #requestRebind(ComponentName)} at this time.
+     */
+    public void onListenerDisconnected() {
         // optional
     }
 
@@ -254,6 +495,53 @@ public abstract class NotificationListenerService extends Service {
     }
 
     /**
+     * Implement this method to be notified when the behavior of silent notifications in the status
+     * bar changes. See {@link NotificationManager#shouldHideSilentStatusBarIcons()}.
+     *
+     * @param hideSilentStatusIcons whether or not status bar icons should be hidden for silent
+     *                              notifications
+     */
+    public void onSilentStatusBarIconsVisibilityChanged(boolean hideSilentStatusIcons) {
+        // optional
+    }
+
+    /**
+     * Implement this method to learn about notification channel modifications.
+     *
+     * <p>The caller must have {@link CompanionDeviceManager#getAssociations() an associated
+     * device} in order to receive this callback.
+     *
+     * @param pkg The package the channel belongs to.
+     * @param user The user on which the change was made.
+     * @param channel The channel that has changed.
+     * @param modificationType One of {@link #NOTIFICATION_CHANNEL_OR_GROUP_ADDED},
+     *                   {@link #NOTIFICATION_CHANNEL_OR_GROUP_UPDATED},
+     *                   {@link #NOTIFICATION_CHANNEL_OR_GROUP_DELETED}.
+     */
+    public void onNotificationChannelModified(String pkg, UserHandle user,
+            NotificationChannel channel, @ChannelOrGroupModificationTypes int modificationType) {
+        // optional
+    }
+
+    /**
+     * Implement this method to learn about notification channel group modifications.
+     *
+     * <p>The caller must have {@link CompanionDeviceManager#getAssociations() an associated
+     * device} in order to receive this callback.
+     *
+     * @param pkg The package the group belongs to.
+     * @param user The user on which the change was made.
+     * @param group The group that has changed.
+     * @param modificationType One of {@link #NOTIFICATION_CHANNEL_OR_GROUP_ADDED},
+     *                   {@link #NOTIFICATION_CHANNEL_OR_GROUP_UPDATED},
+     *                   {@link #NOTIFICATION_CHANNEL_OR_GROUP_DELETED}.
+     */
+    public void onNotificationChannelGroupModified(String pkg, UserHandle user,
+            NotificationChannelGroup group, @ChannelOrGroupModificationTypes int modificationType) {
+        // optional
+    }
+
+    /**
      * Implement this method to be notified when the
      * {@link #getCurrentInterruptionFilter() interruption filter} changed.
      *
@@ -264,7 +552,9 @@ public abstract class NotificationListenerService extends Service {
         // optional
     }
 
-    private final INotificationManager getNotificationInterface() {
+    /** @hide */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
+    protected final INotificationManager getNotificationInterface() {
         if (mNoMan == null) {
             mNoMan = INotificationManager.Stub.asInterface(
                     ServiceManager.getService(Context.NOTIFICATION_SERVICE));
@@ -280,11 +570,14 @@ public abstract class NotificationListenerService extends Service {
      * It should be called after the user dismisses a single notification using your UI;
      * upon being informed, the notification manager will actually remove the notification
      * and you will get an {@link #onNotificationRemoved(StatusBarNotification)} callback.
-     * <P>
+     * <p>
      * <b>Note:</b> If your listener allows the user to fire a notification's
      * {@link android.app.Notification#contentIntent} by tapping/clicking/etc., you should call
      * this method at that time <i>if</i> the Notification in question has the
      * {@link android.app.Notification#FLAG_AUTO_CANCEL} flag set.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
      *
      * @param pkg Package of the notifying app.
      * @param tag Tag of the notification as specified by the notifying app in
@@ -297,6 +590,7 @@ public abstract class NotificationListenerService extends Service {
      * cancel the notification. It will continue to cancel the notification for applications
      * whose {@code targetSdkVersion} is earlier than {@link android.os.Build.VERSION_CODES#LOLLIPOP}.
      */
+    @Deprecated
     public final void cancelNotification(String pkg, String tag, int id) {
         if (!isBound()) return;
         try {
@@ -315,12 +609,16 @@ public abstract class NotificationListenerService extends Service {
      * It should be called after the user dismisses a single notification using your UI;
      * upon being informed, the notification manager will actually remove the notification
      * and you will get an {@link #onNotificationRemoved(StatusBarNotification)} callback.
-     * <P>
+     * <p>
      * <b>Note:</b> If your listener allows the user to fire a notification's
      * {@link android.app.Notification#contentIntent} by tapping/clicking/etc., you should call
      * this method at that time <i>if</i> the Notification in question has the
      * {@link android.app.Notification#FLAG_AUTO_CANCEL} flag set.
      * <p>
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @param key Notification to dismiss from {@link StatusBarNotification#getKey()}.
      */
     public final void cancelNotification(String key) {
@@ -342,6 +640,9 @@ public abstract class NotificationListenerService extends Service {
      * upon being informed, the notification manager will actually remove all active notifications
      * and you will get multiple {@link #onNotificationRemoved(StatusBarNotification)} callbacks.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * {@see #cancelNotification(String, String, int)}
      */
     public final void cancelAllNotifications() {
@@ -353,6 +654,9 @@ public abstract class NotificationListenerService extends Service {
      * <p>
      * Use this if your listener has a user interface that allows the user to dismiss
      * multiple notifications at once.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
      *
      * @param keys Notifications to dismiss, or {@code null} to dismiss all.
      *
@@ -368,10 +672,65 @@ public abstract class NotificationListenerService extends Service {
     }
 
     /**
+     * Inform the notification manager about snoozing a specific notification.
+     * <p>
+     * Use this if your listener has a user interface that allows the user to snooze a notification
+     * until a given {@link SnoozeCriterion}. It should be called after the user snoozes a single
+     * notification using your UI; upon being informed, the notification manager will actually
+     * remove the notification and you will get an
+     * {@link #onNotificationRemoved(StatusBarNotification)} callback. When the snoozing period
+     * expires, you will get a {@link #onNotificationPosted(StatusBarNotification, RankingMap)}
+     * callback for the notification.
+     * @param key The key of the notification to snooze
+     * @param snoozeCriterionId The{@link SnoozeCriterion#getId()} of a context to snooze the
+     *                          notification until.
+     * @hide
+     * @removed
+     */
+    @SystemApi
+    public final void snoozeNotification(String key, String snoozeCriterionId) {
+        if (!isBound()) return;
+        try {
+            getNotificationInterface().snoozeNotificationUntilContextFromListener(
+                    mWrapper, key, snoozeCriterionId);
+        } catch (android.os.RemoteException ex) {
+            Log.v(TAG, "Unable to contact notification manager", ex);
+        }
+    }
+
+    /**
+     * Inform the notification manager about snoozing a specific notification.
+     * <p>
+     * Use this if your listener has a user interface that allows the user to snooze a notification
+     * for a time. It should be called after the user snoozes a single notification using
+     * your UI; upon being informed, the notification manager will actually remove the notification
+     * and you will get an {@link #onNotificationRemoved(StatusBarNotification)} callback. When the
+     * snoozing period expires, you will get a
+     * {@link #onNotificationPosted(StatusBarNotification, RankingMap)} callback for the
+     * notification.
+     * @param key The key of the notification to snooze
+     * @param durationMs A duration to snooze the notification for, in milliseconds.
+     */
+    public final void snoozeNotification(String key, long durationMs) {
+        if (!isBound()) return;
+        try {
+            getNotificationInterface().snoozeNotificationUntilFromListener(
+                    mWrapper, key, durationMs);
+        } catch (android.os.RemoteException ex) {
+            Log.v(TAG, "Unable to contact notification manager", ex);
+        }
+    }
+
+
+    /**
      * Inform the notification manager that these notifications have been viewed by the
      * user. This should only be called when there is sufficient confidence that the user is
      * looking at the notifications, such as when the notifications appear on the screen due to
      * an explicit user interaction.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @param keys Notifications to mark as seen.
      */
     public final void setNotificationsShown(String[] keys) {
@@ -380,6 +739,80 @@ public abstract class NotificationListenerService extends Service {
             getNotificationInterface().setNotificationsShownFromListener(mWrapper, keys);
         } catch (android.os.RemoteException ex) {
             Log.v(TAG, "Unable to contact notification manager", ex);
+        }
+    }
+
+
+    /**
+     * Updates a notification channel for a given package for a given user. This should only be used
+     * to reflect changes a user has made to the channel via the listener's user interface.
+     *
+     * <p>This method will throw a security exception if you don't have access to notifications
+     * for the given user.</p>
+     * <p>The caller must have {@link CompanionDeviceManager#getAssociations() an associated
+     * device} in order to use this method.
+     *
+     * @param pkg The package the channel belongs to.
+     * @param user The user the channel belongs to.
+     * @param channel the channel to update.
+     */
+    public final void updateNotificationChannel(@NonNull String pkg, @NonNull UserHandle user,
+            @NonNull NotificationChannel channel) {
+        if (!isBound()) return;
+        try {
+            getNotificationInterface().updateNotificationChannelFromPrivilegedListener(
+                    mWrapper, pkg, user, channel);
+        } catch (RemoteException e) {
+            Log.v(TAG, "Unable to contact notification manager", e);
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Returns all notification channels belonging to the given package for a given user.
+     *
+     * <p>This method will throw a security exception if you don't have access to notifications
+     * for the given user.</p>
+     * <p>The caller must have {@link CompanionDeviceManager#getAssociations() an associated
+     * device} or be the {@link NotificationAssistantService notification assistant} in order to
+     * use this method.
+     *
+     * @param pkg The package to retrieve channels for.
+     */
+    public final List<NotificationChannel> getNotificationChannels(@NonNull String pkg,
+            @NonNull UserHandle user) {
+        if (!isBound()) return null;
+        try {
+
+            return getNotificationInterface().getNotificationChannelsFromPrivilegedListener(
+                    mWrapper, pkg, user).getList();
+        } catch (RemoteException e) {
+            Log.v(TAG, "Unable to contact notification manager", e);
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Returns all notification channel groups belonging to the given package for a given user.
+     *
+     * <p>This method will throw a security exception if you don't have access to notifications
+     * for the given user.</p>
+     * <p>The caller must have {@link CompanionDeviceManager#getAssociations() an associated
+     * device} or be the {@link NotificationAssistantService notification assistant} in order to
+     * use this method.
+     *
+     * @param pkg The package to retrieve channel groups for.
+     */
+    public final List<NotificationChannelGroup> getNotificationChannelGroups(@NonNull String pkg,
+            @NonNull UserHandle user) {
+        if (!isBound()) return null;
+        try {
+
+            return getNotificationInterface().getNotificationChannelGroupsFromPrivilegedListener(
+                    mWrapper, pkg, user).getList();
+        } catch (RemoteException e) {
+            Log.v(TAG, "Unable to contact notification manager", e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -394,7 +827,11 @@ public abstract class NotificationListenerService extends Service {
      * <p>
      * Set to {@link #TRIM_FULL} initially.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @hide
+     * @removed
      *
      * @param trim trim of the notifications to be passed via {@link #onNotificationPosted}.
      *             See <code>TRIM_*</code> constants.
@@ -413,10 +850,34 @@ public abstract class NotificationListenerService extends Service {
      * Request the list of outstanding notifications (that is, those that are visible to the
      * current user). Useful when you don't know what's already been posted.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @return An array of active notifications, sorted in natural order.
      */
     public StatusBarNotification[] getActiveNotifications() {
-        return getActiveNotifications(null, TRIM_FULL);
+        StatusBarNotification[] activeNotifications = getActiveNotifications(null, TRIM_FULL);
+        return activeNotifications != null ? activeNotifications : new StatusBarNotification[0];
+    }
+
+    /**
+     * Like {@link #getActiveNotifications()}, but returns the list of currently snoozed
+     * notifications, for all users this listener has access to.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
+     * @return An array of snoozed notifications, sorted in natural order.
+     */
+    public final StatusBarNotification[] getSnoozedNotifications() {
+        try {
+            ParceledListSlice<StatusBarNotification> parceledList = getNotificationInterface()
+                    .getSnoozedNotificationsFromListener(mWrapper, TRIM_FULL);
+            return cleanUpNotificationList(parceledList);
+        } catch (android.os.RemoteException ex) {
+            Log.v(TAG, "Unable to contact notification manager", ex);
+        }
+        return null;
     }
 
     /**
@@ -424,13 +885,15 @@ public abstract class NotificationListenerService extends Service {
      * current user). Useful when you don't know what's already been posted.
      *
      * @hide
+     * @removed
      *
      * @param trim trim of the notifications to be returned. See <code>TRIM_*</code> constants.
      * @return An array of active notifications, sorted in natural order.
      */
     @SystemApi
     public StatusBarNotification[] getActiveNotifications(int trim) {
-        return getActiveNotifications(null, trim);
+        StatusBarNotification[] activeNotifications = getActiveNotifications(null, trim);
+        return activeNotifications != null ? activeNotifications : new StatusBarNotification[0];
     }
 
     /**
@@ -438,12 +901,16 @@ public abstract class NotificationListenerService extends Service {
      * notifications but didn't want to retain the bits, and now need to go back and extract
      * more data out of those notifications.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @param keys the keys of the notifications to request
      * @return An array of notifications corresponding to the requested keys, in the
      * same order as the key list.
      */
     public StatusBarNotification[] getActiveNotifications(String[] keys) {
-        return getActiveNotifications(keys, TRIM_FULL);
+        StatusBarNotification[] activeNotifications = getActiveNotifications(keys, TRIM_FULL);
+        return activeNotifications != null ? activeNotifications : new StatusBarNotification[0];
     }
 
     /**
@@ -452,6 +919,7 @@ public abstract class NotificationListenerService extends Service {
      * more data out of those notifications.
      *
      * @hide
+     * @removed
      *
      * @param keys the keys of the notifications to request
      * @param trim trim of the notifications to be returned. See <code>TRIM_*</code> constants.
@@ -465,33 +933,44 @@ public abstract class NotificationListenerService extends Service {
         try {
             ParceledListSlice<StatusBarNotification> parceledList = getNotificationInterface()
                     .getActiveNotificationsFromListener(mWrapper, keys, trim);
-            List<StatusBarNotification> list = parceledList.getList();
-            ArrayList<StatusBarNotification> corruptNotifications = null;
-            int N = list.size();
-            for (int i = 0; i < N; i++) {
-                StatusBarNotification sbn = list.get(i);
-                Notification notification = sbn.getNotification();
-                try {
-                    Builder.rebuild(getContext(), notification);
-                    // convert icon metadata to legacy format for older clients
-                    createLegacyIconExtras(notification);
-                } catch (IllegalArgumentException e) {
-                    if (corruptNotifications == null) {
-                        corruptNotifications = new ArrayList<>(N);
-                    }
-                    corruptNotifications.add(sbn);
-                    Log.w(TAG, "onNotificationPosted: can't rebuild notification from " +
-                            sbn.getPackageName());
-                }
-            }
-            if (corruptNotifications != null) {
-                list.removeAll(corruptNotifications);
-            }
-            return list.toArray(new StatusBarNotification[list.size()]);
+            return cleanUpNotificationList(parceledList);
         } catch (android.os.RemoteException ex) {
             Log.v(TAG, "Unable to contact notification manager", ex);
         }
         return null;
+    }
+
+    private StatusBarNotification[] cleanUpNotificationList(
+            ParceledListSlice<StatusBarNotification> parceledList) {
+        if (parceledList == null || parceledList.getList() == null) {
+            return new StatusBarNotification[0];
+        }
+        List<StatusBarNotification> list = parceledList.getList();
+        ArrayList<StatusBarNotification> corruptNotifications = null;
+        int N = list.size();
+        for (int i = 0; i < N; i++) {
+            StatusBarNotification sbn = list.get(i);
+            Notification notification = sbn.getNotification();
+            try {
+                // convert icon metadata to legacy format for older clients
+                createLegacyIconExtras(notification);
+                // populate remote views for older clients.
+                maybePopulateRemoteViews(notification);
+                // populate people for older clients.
+                maybePopulatePeople(notification);
+            } catch (IllegalArgumentException e) {
+                if (corruptNotifications == null) {
+                    corruptNotifications = new ArrayList<>(N);
+                }
+                corruptNotifications.add(sbn);
+                Log.w(TAG, "get(Active/Snoozed)Notifications: can't rebuild notification from " +
+                        sbn.getPackageName());
+            }
+        }
+        if (corruptNotifications != null) {
+            list.removeAll(corruptNotifications);
+        }
+        return list.toArray(new StatusBarNotification[list.size()]);
     }
 
     /**
@@ -501,6 +980,9 @@ public abstract class NotificationListenerService extends Service {
      * The current state may differ from the requested state if the hint represents state
      * shared across all listeners or a feature the notification host does not support or refuses
      * to grant.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
      *
      * @return Zero or more of the HINT_ constants.
      */
@@ -529,6 +1011,9 @@ public abstract class NotificationListenerService extends Service {
      * <p>
      * Listen for updates using {@link #onInterruptionFilterChanged(int)}.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @return One of the INTERRUPTION_FILTER_ constants, or INTERRUPTION_FILTER_UNKNOWN when
      * unavailable.
      */
@@ -543,6 +1028,21 @@ public abstract class NotificationListenerService extends Service {
     }
 
     /**
+     * Clears listener hints set via {@link #getCurrentListenerHints()}.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     */
+    public final void clearRequestedListenerHints() {
+        if (!isBound()) return;
+        try {
+            getNotificationInterface().clearRequestedListenerHints(mWrapper);
+        } catch (android.os.RemoteException ex) {
+            Log.v(TAG, "Unable to contact notification manager", ex);
+        }
+    }
+
+    /**
      * Sets the desired {@link #getCurrentListenerHints() listener hints}.
      *
      * <p>
@@ -550,6 +1050,9 @@ public abstract class NotificationListenerService extends Service {
      * on other listener requests or other global state.
      * <p>
      * Listen for updates using {@link #onListenerHintsChanged(int)}.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
      *
      * @param hints One or more of the HINT_ constants.
      */
@@ -570,6 +1073,9 @@ public abstract class NotificationListenerService extends Service {
      * interruption filter depending on other listener requests or other global state.
      * <p>
      * Listen for updates using {@link #onInterruptionFilterChanged(int)}.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
      *
      * @param interruptionFilter One of the INTERRUPTION_FILTER_ constants.
      */
@@ -597,26 +1103,45 @@ public abstract class NotificationListenerService extends Service {
      * such events, for example to retrieve the RankingMap right after
      * initialization.
      *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation.
+     *
      * @return A {@link RankingMap} object providing access to ranking information
      */
     public RankingMap getCurrentRanking() {
-        return mRankingMap;
+        synchronized (mLock) {
+            return mRankingMap;
+        }
     }
 
+    /**
+     * This is not the lifecycle event you are looking for.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing any operations.
+     */
     @Override
     public IBinder onBind(Intent intent) {
         if (mWrapper == null) {
-            mWrapper = new INotificationListenerWrapper();
+            mWrapper = new NotificationListenerWrapper();
         }
         return mWrapper;
     }
 
-    private boolean isBound() {
+    /** @hide */
+    @UnsupportedAppUsage
+    protected boolean isBound() {
         if (mWrapper == null) {
             Log.w(TAG, "Notification listener service not yet bound.");
             return false;
         }
         return true;
+    }
+
+    @Override
+    public void onDestroy() {
+        onListenerDisconnected();
+        super.onDestroy();
     }
 
     /**
@@ -630,25 +1155,28 @@ public abstract class NotificationListenerService extends Service {
      * @param componentName the component that will consume the notification information
      * @param currentUser the user to use as the stream filter
      * @hide
+     * @removed
      */
     @SystemApi
     public void registerAsSystemService(Context context, ComponentName componentName,
             int currentUser) throws RemoteException {
-        mSystemContext = context;
         if (mWrapper == null) {
-            mWrapper = new INotificationListenerWrapper();
+            mWrapper = new NotificationListenerWrapper();
         }
+        mSystemContext = context;
         INotificationManager noMan = getNotificationInterface();
-        noMan.registerListener(mWrapper, componentName, currentUser);
+        mHandler = new MyHandler(context.getMainLooper());
         mCurrentUser = currentUser;
+        noMan.registerListener(mWrapper, componentName, currentUser);
     }
 
     /**
      * Directly unregister this service from the Notification Manager.
      *
-     * <P>This method will fail for listeners that were not registered
+     * <p>This method will fail for listeners that were not registered
      * with (@link registerAsService).
      * @hide
+     * @removed
      */
     @SystemApi
     public void unregisterAsSystemService() throws RemoteException {
@@ -658,25 +1186,108 @@ public abstract class NotificationListenerService extends Service {
         }
     }
 
-    /** Convert new-style Icons to legacy representations for pre-M clients. */
-    private void createLegacyIconExtras(Notification n) {
-        Icon smallIcon = n.getSmallIcon();
-        Icon largeIcon = n.getLargeIcon();
-        if (smallIcon != null && smallIcon.getType() == Icon.TYPE_RESOURCE) {
-            n.extras.putInt(Notification.EXTRA_SMALL_ICON, smallIcon.getResId());
-            n.icon = smallIcon.getResId();
+    /**
+     * Request that the listener be rebound, after a previous call to {@link #requestUnbind}.
+     *
+     * <p>This method will fail for listeners that have
+     * not been granted the permission by the user.
+     */
+    public static void requestRebind(ComponentName componentName) {
+        INotificationManager noMan = INotificationManager.Stub.asInterface(
+                ServiceManager.getService(Context.NOTIFICATION_SERVICE));
+        try {
+            noMan.requestBindListener(componentName);
+        } catch (RemoteException ex) {
+            throw ex.rethrowFromSystemServer();
         }
-        if (largeIcon != null) {
-            Drawable d = largeIcon.loadDrawable(getContext());
-            if (d != null && d instanceof BitmapDrawable) {
-                final Bitmap largeIconBits = ((BitmapDrawable) d).getBitmap();
-                n.extras.putParcelable(Notification.EXTRA_LARGE_ICON, largeIconBits);
-                n.largeIcon = largeIconBits;
+    }
+
+    /**
+     * Request that the service be unbound.
+     *
+     * <p>Once this is called, you will no longer receive updates and no method calls are
+     * guaranteed to be successful, until you next receive the {@link #onListenerConnected()} event.
+     * The service will likely be killed by the system after this call.
+     *
+     * <p>The service should wait for the {@link #onListenerConnected()} event
+     * before performing this operation. I know it's tempting, but you must wait.
+     */
+    public final void requestUnbind() {
+        if (mWrapper != null) {
+            INotificationManager noMan = getNotificationInterface();
+            try {
+                noMan.requestUnbindListener(mWrapper);
+                // Disable future messages.
+                isConnected = false;
+            } catch (RemoteException ex) {
+                throw ex.rethrowFromSystemServer();
             }
         }
     }
 
-    private class INotificationListenerWrapper extends INotificationListener.Stub {
+    /**
+     * Convert new-style Icons to legacy representations for pre-M clients.
+     * @hide
+     */
+    public final void createLegacyIconExtras(Notification n) {
+        if (getContext().getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.M) {
+            Icon smallIcon = n.getSmallIcon();
+            Icon largeIcon = n.getLargeIcon();
+            if (smallIcon != null && smallIcon.getType() == Icon.TYPE_RESOURCE) {
+                n.extras.putInt(Notification.EXTRA_SMALL_ICON, smallIcon.getResId());
+                n.icon = smallIcon.getResId();
+            }
+            if (largeIcon != null) {
+                Drawable d = largeIcon.loadDrawable(getContext());
+                if (d != null && d instanceof BitmapDrawable) {
+                    final Bitmap largeIconBits = ((BitmapDrawable) d).getBitmap();
+                    n.extras.putParcelable(Notification.EXTRA_LARGE_ICON, largeIconBits);
+                    n.largeIcon = largeIconBits;
+                }
+            }
+        }
+    }
+
+    /**
+     * Populates remote views for pre-N targeting apps.
+     */
+    private void maybePopulateRemoteViews(Notification notification) {
+        if (getContext().getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N) {
+            Builder builder = Builder.recoverBuilder(getContext(), notification);
+
+            // Some styles wrap Notification's contentView, bigContentView and headsUpContentView.
+            // First inflate them all, only then set them to avoid recursive wrapping.
+            RemoteViews content = builder.createContentView();
+            RemoteViews big = builder.createBigContentView();
+            RemoteViews headsUp = builder.createHeadsUpContentView();
+
+            notification.contentView = content;
+            notification.bigContentView = big;
+            notification.headsUpContentView = headsUp;
+        }
+    }
+
+    /**
+     * Populates remote views for pre-P targeting apps.
+     */
+    private void maybePopulatePeople(Notification notification) {
+        if (getContext().getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.P) {
+            ArrayList<Person> people = notification.extras.getParcelableArrayList(
+                    Notification.EXTRA_PEOPLE_LIST);
+            if (people != null && people.isEmpty()) {
+                int size = people.size();
+                String[] peopleArray = new String[size];
+                for (int i = 0; i < size; i++) {
+                    Person person = people.get(i);
+                    peopleArray[i] = person.resolveToLegacyUri();
+                }
+                notification.extras.putStringArray(Notification.EXTRA_PEOPLE, peopleArray);
+            }
+        }
+    }
+
+    /** @hide */
+    protected class NotificationListenerWrapper extends INotificationListener.Stub {
         @Override
         public void onNotificationPosted(IStatusBarNotificationHolder sbnHolder,
                 NotificationRankingUpdate update) {
@@ -687,36 +1298,44 @@ public abstract class NotificationListenerService extends Service {
                 Log.w(TAG, "onNotificationPosted: Error receiving StatusBarNotification", e);
                 return;
             }
+            if (sbn == null) {
+                Log.w(TAG, "onNotificationPosted: Error receiving StatusBarNotification");
+                return;
+            }
 
             try {
-                Notification.Builder.rebuild(getContext(), sbn.getNotification());
                 // convert icon metadata to legacy format for older clients
                 createLegacyIconExtras(sbn.getNotification());
+                maybePopulateRemoteViews(sbn.getNotification());
+                maybePopulatePeople(sbn.getNotification());
             } catch (IllegalArgumentException e) {
-                // drop corrupt notification
-                sbn = null;
+                // warn and drop corrupt notification
                 Log.w(TAG, "onNotificationPosted: can't rebuild notification from " +
                         sbn.getPackageName());
+                sbn = null;
             }
 
             // protect subclass from concurrent modifications of (@link mNotificationKeys}.
-            synchronized (mWrapper) {
-                applyUpdate(update);
-                try {
-                    if (sbn != null) {
-                        NotificationListenerService.this.onNotificationPosted(sbn, mRankingMap);
-                    } else {
-                        // still pass along the ranking map, it may contain other information
-                        NotificationListenerService.this.onNotificationRankingUpdate(mRankingMap);
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "Error running onNotificationPosted", t);
+            synchronized (mLock) {
+                applyUpdateLocked(update);
+                if (sbn != null) {
+                    SomeArgs args = SomeArgs.obtain();
+                    args.arg1 = sbn;
+                    args.arg2 = mRankingMap;
+                    mHandler.obtainMessage(MyHandler.MSG_ON_NOTIFICATION_POSTED,
+                            args).sendToTarget();
+                } else {
+                    // still pass along the ranking map, it may contain other information
+                    mHandler.obtainMessage(MyHandler.MSG_ON_NOTIFICATION_RANKING_UPDATE,
+                            mRankingMap).sendToTarget();
                 }
             }
+
         }
+
         @Override
         public void onNotificationRemoved(IStatusBarNotificationHolder sbnHolder,
-                NotificationRankingUpdate update) {
+                NotificationRankingUpdate update, NotificationStats stats, int reason) {
             StatusBarNotification sbn;
             try {
                 sbn = sbnHolder.get();
@@ -724,65 +1343,163 @@ public abstract class NotificationListenerService extends Service {
                 Log.w(TAG, "onNotificationRemoved: Error receiving StatusBarNotification", e);
                 return;
             }
-            // protect subclass from concurrent modifications of (@link mNotificationKeys}.
-            synchronized (mWrapper) {
-                applyUpdate(update);
-                try {
-                    NotificationListenerService.this.onNotificationRemoved(sbn, mRankingMap);
-                } catch (Throwable t) {
-                    Log.w(TAG, "Error running onNotificationRemoved", t);
-                }
+            if (sbn == null) {
+                Log.w(TAG, "onNotificationRemoved: Error receiving StatusBarNotification");
+                return;
             }
+            // protect subclass from concurrent modifications of (@link mNotificationKeys}.
+            synchronized (mLock) {
+                applyUpdateLocked(update);
+                SomeArgs args = SomeArgs.obtain();
+                args.arg1 = sbn;
+                args.arg2 = mRankingMap;
+                args.arg3 = reason;
+                args.arg4 = stats;
+                mHandler.obtainMessage(MyHandler.MSG_ON_NOTIFICATION_REMOVED,
+                        args).sendToTarget();
+            }
+
         }
+
         @Override
         public void onListenerConnected(NotificationRankingUpdate update) {
             // protect subclass from concurrent modifications of (@link mNotificationKeys}.
-            synchronized (mWrapper) {
-                applyUpdate(update);
-                try {
-                    NotificationListenerService.this.onListenerConnected();
-                } catch (Throwable t) {
-                    Log.w(TAG, "Error running onListenerConnected", t);
-                }
+            synchronized (mLock) {
+                applyUpdateLocked(update);
             }
+            isConnected = true;
+            mHandler.obtainMessage(MyHandler.MSG_ON_LISTENER_CONNECTED).sendToTarget();
         }
+
         @Override
         public void onNotificationRankingUpdate(NotificationRankingUpdate update)
                 throws RemoteException {
             // protect subclass from concurrent modifications of (@link mNotificationKeys}.
-            synchronized (mWrapper) {
-                applyUpdate(update);
-                try {
-                    NotificationListenerService.this.onNotificationRankingUpdate(mRankingMap);
-                } catch (Throwable t) {
-                    Log.w(TAG, "Error running onNotificationRankingUpdate", t);
-                }
+            synchronized (mLock) {
+                applyUpdateLocked(update);
+                mHandler.obtainMessage(MyHandler.MSG_ON_NOTIFICATION_RANKING_UPDATE,
+                        mRankingMap).sendToTarget();
             }
+
         }
+
         @Override
         public void onListenerHintsChanged(int hints) throws RemoteException {
-            try {
-                NotificationListenerService.this.onListenerHintsChanged(hints);
-            } catch (Throwable t) {
-                Log.w(TAG, "Error running onListenerHintsChanged", t);
-            }
+            mHandler.obtainMessage(MyHandler.MSG_ON_LISTENER_HINTS_CHANGED,
+                    hints, 0).sendToTarget();
         }
 
         @Override
         public void onInterruptionFilterChanged(int interruptionFilter) throws RemoteException {
-            try {
-                NotificationListenerService.this.onInterruptionFilterChanged(interruptionFilter);
-            } catch (Throwable t) {
-                Log.w(TAG, "Error running onInterruptionFilterChanged", t);
-            }
+            mHandler.obtainMessage(MyHandler.MSG_ON_INTERRUPTION_FILTER_CHANGED,
+                    interruptionFilter, 0).sendToTarget();
+        }
+
+        @Override
+        public void onNotificationEnqueuedWithChannel(
+                IStatusBarNotificationHolder notificationHolder, NotificationChannel channel)
+                throws RemoteException {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationsSeen(List<String> keys)
+                throws RemoteException {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onPanelRevealed(int items) throws RemoteException {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onPanelHidden() throws RemoteException {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationVisibilityChanged(
+                String key, boolean isVisible) {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationSnoozedUntilContext(
+                IStatusBarNotificationHolder notificationHolder, String snoozeCriterionId)
+                throws RemoteException {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationExpansionChanged(
+                String key, boolean isUserAction, boolean isExpanded) {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationDirectReply(String key) {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onSuggestedReplySent(String key, CharSequence reply, int source) {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onActionClicked(String key, Notification.Action action, int source) {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onAllowedAdjustmentsChanged() {
+            // no-op in the listener
+        }
+
+        @Override
+        public void onNotificationChannelModification(String pkgName, UserHandle user,
+                NotificationChannel channel,
+                @ChannelOrGroupModificationTypes int modificationType) {
+            SomeArgs args = SomeArgs.obtain();
+            args.arg1 = pkgName;
+            args.arg2 = user;
+            args.arg3 = channel;
+            args.arg4 = modificationType;
+            mHandler.obtainMessage(
+                    MyHandler.MSG_ON_NOTIFICATION_CHANNEL_MODIFIED, args).sendToTarget();
+        }
+
+        @Override
+        public void onNotificationChannelGroupModification(String pkgName, UserHandle user,
+                NotificationChannelGroup group,
+                @ChannelOrGroupModificationTypes int modificationType) {
+            SomeArgs args = SomeArgs.obtain();
+            args.arg1 = pkgName;
+            args.arg2 = user;
+            args.arg3 = group;
+            args.arg4 = modificationType;
+            mHandler.obtainMessage(
+                    MyHandler.MSG_ON_NOTIFICATION_CHANNEL_GROUP_MODIFIED, args).sendToTarget();
+        }
+
+        @Override
+        public void onStatusBarIconsBehaviorChanged(boolean hideSilentStatusIcons) {
+            mHandler.obtainMessage(MyHandler.MSG_ON_STATUS_BAR_ICON_BEHAVIOR_CHANGED,
+                    hideSilentStatusIcons).sendToTarget();
         }
     }
 
-    private void applyUpdate(NotificationRankingUpdate update) {
-        mRankingMap = new RankingMap(update);
+    /**
+     * @hide
+     */
+    @GuardedBy("mLock")
+    public final void applyUpdateLocked(NotificationRankingUpdate update) {
+        mRankingMap = update.getRankingMap();
     }
 
-    private Context getContext() {
+    /** @hide */
+    protected Context getContext() {
         if (mSystemContext != null) {
             return mSystemContext;
         }
@@ -798,17 +1515,132 @@ public abstract class NotificationListenerService extends Service {
      * current {@link RankingMap}.
      */
     public static class Ranking {
+
         /** Value signifying that the user has not expressed a per-app visibility override value.
          * @hide */
-        public static final int VISIBILITY_NO_OVERRIDE = -1000;
+        public static final int VISIBILITY_NO_OVERRIDE = NotificationManager.VISIBILITY_NO_OVERRIDE;
 
-        private String mKey;
+        /**
+         * The user is likely to have a negative reaction to this notification.
+         */
+        public static final int USER_SENTIMENT_NEGATIVE = -1;
+        /**
+         * It is not known how the user will react to this notification.
+         */
+        public static final int USER_SENTIMENT_NEUTRAL = 0;
+        /**
+         * The user is likely to have a positive reaction to this notification.
+         */
+        public static final int USER_SENTIMENT_POSITIVE = 1;
+
+       /** @hide */
+        @IntDef(prefix = { "USER_SENTIMENT_" }, value = {
+                USER_SENTIMENT_NEGATIVE, USER_SENTIMENT_NEUTRAL, USER_SENTIMENT_POSITIVE
+        })
+        @Retention(RetentionPolicy.SOURCE)
+        public @interface UserSentiment {}
+
+        private @NonNull String mKey;
         private int mRank = -1;
         private boolean mIsAmbient;
         private boolean mMatchesInterruptionFilter;
         private int mVisibilityOverride;
+        private int mSuppressedVisualEffects;
+        private @NotificationManager.Importance int mImportance;
+        private CharSequence mImportanceExplanation;
+        // System specified group key.
+        private String mOverrideGroupKey;
+        // Notification assistant channel override.
+        private NotificationChannel mChannel;
+        // Notification assistant people override.
+        private ArrayList<String> mOverridePeople;
+        // Notification assistant snooze criteria.
+        private ArrayList<SnoozeCriterion> mSnoozeCriteria;
+        private boolean mShowBadge;
+        private @UserSentiment int mUserSentiment = USER_SENTIMENT_NEUTRAL;
+        private boolean mHidden;
+        private long mLastAudiblyAlertedMs;
+        private boolean mNoisy;
+        private ArrayList<Notification.Action> mSmartActions;
+        private ArrayList<CharSequence> mSmartReplies;
+        private boolean mCanBubble;
+        private boolean mVisuallyInterruptive;
+        private boolean mIsConversation;
+        private ShortcutInfo mShortcutInfo;
+        private boolean mIsBubble;
 
-        public Ranking() {}
+        private static final int PARCEL_VERSION = 2;
+
+        public Ranking() { }
+
+        // You can parcel it, but it's not Parcelable
+        /** @hide */
+        @VisibleForTesting
+        public void writeToParcel(Parcel out, int flags) {
+            final long start = out.dataPosition();
+            out.writeInt(PARCEL_VERSION);
+            out.writeString(mKey);
+            out.writeInt(mRank);
+            out.writeBoolean(mIsAmbient);
+            out.writeBoolean(mMatchesInterruptionFilter);
+            out.writeInt(mVisibilityOverride);
+            out.writeInt(mSuppressedVisualEffects);
+            out.writeInt(mImportance);
+            out.writeCharSequence(mImportanceExplanation);
+            out.writeString(mOverrideGroupKey);
+            out.writeParcelable(mChannel, flags);
+            out.writeStringList(mOverridePeople);
+            out.writeTypedList(mSnoozeCriteria, flags);
+            out.writeBoolean(mShowBadge);
+            out.writeInt(mUserSentiment);
+            out.writeBoolean(mHidden);
+            out.writeLong(mLastAudiblyAlertedMs);
+            out.writeBoolean(mNoisy);
+            out.writeTypedList(mSmartActions, flags);
+            out.writeCharSequenceList(mSmartReplies);
+            out.writeBoolean(mCanBubble);
+            out.writeBoolean(mVisuallyInterruptive);
+            out.writeBoolean(mIsConversation);
+            out.writeParcelable(mShortcutInfo, flags);
+            out.writeBoolean(mIsBubble);
+        }
+
+        /** @hide */
+        @VisibleForTesting
+        public Ranking(Parcel in) {
+            final ClassLoader cl = getClass().getClassLoader();
+
+            final int version = in.readInt();
+            if (version != PARCEL_VERSION) {
+                throw new IllegalArgumentException("malformed Ranking parcel: " + in + " version "
+                        + version + ", expected " + PARCEL_VERSION);
+            }
+            mKey = in.readString();
+            mRank = in.readInt();
+            mIsAmbient = in.readBoolean();
+            mMatchesInterruptionFilter = in.readBoolean();
+            mVisibilityOverride = in.readInt();
+            mSuppressedVisualEffects = in.readInt();
+            mImportance = in.readInt();
+            mImportanceExplanation = in.readCharSequence(); // may be null
+            mOverrideGroupKey = in.readString(); // may be null
+            mChannel = in.readParcelable(cl); // may be null
+            mOverridePeople = in.createStringArrayList();
+            mSnoozeCriteria = in.createTypedArrayList(SnoozeCriterion.CREATOR);
+            mShowBadge = in.readBoolean();
+            mUserSentiment = in.readInt();
+            mHidden = in.readBoolean();
+            mLastAudiblyAlertedMs = in.readLong();
+            mNoisy = in.readBoolean();
+            mSmartActions = in.createTypedArrayList(Notification.Action.CREATOR);
+            mSmartReplies = in.readCharSequenceList();
+            mCanBubble = in.readBoolean();
+            mVisuallyInterruptive = in.readBoolean();
+            mIsConversation = in.readBoolean();
+            mShortcutInfo = in.readParcelable(cl);
+            mIsBubble = in.readBoolean();
+        }
+
 
         /**
          * Returns the key of the notification this Ranking applies to.
@@ -836,16 +1668,25 @@ public abstract class NotificationListenerService extends Service {
         }
 
         /**
-         * Returns the user specificed visibility for the package that posted
+         * Returns the user specified visibility for the package that posted
          * this notification, or
          * {@link NotificationListenerService.Ranking#VISIBILITY_NO_OVERRIDE} if
          * no such preference has been expressed.
          * @hide
          */
+        @UnsupportedAppUsage
         public int getVisibilityOverride() {
             return mVisibilityOverride;
         }
 
+        /**
+         * Returns the type(s) of visual effects that should be suppressed for this notification.
+         * See {@link NotificationManager.Policy}, e.g.
+         * {@link NotificationManager.Policy#SUPPRESSED_EFFECT_LIGHTS}.
+         */
+        public int getSuppressedVisualEffects() {
+            return mSuppressedVisualEffects;
+        }
 
         /**
          * Returns whether the notification matches the user's interruption
@@ -858,13 +1699,290 @@ public abstract class NotificationListenerService extends Service {
             return mMatchesInterruptionFilter;
         }
 
-        private void populate(String key, int rank, boolean isAmbient,
-                boolean matchesInterruptionFilter, int visibilityOverride) {
+        /**
+         * Returns the importance of the notification, which dictates its
+         * modes of presentation, see: {@link NotificationManager#IMPORTANCE_DEFAULT}, etc.
+         *
+         * @return the importance of the notification
+         */
+        public @NotificationManager.Importance int getImportance() {
+            return mImportance;
+        }
+
+        /**
+         * If the importance has been overridden by user preference, then this will be non-null,
+         * and should be displayed to the user.
+         *
+         * @return the explanation for the importance, or null if it is the natural importance
+         */
+        public CharSequence getImportanceExplanation() {
+            return mImportanceExplanation;
+        }
+
+        /**
+         * If the system has overridden the group key, then this will be non-null, and this
+         * key should be used to bundle notifications.
+         */
+        public String getOverrideGroupKey() {
+            return mOverrideGroupKey;
+        }
+
+        /**
+         * Returns the notification channel this notification was posted to, which dictates
+         * notification behavior and presentation.
+         */
+        public NotificationChannel getChannel() {
+            return mChannel;
+        }
+
+        /**
+         * Returns how the system thinks the user feels about notifications from the
+         * channel provided by {@link #getChannel()}. You can use this information to expose
+         * controls to help the user block this channel's notifications, if the sentiment is
+         * {@link #USER_SENTIMENT_NEGATIVE}, or emphasize this notification if the sentiment is
+         * {@link #USER_SENTIMENT_POSITIVE}.
+         */
+        public int getUserSentiment() {
+            return mUserSentiment;
+        }
+
+        /**
+         * If the {@link NotificationAssistantService} has added people to this notification, then
+         * this will be non-null.
+         * @hide
+         * @removed
+         */
+        @SystemApi
+        public List<String> getAdditionalPeople() {
+            return mOverridePeople;
+        }
+
+        /**
+         * Returns snooze criteria provided by the {@link NotificationAssistantService}. If your
+         * user interface displays options for snoozing notifications these criteria should be
+         * displayed as well.
+         * @hide
+         * @removed
+         */
+        @SystemApi
+        public List<SnoozeCriterion> getSnoozeCriteria() {
+            return mSnoozeCriteria;
+        }
+
+        /**
+         * Returns a list of smart {@link Notification.Action} that can be added by the
+         * {@link NotificationAssistantService}
+         */
+        public @NonNull List<Notification.Action> getSmartActions() {
+            return mSmartActions;
+        }
+
+        /**
+         * Returns a list of smart replies that can be added by the
+         * {@link NotificationAssistantService}
+         */
+        public @NonNull List<CharSequence> getSmartReplies() {
+            return mSmartReplies;
+        }
+
+        /**
+         * Returns whether this notification can be displayed as a badge.
+         *
+         * @return true if the notification can be displayed as a badge, false otherwise.
+         */
+        public boolean canShowBadge() {
+            return mShowBadge;
+        }
+
+        /**
+         * Returns whether the app that posted this notification is suspended, so this notification
+         * should be hidden.
+         *
+         * @return true if the notification should be hidden, false otherwise.
+         */
+        public boolean isSuspended() {
+            return mHidden;
+        }
+
+        /**
+         * Returns the last time this notification alerted the user via sound or vibration.
+         *
+         * @return the time of the last alerting behavior, in milliseconds.
+         */
+        @CurrentTimeMillisLong
+        public long getLastAudiblyAlertedMillis() {
+            return mLastAudiblyAlertedMs;
+        }
+
+        /**
+         * Returns whether the user has allowed bubbles globally, at the app level, and at the
+         * channel level for this notification.
+         *
+         * <p>This does not take into account the current importance of the notification, the
+         * current DND state, or whether the posting app is foreground.</p>
+         */
+        public boolean canBubble() {
+            return mCanBubble;
+        }
+
+        /** @hide */
+        public boolean visuallyInterruptive() {
+            return mVisuallyInterruptive;
+        }
+
+        /** @hide */
+        public boolean isNoisy() {
+            return mNoisy;
+        }
+
+        /**
+         * Returns whether this notification is a conversation notification.
+         * @hide
+         */
+        public boolean isConversation() {
+            return mIsConversation;
+        }
+
+        /**
+         * Returns whether this notification is actively a bubble.
+         * @hide
+         */
+        public boolean isBubble() {
+            return mIsBubble;
+        }
+
+        /**
+         * @hide
+         */
+        public @Nullable ShortcutInfo getShortcutInfo() {
+            return mShortcutInfo;
+        }
+
+        /**
+         * @hide
+         */
+        @VisibleForTesting
+        public void populate(String key, int rank, boolean matchesInterruptionFilter,
+                int visibilityOverride, int suppressedVisualEffects, int importance,
+                CharSequence explanation, String overrideGroupKey,
+                NotificationChannel channel, ArrayList<String> overridePeople,
+                ArrayList<SnoozeCriterion> snoozeCriteria, boolean showBadge,
+                int userSentiment, boolean hidden, long lastAudiblyAlertedMs,
+                boolean noisy, ArrayList<Notification.Action> smartActions,
+                ArrayList<CharSequence> smartReplies, boolean canBubble,
+                boolean visuallyInterruptive, boolean isConversation, ShortcutInfo shortcutInfo,
+                boolean isBubble) {
             mKey = key;
             mRank = rank;
-            mIsAmbient = isAmbient;
+            mIsAmbient = importance < NotificationManager.IMPORTANCE_LOW;
             mMatchesInterruptionFilter = matchesInterruptionFilter;
             mVisibilityOverride = visibilityOverride;
+            mSuppressedVisualEffects = suppressedVisualEffects;
+            mImportance = importance;
+            mImportanceExplanation = explanation;
+            mOverrideGroupKey = overrideGroupKey;
+            mChannel = channel;
+            mOverridePeople = overridePeople;
+            mSnoozeCriteria = snoozeCriteria;
+            mShowBadge = showBadge;
+            mUserSentiment = userSentiment;
+            mHidden = hidden;
+            mLastAudiblyAlertedMs = lastAudiblyAlertedMs;
+            mNoisy = noisy;
+            mSmartActions = smartActions;
+            mSmartReplies = smartReplies;
+            mCanBubble = canBubble;
+            mVisuallyInterruptive = visuallyInterruptive;
+            mIsConversation = isConversation;
+            mShortcutInfo = shortcutInfo;
+            mIsBubble = isBubble;
+        }
+
+        /**
+         * @hide
+         */
+        public void populate(Ranking other) {
+            populate(other.mKey,
+                    other.mRank,
+                    other.mMatchesInterruptionFilter,
+                    other.mVisibilityOverride,
+                    other.mSuppressedVisualEffects,
+                    other.mImportance,
+                    other.mImportanceExplanation,
+                    other.mOverrideGroupKey,
+                    other.mChannel,
+                    other.mOverridePeople,
+                    other.mSnoozeCriteria,
+                    other.mShowBadge,
+                    other.mUserSentiment,
+                    other.mHidden,
+                    other.mLastAudiblyAlertedMs,
+                    other.mNoisy,
+                    other.mSmartActions,
+                    other.mSmartReplies,
+                    other.mCanBubble,
+                    other.mVisuallyInterruptive,
+                    other.mIsConversation,
+                    other.mShortcutInfo,
+                    other.mIsBubble);
+        }
+
+        /**
+         * {@hide}
+         */
+        public static String importanceToString(int importance) {
+            switch (importance) {
+                case NotificationManager.IMPORTANCE_UNSPECIFIED:
+                    return "UNSPECIFIED";
+                case NotificationManager.IMPORTANCE_NONE:
+                    return "NONE";
+                case NotificationManager.IMPORTANCE_MIN:
+                    return "MIN";
+                case NotificationManager.IMPORTANCE_LOW:
+                    return "LOW";
+                case NotificationManager.IMPORTANCE_DEFAULT:
+                    return "DEFAULT";
+                case NotificationManager.IMPORTANCE_HIGH:
+                case NotificationManager.IMPORTANCE_MAX:
+                    return "HIGH";
+                default:
+                    return "UNKNOWN(" + String.valueOf(importance) + ")";
+            }
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            Ranking other = (Ranking) o;
+            return Objects.equals(mKey, other.mKey)
+                    && Objects.equals(mRank, other.mRank)
+                    && Objects.equals(mMatchesInterruptionFilter, other.mMatchesInterruptionFilter)
+                    && Objects.equals(mVisibilityOverride, other.mVisibilityOverride)
+                    && Objects.equals(mSuppressedVisualEffects, other.mSuppressedVisualEffects)
+                    && Objects.equals(mImportance, other.mImportance)
+                    && Objects.equals(mImportanceExplanation, other.mImportanceExplanation)
+                    && Objects.equals(mOverrideGroupKey, other.mOverrideGroupKey)
+                    && Objects.equals(mChannel, other.mChannel)
+                    && Objects.equals(mOverridePeople, other.mOverridePeople)
+                    && Objects.equals(mSnoozeCriteria, other.mSnoozeCriteria)
+                    && Objects.equals(mShowBadge, other.mShowBadge)
+                    && Objects.equals(mUserSentiment, other.mUserSentiment)
+                    && Objects.equals(mHidden, other.mHidden)
+                    && Objects.equals(mLastAudiblyAlertedMs, other.mLastAudiblyAlertedMs)
+                    && Objects.equals(mNoisy, other.mNoisy)
+                    // Action.equals() doesn't exist so let's just compare list lengths
+                    && ((mSmartActions == null ? 0 : mSmartActions.size())
+                        == (other.mSmartActions == null ? 0 : other.mSmartActions.size()))
+                    && Objects.equals(mSmartReplies, other.mSmartReplies)
+                    && Objects.equals(mCanBubble, other.mCanBubble)
+                    && Objects.equals(mVisuallyInterruptive, other.mVisuallyInterruptive)
+                    && Objects.equals(mIsConversation, other.mIsConversation)
+                    // Shortcutinfo doesn't have equals either; use id
+                    &&  Objects.equals((mShortcutInfo == null ? 0 : mShortcutInfo.getId()),
+                    (other.mShortcutInfo == null ? 0 : other.mShortcutInfo.getId()))
+                    && Objects.equals(mIsBubble, other.mIsBubble);
         }
     }
 
@@ -877,14 +1995,73 @@ public abstract class NotificationListenerService extends Service {
      * notifications active at the time of retrieval.
      */
     public static class RankingMap implements Parcelable {
-        private final NotificationRankingUpdate mRankingUpdate;
-        private ArrayMap<String,Integer> mRanks;
-        private ArraySet<Object> mIntercepted;
-        private ArrayMap<String, Integer> mVisibilityOverrides;
+        private ArrayList<String> mOrderedKeys = new ArrayList<>();
+        // Note: all String keys should be intern'd as pointers into mOrderedKeys
+        private ArrayMap<String, Ranking> mRankings = new ArrayMap<>();
 
-        private RankingMap(NotificationRankingUpdate rankingUpdate) {
-            mRankingUpdate = rankingUpdate;
+        /**
+         * @hide
+         */
+        public RankingMap(Ranking[] rankings) {
+            for (int i = 0; i < rankings.length; i++) {
+                final String key = rankings[i].getKey();
+                mOrderedKeys.add(key);
+                mRankings.put(key, rankings[i]);
+            }
         }
+
+        // -- parcelable interface --
+
+        private RankingMap(Parcel in) {
+            final ClassLoader cl = getClass().getClassLoader();
+            final int count = in.readInt();
+            mOrderedKeys.ensureCapacity(count);
+            mRankings.ensureCapacity(count);
+            for (int i = 0; i < count; i++) {
+                final Ranking r = new Ranking(in);
+                final String key = r.getKey();
+                mOrderedKeys.add(key);
+                mRankings.put(key, r);
+            }
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            RankingMap other = (RankingMap) o;
+
+            return mOrderedKeys.equals(other.mOrderedKeys)
+                    && mRankings.equals(other.mRankings);
+
+        }
+
+        @Override
+        public int describeContents() {
+            return 0;
+        }
+
+        @Override
+        public void writeToParcel(Parcel out, int flags) {
+            final int count = mOrderedKeys.size();
+            out.writeInt(count);
+            for (int i = 0; i < count; i++) {
+                mRankings.get(mOrderedKeys.get(i)).writeToParcel(out, flags);
+            }
+        }
+
+        public static final @android.annotation.NonNull Creator<RankingMap> CREATOR = new Creator<RankingMap>() {
+            @Override
+            public RankingMap createFromParcel(Parcel source) {
+                return new RankingMap(source);
+            }
+
+            @Override
+            public RankingMap[] newArray(int size) {
+                return new RankingMap[size];
+            }
+        };
 
         /**
          * Request the list of notification keys in their current ranking
@@ -893,7 +2070,7 @@ public abstract class NotificationListenerService extends Service {
          * @return An array of active notification keys, in their ranking order.
          */
         public String[] getOrderedKeys() {
-            return mRankingUpdate.getOrderedKeys();
+            return mOrderedKeys.toArray(new String[0]);
         }
 
         /**
@@ -901,105 +2078,108 @@ public abstract class NotificationListenerService extends Service {
          * with the given key.
          *
          * @return true if a valid key has been passed and outRanking has
-         *     been populated; false otherwise
+         * been populated; false otherwise
          */
         public boolean getRanking(String key, Ranking outRanking) {
-            int rank = getRank(key);
-            outRanking.populate(key, rank, isAmbient(key), !isIntercepted(key),
-                    getVisibilityOverride(key));
-            return rank >= 0;
-        }
-
-        private int getRank(String key) {
-            synchronized (this) {
-                if (mRanks == null) {
-                    buildRanksLocked();
-                }
+            if (mRankings.containsKey(key)) {
+                outRanking.populate(mRankings.get(key));
+                return true;
             }
-            Integer rank = mRanks.get(key);
-            return rank != null ? rank : -1;
+            return false;
         }
 
-        private boolean isAmbient(String key) {
-            int firstAmbientIndex = mRankingUpdate.getFirstAmbientIndex();
-            if (firstAmbientIndex < 0) {
-                return false;
-            }
-            int rank = getRank(key);
-            return rank >= 0 && rank >= firstAmbientIndex;
+        /**
+         * Get a reference to the actual Ranking object corresponding to the key.
+         * Used only by unit tests.
+         *
+         * @hide
+         */
+        @VisibleForTesting
+        public Ranking getRawRankingObject(String key) {
+            return mRankings.get(key);
         }
+    }
 
-        private boolean isIntercepted(String key) {
-            synchronized (this) {
-                if (mIntercepted == null) {
-                    buildInterceptedSetLocked();
-                }
-            }
-            return mIntercepted.contains(key);
-        }
+    private final class MyHandler extends Handler {
+        public static final int MSG_ON_NOTIFICATION_POSTED = 1;
+        public static final int MSG_ON_NOTIFICATION_REMOVED = 2;
+        public static final int MSG_ON_LISTENER_CONNECTED = 3;
+        public static final int MSG_ON_NOTIFICATION_RANKING_UPDATE = 4;
+        public static final int MSG_ON_LISTENER_HINTS_CHANGED = 5;
+        public static final int MSG_ON_INTERRUPTION_FILTER_CHANGED = 6;
+        public static final int MSG_ON_NOTIFICATION_CHANNEL_MODIFIED = 7;
+        public static final int MSG_ON_NOTIFICATION_CHANNEL_GROUP_MODIFIED = 8;
+        public static final int MSG_ON_STATUS_BAR_ICON_BEHAVIOR_CHANGED = 9;
 
-        private int getVisibilityOverride(String key) {
-            synchronized (this) {
-                if (mVisibilityOverrides == null) {
-                    buildVisibilityOverridesLocked();
-                }
-            }
-            Integer overide = mVisibilityOverrides.get(key);
-            if (overide == null) {
-                return Ranking.VISIBILITY_NO_OVERRIDE;
-            }
-            return overide.intValue();
-        }
-
-        // Locked by 'this'
-        private void buildRanksLocked() {
-            String[] orderedKeys = mRankingUpdate.getOrderedKeys();
-            mRanks = new ArrayMap<>(orderedKeys.length);
-            for (int i = 0; i < orderedKeys.length; i++) {
-                String key = orderedKeys[i];
-                mRanks.put(key, i);
-            }
-        }
-
-        // Locked by 'this'
-        private void buildInterceptedSetLocked() {
-            String[] dndInterceptedKeys = mRankingUpdate.getInterceptedKeys();
-            mIntercepted = new ArraySet<>(dndInterceptedKeys.length);
-            Collections.addAll(mIntercepted, dndInterceptedKeys);
-        }
-
-        // Locked by 'this'
-        private void buildVisibilityOverridesLocked() {
-            Bundle visibilityBundle = mRankingUpdate.getVisibilityOverrides();
-            mVisibilityOverrides = new ArrayMap<>(visibilityBundle.size());
-            for (String key: visibilityBundle.keySet()) {
-               mVisibilityOverrides.put(key, visibilityBundle.getInt(key));
-            }
-        }
-
-        // ----------- Parcelable
-
-        @Override
-        public int describeContents() {
-            return 0;
+        public MyHandler(Looper looper) {
+            super(looper, null, false);
         }
 
         @Override
-        public void writeToParcel(Parcel dest, int flags) {
-            dest.writeParcelable(mRankingUpdate, flags);
+        public void handleMessage(Message msg) {
+            if (!isConnected) {
+                return;
+            }
+            switch (msg.what) {
+                case MSG_ON_NOTIFICATION_POSTED: {
+                    SomeArgs args = (SomeArgs) msg.obj;
+                    StatusBarNotification sbn = (StatusBarNotification) args.arg1;
+                    RankingMap rankingMap = (RankingMap) args.arg2;
+                    args.recycle();
+                    onNotificationPosted(sbn, rankingMap);
+                } break;
+
+                case MSG_ON_NOTIFICATION_REMOVED: {
+                    SomeArgs args = (SomeArgs) msg.obj;
+                    StatusBarNotification sbn = (StatusBarNotification) args.arg1;
+                    RankingMap rankingMap = (RankingMap) args.arg2;
+                    int reason = (int) args.arg3;
+                    NotificationStats stats = (NotificationStats) args.arg4;
+                    args.recycle();
+                    onNotificationRemoved(sbn, rankingMap, stats, reason);
+                } break;
+
+                case MSG_ON_LISTENER_CONNECTED: {
+                    onListenerConnected();
+                } break;
+
+                case MSG_ON_NOTIFICATION_RANKING_UPDATE: {
+                    RankingMap rankingMap = (RankingMap) msg.obj;
+                    onNotificationRankingUpdate(rankingMap);
+                } break;
+
+                case MSG_ON_LISTENER_HINTS_CHANGED: {
+                    final int hints = msg.arg1;
+                    onListenerHintsChanged(hints);
+                } break;
+
+                case MSG_ON_INTERRUPTION_FILTER_CHANGED: {
+                    final int interruptionFilter = msg.arg1;
+                    onInterruptionFilterChanged(interruptionFilter);
+                } break;
+
+                case MSG_ON_NOTIFICATION_CHANNEL_MODIFIED: {
+                    SomeArgs args = (SomeArgs) msg.obj;
+                    String pkgName = (String) args.arg1;
+                    UserHandle user= (UserHandle) args.arg2;
+                    NotificationChannel channel = (NotificationChannel) args.arg3;
+                    int modificationType = (int) args.arg4;
+                    onNotificationChannelModified(pkgName, user, channel, modificationType);
+                } break;
+
+                case MSG_ON_NOTIFICATION_CHANNEL_GROUP_MODIFIED: {
+                    SomeArgs args = (SomeArgs) msg.obj;
+                    String pkgName = (String) args.arg1;
+                    UserHandle user = (UserHandle) args.arg2;
+                    NotificationChannelGroup group = (NotificationChannelGroup) args.arg3;
+                    int modificationType = (int) args.arg4;
+                    onNotificationChannelGroupModified(pkgName, user, group, modificationType);
+                } break;
+
+                case MSG_ON_STATUS_BAR_ICON_BEHAVIOR_CHANGED: {
+                    onSilentStatusBarIconsVisibilityChanged((Boolean) msg.obj);
+                } break;
+            }
         }
-
-        public static final Creator<RankingMap> CREATOR = new Creator<RankingMap>() {
-            @Override
-            public RankingMap createFromParcel(Parcel source) {
-                NotificationRankingUpdate rankingUpdate = source.readParcelable(null);
-                return new RankingMap(rankingUpdate);
-            }
-
-            @Override
-            public RankingMap[] newArray(int size) {
-                return new RankingMap[size];
-            }
-        };
     }
 }

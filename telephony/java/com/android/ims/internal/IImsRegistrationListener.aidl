@@ -16,27 +16,55 @@
 
 package com.android.ims.internal;
 
-import com.android.ims.ImsReasonInfo;
+import android.telephony.ims.ImsReasonInfo;
+
+import android.net.Uri;
+
 /**
  * A listener type for receiving notifications about the changes to
  * the IMS connection(registration).
  *
  * {@hide}
  */
-interface IImsRegistrationListener {
+oneway interface IImsRegistrationListener {
     /**
      * Notifies the application when the device is connected to the IMS network.
+     *
+     * @deprecated see {@link registrationConnectedWithRadioTech}
      */
+    @UnsupportedAppUsage
     void registrationConnected();
 
     /**
      * Notifies the application when the device is trying to connect the IMS network.
+     *
+     * @deprecated see {@link registrationProgressingWithRadioTech}
      */
     void registrationProgressing();
 
     /**
+     * Notifies the application when the device is connected to the IMS network.
+     *
+     * @param imsRadioTech the radio access technology. Valid values are {@code
+     * RIL_RADIO_TECHNOLOGY_*} defined in {@link ServiceState}.
+     */
+    @UnsupportedAppUsage
+    void registrationConnectedWithRadioTech(int imsRadioTech);
+
+    /**
+     * Notifies the application when the device is trying to connect the IMS network.
+     *
+     * @param imsRadioTech the radio access technology. Valid values are {@code
+     * RIL_RADIO_TECHNOLOGY_*} defined in {@link ServiceState}.
+     */
+    @UnsupportedAppUsage
+    void registrationProgressingWithRadioTech(int imsRadioTech);
+
+
+    /**
      * Notifies the application when the device is disconnected from the IMS network.
      */
+    @UnsupportedAppUsage
     void registrationDisconnected(in ImsReasonInfo imsReasonInfo);
 
     /**
@@ -70,6 +98,7 @@ interface IImsRegistrationListener {
      * @param enabledFeatures features enabled as defined in com.android.ims.ImsConfig#FeatureConstants.
      * @param disabledFeatures features disabled as defined in com.android.ims.ImsConfig#FeatureConstants.
      */
+    @UnsupportedAppUsage
     void registrationFeatureCapabilityChanged(int serviceClass,
             in int[] enabledFeatures, in int[] disabledFeatures);
 
@@ -77,5 +106,23 @@ interface IImsRegistrationListener {
      * Updates the application with the waiting voice message count.
      * @param count The number of waiting voice messages.
      */
+    @UnsupportedAppUsage
     void voiceMessageCountUpdate(int count);
+
+    /**
+     * Notifies the application when the list of URIs associated with IMS client is updated.
+     */
+    @UnsupportedAppUsage
+    void registrationAssociatedUriChanged(in Uri[] uris);
+
+    /**
+     * Notifies the application when IMS registration attempt on a target
+     * access tech fails.
+     *
+     * @param targetAccessTech Radio access technology on which the IMS registration was
+     *         attempted.
+     * @param imsReasonInfo Reason for the failure.
+     */
+    @UnsupportedAppUsage
+    void registrationChangeFailed(in int targetAccessTech, in ImsReasonInfo imsReasonInfo);
 }

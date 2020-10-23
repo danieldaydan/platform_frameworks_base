@@ -16,13 +16,13 @@
 
 package android.telecom;
 
-import com.android.internal.telecom.IConnectionService;
-
 import android.annotation.Nullable;
 import android.annotation.SystemApi;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.RemoteException;
+
+import com.android.internal.telecom.IConnectionService;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -92,6 +92,18 @@ public final class RemoteConference {
                 int connectionCapabilities) {}
 
         /**
+         * Indicates that the call properties of this {@code RemoteConference} have changed.
+         * See {@link #getConnectionProperties()}.
+         *
+         * @param conference The {@code RemoteConference} invoking this method.
+         * @param connectionProperties The new properties of the {@code RemoteConference}.
+         */
+        public void onConnectionPropertiesChanged(
+                RemoteConference conference,
+                int connectionProperties) {}
+
+
+        /**
          * Invoked when the set of {@link RemoteConnection}s which can be added to this conference
          * call have changed.
          *
@@ -133,12 +145,21 @@ public final class RemoteConference {
     private int mState = Connection.STATE_NEW;
     private DisconnectCause mDisconnectCause;
     private int mConnectionCapabilities;
+    private int mConnectionProperties;
     private Bundle mExtras;
 
     /** @hide */
     RemoteConference(String id, IConnectionService connectionService) {
         mId = id;
         mConnectionService = connectionService;
+    }
+
+    /** @hide */
+    RemoteConference(DisconnectCause disconnectCause) {
+        mId = "NULL";
+        mConnectionService = null;
+        mState = Connection.STATE_DISCONNECTED;
+        mDisconnectCause = disconnectCause;
     }
 
     /** @hide */
@@ -244,6 +265,24 @@ public final class RemoteConference {
     }
 
     /** @hide */
+    void setConnectionProperties(final int connectionProperties) {
+        if (mConnectionProperties != connectionProperties) {
+            mConnectionProperties = connectionProperties;
+            for (CallbackRecord<Callback> record : mCallbackRecords) {
+                final RemoteConference conference = this;
+                final Callback callback = record.getCallback();
+                record.getHandler().post(new Runnable() {
+                    @Override
+                    public void run() {
+                        callback.onConnectionPropertiesChanged(
+                                conference, mConnectionProperties);
+                    }
+                });
+            }
+        }
+    }
+
+    /** @hide */
     void setConferenceableConnections(List<RemoteConnection> conferenceableConnections) {
         mConferenceableConnections.clear();
         mConferenceableConnections.addAll(conferenceableConnections);
@@ -279,15 +318,38 @@ public final class RemoteConference {
     }
 
     /** @hide */
-    void setExtras(final Bundle extras) {
-        mExtras = extras;
+    void putExtras(final Bundle extras) {
+        if (extras == null) {
+            return;
+        }
+        if (mExtras == null) {
+            mExtras = new Bundle();
+        }
+        mExtras.putAll(extras);
+
+        notifyExtrasChanged();
+    }
+
+    /** @hide */
+    void removeExtras(List<String> keys) {
+        if (mExtras == null || keys == null || keys.isEmpty()) {
+            return;
+        }
+        for (String key : keys) {
+            mExtras.remove(key);
+        }
+
+        notifyExtrasChanged();
+    }
+
+    private void notifyExtrasChanged() {
         for (CallbackRecord<Callback> record : mCallbackRecords) {
             final RemoteConference conference = this;
             final Callback callback = record.getCallback();
             record.getHandler().post(new Runnable() {
                 @Override
                 public void run() {
-                    callback.onExtrasChanged(conference, extras);
+                    callback.onExtrasChanged(conference, mExtras);
                 }
             });
         }
@@ -322,6 +384,16 @@ public final class RemoteConference {
     }
 
     /**
+     * Returns the properties of the conference. See {@code PROPERTY_*} constants in class
+     * {@link Connection} for valid values.
+     *
+     * @return A bitmask of the properties of the conference call.
+     */
+    public final int getConnectionProperties() {
+        return mConnectionProperties;
+    }
+
+    /**
      * Obtain the extras associated with this {@code RemoteConnection}.
      *
      * @return The extras for this connection.
@@ -335,7 +407,7 @@ public final class RemoteConference {
      */
     public void disconnect() {
         try {
-            mConnectionService.disconnect(mId);
+            mConnectionService.disconnect(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -350,7 +422,7 @@ public final class RemoteConference {
     public void separate(RemoteConnection connection) {
         if (mChildConnections.contains(connection)) {
             try {
-                mConnectionService.splitFromConference(connection.getId());
+                mConnectionService.splitFromConference(connection.getId(), null /*Session.Info*/);
             } catch (RemoteException e) {
             }
         }
@@ -368,7 +440,7 @@ public final class RemoteConference {
      */
     public void merge() {
         try {
-            mConnectionService.mergeConference(mId);
+            mConnectionService.mergeConference(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -384,7 +456,7 @@ public final class RemoteConference {
      */
     public void swap() {
         try {
-            mConnectionService.swapConference(mId);
+            mConnectionService.swapConference(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -394,7 +466,7 @@ public final class RemoteConference {
      */
     public void hold() {
         try {
-            mConnectionService.hold(mId);
+            mConnectionService.hold(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -404,7 +476,7 @@ public final class RemoteConference {
      */
     public void unhold() {
         try {
-            mConnectionService.unhold(mId);
+            mConnectionService.unhold(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -427,7 +499,7 @@ public final class RemoteConference {
      */
     public void playDtmfTone(char digit) {
         try {
-            mConnectionService.playDtmfTone(mId, digit);
+            mConnectionService.playDtmfTone(mId, digit, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -439,7 +511,7 @@ public final class RemoteConference {
      */
     public void stopDtmfTone() {
         try {
-            mConnectionService.stopDtmfTone(mId);
+            mConnectionService.stopDtmfTone(mId, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -464,7 +536,7 @@ public final class RemoteConference {
      */
     public void setCallAudioState(CallAudioState state) {
         try {
-            mConnectionService.onCallAudioStateChanged(mId, state);
+            mConnectionService.onCallAudioStateChanged(mId, state, null /*Session.Info*/);
         } catch (RemoteException e) {
         }
     }
@@ -518,5 +590,17 @@ public final class RemoteConference {
                 }
             }
         }
+    }
+
+    /**
+     * Create a {@link RemoteConference} represents a failure, and which will
+     * be in {@link Connection#STATE_DISCONNECTED}.
+     *
+     * @param disconnectCause The disconnect cause.
+     * @return a failed {@link RemoteConference}
+     * @hide
+     */
+    public static RemoteConference failure(DisconnectCause disconnectCause) {
+        return new RemoteConference(disconnectCause);
     }
 }

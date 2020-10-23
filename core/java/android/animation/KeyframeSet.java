@@ -16,21 +16,22 @@
 
 package android.animation;
 
-import java.util.Arrays;
-import java.util.List;
-
-import android.animation.Keyframe.IntKeyframe;
 import android.animation.Keyframe.FloatKeyframe;
+import android.animation.Keyframe.IntKeyframe;
 import android.animation.Keyframe.ObjectKeyframe;
 import android.graphics.Path;
 import android.util.Log;
+
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * This class holds a collection of Keyframe objects and is called by ValueAnimator to calculate
  * values between those keyframes for a given animation. The class internal to the animation
  * package because it is an implementation detail of how Keyframes are stored and used.
+ * @hide
  */
-class KeyframeSet implements Keyframes {
+public class KeyframeSet implements Keyframes {
 
     int mNumKeyframes;
 
@@ -48,14 +49,6 @@ class KeyframeSet implements Keyframes {
         mFirstKeyframe = keyframes[0];
         mLastKeyframe = keyframes[mNumKeyframes - 1];
         mInterpolator = mLastKeyframe.getInterpolator();
-    }
-
-    /**
-     * If subclass has variables that it calculates based on the Keyframes, it should reset them
-     * when this method is called because Keyframe contents might have changed.
-     */
-    @Override
-    public void invalidateCache() {
     }
 
     public List<Keyframe> getKeyframes() {

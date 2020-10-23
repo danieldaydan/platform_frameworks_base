@@ -16,14 +16,16 @@
 
 package com.android.uiautomator.testrunner;
 
+import android.app.ActivityThread;
+import android.content.ContentResolver;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.os.RemoteException;
-import android.os.ServiceManager;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.view.inputmethod.InputMethodInfo;
+import android.view.inputmethod.InputMethodManager;
 
-import com.android.internal.view.IInputMethodManager;
 import com.android.uiautomator.core.UiDevice;
 
 import junit.framework.TestCase;
@@ -36,11 +38,16 @@ import java.util.List;
  * {@link UiDevice} instance
  * {@link Bundle} for command line parameters.
  * @since API Level 16
+ * @deprecated New tests should be written using UI Automator 2.0 which is available as part of the
+ * Android Testing Support Library.
  */
+@Deprecated
 public class UiAutomatorTestCase extends TestCase {
 
     private static final String DISABLE_IME = "disable_ime";
-    private static final String DUMMY_IME_PACKAGE = "com.android.testing.dummyime";
+    private static final String STUB_IME_PACKAGE = "com.android.testing.stubime";
+    private static final int NOT_A_SUBTYPE_ID = -1;
+
     private UiDevice mUiDevice;
     private Bundle mParams;
     private IAutomationSupport mAutomationSupport;
@@ -51,7 +58,7 @@ public class UiAutomatorTestCase extends TestCase {
         super.setUp();
         mShouldDisableIme = "true".equals(mParams.getString(DISABLE_IME));
         if (mShouldDisableIme) {
-            setDummyIme();
+            setStubIme();
         }
     }
 
@@ -121,24 +128,35 @@ public class UiAutomatorTestCase extends TestCase {
         SystemClock.sleep(ms);
     }
 
-    private void setDummyIme() throws RemoteException {
-        IInputMethodManager im = IInputMethodManager.Stub.asInterface(ServiceManager
-                .getService(Context.INPUT_METHOD_SERVICE));
+    private void setStubIme() {
+        Context context = ActivityThread.currentApplication();
+        if (context == null) {
+            throw new RuntimeException("ActivityThread.currentApplication() is null.");
+        }
+        InputMethodManager im = (InputMethodManager) context.getSystemService(
+                Context.INPUT_METHOD_SERVICE);
         List<InputMethodInfo> infos = im.getInputMethodList();
         String id = null;
         for (InputMethodInfo info : infos) {
-            if (DUMMY_IME_PACKAGE.equals(info.getComponent().getPackageName())) {
+            if (STUB_IME_PACKAGE.equals(info.getComponent().getPackageName())) {
                 id = info.getId();
             }
         }
         if (id == null) {
             throw new RuntimeException(String.format(
-                    "Required testing fixture missing: IME package (%s)", DUMMY_IME_PACKAGE));
+                    "Required testing fixture missing: IME package (%s)", STUB_IME_PACKAGE));
         }
-        im.setInputMethod(null, id);
+        if (context.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        ContentResolver resolver = context.getContentResolver();
+        Settings.Secure.putInt(resolver, Settings.Secure.SELECTED_INPUT_METHOD_SUBTYPE,
+                NOT_A_SUBTYPE_ID);
+        Settings.Secure.putString(resolver, Settings.Secure.DEFAULT_INPUT_METHOD, id);
     }
 
-    private void restoreActiveIme() throws RemoteException {
+    private void restoreActiveIme() {
         // TODO: figure out a way to restore active IME
         // Currently retrieving active IME requires querying secure settings provider, which is hard
         // to do without a Context; so the caveat here is that to make the post test device usable,

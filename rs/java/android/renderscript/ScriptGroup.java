@@ -148,6 +148,8 @@ public final class ScriptGroup extends BaseObj {
                                         fieldIDs, values, sizes, depClosures, depFieldIDs);
 
             setID(id);
+
+            guard.open("destroy");
         }
 
         Closure(RenderScript rs, Script.InvokeID invokeID,
@@ -181,6 +183,25 @@ public final class ScriptGroup extends BaseObj {
                                               values, sizes);
 
             setID(id);
+
+            guard.open("destroy");
+        }
+
+        /**
+         * Destroys this Closure and the Allocation for its return value
+         */
+        public void destroy() {
+            super.destroy();
+            if (mReturnValue != null) {
+                mReturnValue.destroy();
+            }
+        }
+
+        protected void finalize() throws Throwable {
+            // Set null mReturnValue to avoid double-destroying it, in case its
+            // finalizer races ahead.
+            mReturnValue = null;
+            super.finalize();
         }
 
         private void retrieveValueAndDependenceInfo(RenderScript rs,
@@ -382,6 +403,7 @@ public final class ScriptGroup extends BaseObj {
 
     ScriptGroup(long id, RenderScript rs) {
         super(id, rs);
+        guard.open("destroy");
     }
 
     ScriptGroup(RenderScript rs, String name, List<Closure> closures,
@@ -396,8 +418,9 @@ public final class ScriptGroup extends BaseObj {
         for (int i = 0; i < closureIDs.length; i++) {
             closureIDs[i] = closures.get(i).getID(rs);
         }
-        long id = rs.nScriptGroup2Create(name, ScriptC.mCachePath, closureIDs);
+        long id = rs.nScriptGroup2Create(name, RenderScript.getCachePath(), closureIDs);
         setID(id);
+        guard.open("destroy");
     }
 
     /**
@@ -1009,6 +1032,8 @@ public final class ScriptGroup extends BaseObj {
                 throw new RSIllegalArgumentException("invalid script group name");
             }
             ScriptGroup ret = new ScriptGroup(mRS, name, mClosures, mInputs, outputs);
+            mClosures = new ArrayList<Closure>();
+            mInputs = new ArrayList<Input>();
             return ret;
         }
 
@@ -1036,4 +1061,17 @@ public final class ScriptGroup extends BaseObj {
 
     }
 
+    /**
+     * Destroy this ScriptGroup and all Closures in it
+     */
+    public void destroy() {
+        super.destroy();
+        // ScriptGroup created using the old Builder class does not
+        // initialize the field mClosures
+        if (mClosures != null) {
+            for (Closure c : mClosures) {
+                c.destroy();
+            }
+        }
+    }
 }

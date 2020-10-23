@@ -4,9 +4,9 @@
      Licensed under the Apache License, Version 2.0 (the "License");
      you may not use this file except in compliance with the License.
      You may obtain a copy of the License at
-  
+
           http://www.apache.org/licenses/LICENSE-2.0
-  
+
      Unless required by applicable law or agreed to in writing, software
      distributed under the License is distributed on an "AS IS" BASIS,
      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -43,8 +43,9 @@
     </permission>
 
     <permission name="android.permission.BLUETOOTH_STACK" >
-        <group gid="net_bt_stack" />
+        <group gid="bluetooth" />
         <group gid="wakelock" />
+        <group gid="uhid" />
     </permission>
 
     <permission name="android.permission.NET_TUNNELING" >
@@ -59,9 +60,8 @@
         <group gid="log" />
     </permission>
 
-    <permission name="android.permission.WRITE_MEDIA_STORAGE" >
-        <group gid="media_rw" />
-        <group gid="sdcard_rw" />
+    <permission name="android.permission.MANAGE_EXTERNAL_STORAGE" >
+        <group gid="external_storage" />
     </permission>
 
     <permission name="android.permission.ACCESS_MTP" >
@@ -70,6 +70,11 @@
 
     <permission name="android.permission.NET_ADMIN" >
         <group gid="net_admin" />
+    </permission>
+
+    <permission name="android.permission.MAINLINE_NETWORK_STACK" >
+        <group gid="net_admin" />
+        <group gid="net_raw" />
     </permission>
 
     <!-- The group that /cache belongs to, linked to the permission
@@ -92,7 +97,7 @@
     </permission>
 
     <!-- Group that can modify how network statistics are accounted -->
-    <permission name="android.permission.MODIFY_NETWORK_ACCOUNTING">
+    <permission name="android.permission.UPDATE_DEVICE_STATS">
         <group gid="net_bw_acct" />
     </permission>
 
@@ -106,9 +111,28 @@
         <group gid="audio" />
     </permission>
 
-    <permission name="android.permission.ACCESS_FM_RADIO" >
+    <permission name="android.permission.ACCESS_BROADCAST_RADIO" >
+        <!-- /dev/fm is gid media, not audio -->
         <group gid="media" />
     </permission>
+
+    <permission name="android.permission.USE_RESERVED_DISK">
+        <group gid="reserved_disk" />
+    </permission>
+
+    <!-- These are permissions that were mapped to gids but we need
+         to keep them here until an upgrade from L to the current
+         version is to be supported. These permissions are built-in
+         and in L were not stored in packages.xml as a result if they
+         are not defined here while parsing packages.xml we would
+         ignore these permissions being granted to apps and not
+         propagate the granted state. From N we are storing the
+         built-in permissions in packages.xml as the saved storage
+         is negligible (one tag with the permission) compared to
+         the fragility as one can remove a built-in permission which
+         no longer needs to be mapped to gids and break grant propagation. -->
+    <permission name="android.permission.READ_EXTERNAL_STORAGE" />
+    <permission name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <!-- ================================================================== -->
     <!-- ================================================================== -->
@@ -127,21 +151,118 @@
     <assign-permission name="android.permission.WAKE_LOCK" uid="media" />
     <assign-permission name="android.permission.UPDATE_DEVICE_STATS" uid="media" />
     <assign-permission name="android.permission.UPDATE_APP_OPS_STATS" uid="media" />
+    <assign-permission name="android.permission.GET_PROCESS_STATE_AND_OOM_SCORE" uid="media" />
+    <assign-permission name="android.permission.INTERNET" uid="media" />
+
+    <assign-permission name="android.permission.INTERNET" uid="shell" />
+
+    <assign-permission name="android.permission.MODIFY_AUDIO_SETTINGS" uid="audioserver" />
+    <assign-permission name="android.permission.ACCESS_SURFACE_FLINGER" uid="audioserver" />
+    <assign-permission name="android.permission.WAKE_LOCK" uid="audioserver" />
+    <assign-permission name="android.permission.UPDATE_DEVICE_STATS" uid="audioserver" />
+    <assign-permission name="android.permission.UPDATE_APP_OPS_STATS" uid="audioserver" />
+    <assign-permission name="android.permission.PACKAGE_USAGE_STATS" uid="audioserver" />
+
+    <assign-permission name="android.permission.MODIFY_AUDIO_SETTINGS" uid="cameraserver" />
+    <assign-permission name="android.permission.ACCESS_SURFACE_FLINGER" uid="cameraserver" />
+    <assign-permission name="android.permission.WAKE_LOCK" uid="cameraserver" />
+    <assign-permission name="android.permission.UPDATE_DEVICE_STATS" uid="cameraserver" />
+    <assign-permission name="android.permission.UPDATE_APP_OPS_STATS" uid="cameraserver" />
+    <assign-permission name="android.permission.GET_PROCESS_STATE_AND_OOM_SCORE" uid="cameraserver" />
+    <assign-permission name="android.permission.PACKAGE_USAGE_STATS" uid="cameraserver" />
+    <assign-permission name="android.permission.WATCH_APPOPS" uid="cameraserver" />
+    <assign-permission name="android.permission.MANAGE_APP_OPS_MODES" uid="cameraserver" />
 
     <assign-permission name="android.permission.ACCESS_SURFACE_FLINGER" uid="graphics" />
+
+    <assign-permission name="android.permission.DUMP" uid="incidentd" />
+    <assign-permission name="android.permission.PACKAGE_USAGE_STATS" uid="incidentd" />
+    <assign-permission name="android.permission.INTERACT_ACROSS_USERS" uid="incidentd" />
+    <assign-permission name="android.permission.REQUEST_INCIDENT_REPORT_APPROVAL" uid="incidentd" />
+    <assign-permission name="android.permission.PEEK_DROPBOX_DATA" uid="incidentd" />
+
+    <assign-permission name="android.permission.ACCESS_LOWPAN_STATE" uid="lowpan" />
+    <assign-permission name="android.permission.MANAGE_LOWPAN_INTERFACES" uid="lowpan" />
+
+    <assign-permission name="android.permission.DUMP" uid="statsd" />
+    <assign-permission name="android.permission.PACKAGE_USAGE_STATS" uid="statsd" />
+    <assign-permission name="android.permission.STATSCOMPANION" uid="statsd" />
+    <assign-permission name="android.permission.UPDATE_APP_OPS_STATS" uid="statsd" />
+
+    <assign-permission name="android.permission.REGISTER_STATS_PULL_ATOM" uid="gpu_service" />
+
+    <split-permission name="android.permission.ACCESS_FINE_LOCATION">
+        <new-permission name="android.permission.ACCESS_COARSE_LOCATION" />
+    </split-permission>
+    <split-permission name="android.permission.WRITE_EXTERNAL_STORAGE">
+        <new-permission name="android.permission.READ_EXTERNAL_STORAGE" />
+    </split-permission>
+    <split-permission name="android.permission.READ_PRIVILEGED_PHONE_STATE">
+        <new-permission name="android.permission.READ_PHONE_STATE" />
+    </split-permission>
+    <split-permission name="android.permission.READ_CONTACTS"
+                      targetSdk="16">
+        <new-permission name="android.permission.READ_CALL_LOG" />
+    </split-permission>
+    <split-permission name="android.permission.WRITE_CONTACTS"
+                      targetSdk="16">
+        <new-permission name="android.permission.WRITE_CALL_LOG" />
+    </split-permission>
+    <split-permission name="android.permission.ACCESS_FINE_LOCATION"
+                      targetSdk="29">
+        <new-permission name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    </split-permission>
+    <split-permission name="android.permission.ACCESS_COARSE_LOCATION"
+                      targetSdk="29">
+        <new-permission name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    </split-permission>
+    <split-permission name="android.permission.READ_EXTERNAL_STORAGE"
+                      targetSdk="29">
+        <new-permission name="android.permission.ACCESS_MEDIA_LOCATION" />
+    </split-permission>
 
     <!-- This is a list of all the libraries available for application
          code to link against. -->
 
+    <library name="android.test.base"
+            file="/system/framework/android.test.base.jar" />
+    <library name="android.test.mock"
+            file="/system/framework/android.test.mock.jar" />
     <library name="android.test.runner"
-            file="/system/framework/android.test.runner.jar" />
-    <library name="javax.obex"
-            file="/system/framework/javax.obex.jar" />
-    <library name="org.apache.http.legacy"
-            file="/system/framework/org.apache.http.legacy.jar" />
+            file="/system/framework/android.test.runner.jar"
+            dependency="android.test.base:android.test.mock" />
+
+    <!-- In BOOT_JARS historically, and now added to legacy applications. -->
+    <library name="android.hidl.base-V1.0-java"
+            file="/system/framework/android.hidl.base-V1.0-java.jar" />
+    <library name="android.hidl.manager-V1.0-java"
+            file="/system/framework/android.hidl.manager-V1.0-java.jar" />
 
     <!-- These are the standard packages that are white-listed to always have internet
          access while in power save mode, even if they aren't in the foreground. -->
-    <allow-in-power-save-except-idle package="com.android.providers.downloads" />
+    <allow-in-power-save package="com.android.providers.downloads" />
 
+    <!-- These are the standard packages that are white-listed to always have internet
+         access while in data mode, even if they aren't in the foreground. -->
+    <allow-in-data-usage-save package="com.android.providers.downloads" />
+
+    <!-- This is a core platform component that needs to freely run in the background -->
+    <allow-in-power-save package="com.android.cellbroadcastreceiver.module" />
+    <allow-in-power-save package="com.android.cellbroadcastreceiver" />
+    <allow-in-power-save package="com.android.shell" />
+
+    <!-- Whitelist system providers -->
+    <allow-in-power-save-except-idle package="com.android.providers.calendar" />
+    <allow-in-power-save-except-idle package="com.android.providers.contacts" />
+
+    <!-- The PAC proxy process must have network access, otherwise no app will
+         be able to connect to the internet when such a proxy is in use, since
+         all outgoing connections originate from this app. -->
+    <allow-in-power-save-except-idle package="com.android.proxyhandler" />
+
+    <!-- These are the packages that are white-listed to be able to run as system user -->
+    <system-user-whitelisted-app package="com.android.settings" />
+
+    <!-- These are the packages that shouldn't run as system user -->
+    <system-user-blacklisted-app package="com.android.wallpaper.livepicker" />
 </permissions>

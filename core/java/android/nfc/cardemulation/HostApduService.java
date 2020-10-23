@@ -36,9 +36,9 @@ import android.util.Log;
  *
  * <div class="special reference">
  * <h3>Developer Guide</h3>
- * For a general introduction into the topic of card emulation,
- * please read the <a href="{@docRoot}guide/topics/nfc/ce.html">
- * NFC card emulation developer guide.</a></p>
+ * For a general introduction to card emulation, see
+ * <a href="{@docRoot}guide/topics/connectivity/nfc/hce.html">
+ * Host-based Card Emulation</a>.</p>
  * </div>
  *
  * <h3>NFC Protocols</h3>
@@ -372,7 +372,7 @@ public abstract class HostApduService extends Service {
      * from a remote device. A response APDU can be provided directly
      * by returning a byte-array in this method. Note that in general
      * response APDUs must be sent as quickly as possible, given the fact
-     * that the user is likely holding his device over an NFC reader
+     * that the user is likely holding their device over an NFC reader
      * when this method is called.
      *
      * <p class="note">If there are multiple services that have registered for the same

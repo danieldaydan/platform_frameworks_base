@@ -16,12 +16,24 @@
 
 package android.os;
 
+import android.os.VibrationEffect;
+import android.os.VibrationAttributes;
+import android.os.IVibratorStateListener;
+
 /** {@hide} */
 interface IVibratorService
 {
     boolean hasVibrator();
-    void vibrate(int uid, String opPkg, long milliseconds, int usageHint, IBinder token);
-    void vibratePattern(int uid, String opPkg, in long[] pattern, int repeat, int usageHint, IBinder token);
+    boolean isVibrating();
+    boolean registerVibratorStateListener(in IVibratorStateListener listener);
+    boolean unregisterVibratorStateListener(in IVibratorStateListener listener);
+    boolean hasAmplitudeControl();
+    int[] areEffectsSupported(in int[] effectIds);
+    boolean[] arePrimitivesSupported(in int[] primitiveIds);
+    boolean setAlwaysOnEffect(int uid, String opPkg, int alwaysOnId, in VibrationEffect effect,
+            in VibrationAttributes attributes);
+    void vibrate(int uid, String opPkg, in VibrationEffect effect,
+            in VibrationAttributes attributes, String reason, IBinder token);
     void cancelVibrate(IBinder token);
 }
 

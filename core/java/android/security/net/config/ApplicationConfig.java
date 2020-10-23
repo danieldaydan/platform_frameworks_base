@@ -17,6 +17,7 @@
 package android.security.net.config;
 
 import android.util.Pair;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
 import javax.net.ssl.X509TrustManager;
@@ -144,6 +145,26 @@ public final class ApplicationConfig {
      */
     public boolean isCleartextTrafficPermitted(String hostname) {
         return getConfigForHostname(hostname).isCleartextTrafficPermitted();
+    }
+
+    public void handleTrustStorageUpdate() {
+        synchronized(mLock) {
+            // If the config is uninitialized then there is no work to be done to handle an update,
+            // avoid needlessly parsing configs.
+            if (!mInitialized) {
+                return;
+            }
+            mDefaultConfig.handleTrustStorageUpdate();
+            if (mConfigs != null) {
+                Set<NetworkSecurityConfig> updatedConfigs =
+                        new HashSet<NetworkSecurityConfig>(mConfigs.size());
+                for (Pair<Domain, NetworkSecurityConfig> entry : mConfigs) {
+                    if (updatedConfigs.add(entry.second)) {
+                        entry.second.handleTrustStorageUpdate();
+                    }
+                }
+            }
+        }
     }
 
     private void ensureInitialized() {

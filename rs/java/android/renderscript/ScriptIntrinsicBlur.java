@@ -34,7 +34,8 @@ public final class ScriptIntrinsicBlur extends ScriptIntrinsic {
      * Create an intrinsic for applying a blur to an allocation. The
      * default radius is 5.0.
      *
-     * Supported elements types are {@link Element#U8_4 Element#U8}
+     * Supported elements types are {@link Element#U8},
+     * {@link Element#U8_4}.
      *
      * @param rs The RenderScript context
      * @param e Element type for inputs and outputs
@@ -43,7 +44,7 @@ public final class ScriptIntrinsicBlur extends ScriptIntrinsic {
      */
     public static ScriptIntrinsicBlur create(RenderScript rs, Element e) {
         if ((!e.isCompatible(Element.U8_4(rs))) && (!e.isCompatible(Element.U8(rs)))) {
-            throw new RSIllegalArgumentException("Unsuported element type.");
+            throw new RSIllegalArgumentException("Unsupported element type.");
         }
         long id = rs.nScriptIntrinsicCreate(5, e.getID(rs));
         ScriptIntrinsicBlur sib = new ScriptIntrinsicBlur(id, rs);
@@ -58,6 +59,13 @@ public final class ScriptIntrinsicBlur extends ScriptIntrinsic {
      * @param ain The input allocation
      */
     public void setInput(Allocation ain) {
+        if (ain.getType().getY() == 0) {
+            throw new RSIllegalArgumentException("Input set to a 1D Allocation");
+        }
+        Element e = ain.getElement();
+        if ((!e.isCompatible(Element.U8_4(mRS))) && (!e.isCompatible(Element.U8(mRS)))) {
+            throw new RSIllegalArgumentException("Unsupported element type.");
+        }
         mInput = ain;
         setVar(1, ain);
     }
@@ -84,6 +92,9 @@ public final class ScriptIntrinsicBlur extends ScriptIntrinsic {
      *             type.
      */
     public void forEach(Allocation aout) {
+        if (aout.getType().getY() == 0) {
+            throw new RSIllegalArgumentException("Output is a 1D Allocation");
+        }
         forEach(0, (Allocation) null, aout, null);
     }
 
@@ -96,6 +107,9 @@ public final class ScriptIntrinsicBlur extends ScriptIntrinsic {
      * @param opt LaunchOptions for clipping
      */
     public void forEach(Allocation aout, Script.LaunchOptions opt) {
+        if (aout.getType().getY() == 0) {
+            throw new RSIllegalArgumentException("Output is a 1D Allocation");
+        }
         forEach(0, (Allocation) null, aout, null, opt);
     }
 

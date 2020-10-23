@@ -17,6 +17,7 @@
 
 package android.provider;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.ContentProvider;
 import android.content.ContentResolver;
 import android.content.ContentValues;
@@ -27,21 +28,20 @@ import android.database.Cursor;
 import android.location.Country;
 import android.location.CountryDetector;
 import android.net.Uri;
+import android.os.Build;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.provider.ContactsContract.CommonDataKinds.Callable;
 import android.provider.ContactsContract.CommonDataKinds.Phone;
 import android.provider.ContactsContract.Data;
 import android.provider.ContactsContract.DataUsageFeedback;
+import android.telecom.CallerInfo;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.telephony.PhoneNumberUtils;
 import android.text.TextUtils;
 import android.util.Log;
-
-import com.android.internal.telephony.CallerInfo;
-import com.android.internal.telephony.PhoneConstants;
 
 import java.util.List;
 
@@ -50,6 +50,7 @@ import java.util.List;
  */
 public class CallLog {
     private static final String LOG_TAG = "CallLog";
+    private static final boolean VERBOSE_LOG = false; // DON'T SUBMIT WITH TRUE.
 
     public static final String AUTHORITY = "call_log";
 
@@ -58,6 +59,17 @@ public class CallLog {
      */
     public static final Uri CONTENT_URI =
         Uri.parse("content://" + AUTHORITY);
+
+
+    /**
+     * The "shadow" provider stores calllog when the real calllog provider is encrypted.  The
+     * real provider will alter copy from it when it starts, and remove the entries in the shadow.
+     *
+     * <p>See the comment in {@link Calls#addCall} for the details.
+     *
+     * @hide
+     */
+    public static final String SHADOW_AUTHORITY = "call_log_shadow";
 
     /**
      * Contains the recent calls.
@@ -68,6 +80,10 @@ public class CallLog {
          */
         public static final Uri CONTENT_URI =
                 Uri.parse("content://call_log/calls");
+
+        /** @hide */
+        public static final Uri SHADOW_CONTENT_URI =
+                Uri.parse("content://call_log_shadow/calls");
 
         /**
          * The content:// style URL for filtering this table on phone numbers
@@ -81,6 +97,13 @@ public class CallLog {
          * TYPE: integer
          */
         public static final String LIMIT_PARAM_KEY = "limit";
+
+        /**
+         * Form of {@link #CONTENT_URI} which limits the query results to a single result.
+         */
+        private static final Uri CONTENT_URI_LIMIT_1 = CONTENT_URI.buildUpon()
+                .appendQueryParameter(LIMIT_PARAM_KEY, "1")
+                .build();
 
         /**
          * Query parameter used to specify the starting record to return.
@@ -153,6 +176,19 @@ public class CallLog {
         /**
          * The type of the call (incoming, outgoing or missed).
          * <P>Type: INTEGER (int)</P>
+         *
+         * <p>
+         * Allowed values:
+         * <ul>
+         * <li>{@link #INCOMING_TYPE}</li>
+         * <li>{@link #OUTGOING_TYPE}</li>
+         * <li>{@link #MISSED_TYPE}</li>
+         * <li>{@link #VOICEMAIL_TYPE}</li>
+         * <li>{@link #REJECTED_TYPE}</li>
+         * <li>{@link #BLOCKED_TYPE}</li>
+         * <li>{@link #ANSWERED_EXTERNALLY_TYPE}</li>
+         * </ul>
+         * </p>
          */
         public static final String TYPE = "type";
 
@@ -164,6 +200,16 @@ public class CallLog {
         public static final int MISSED_TYPE = 3;
         /** Call log type for voicemails. */
         public static final int VOICEMAIL_TYPE = 4;
+        /** Call log type for calls rejected by direct user action. */
+        public static final int REJECTED_TYPE = 5;
+        /** Call log type for calls blocked automatically. */
+        public static final int BLOCKED_TYPE = 6;
+        /**
+         * Call log type for a call which was answered on another device.  Used in situations where
+         * a call rings on multiple devices simultaneously and it ended up being answered on a
+         * device other than the current one.
+         */
+        public static final int ANSWERED_EXTERNALLY_TYPE = 7;
 
         /**
          * Bit-mask describing features of the call (e.g. video).
@@ -173,7 +219,28 @@ public class CallLog {
         public static final String FEATURES = "features";
 
         /** Call had video. */
-        public static final int FEATURES_VIDEO = 0x1;
+        public static final int FEATURES_VIDEO = 1 << 0;
+
+        /** Call was pulled externally. */
+        public static final int FEATURES_PULLED_EXTERNALLY = 1 << 1;
+
+        /** Call was HD. */
+        public static final int FEATURES_HD_CALL = 1 << 2;
+
+        /** Call was WIFI call. */
+        public static final int FEATURES_WIFI = 1 << 3;
+
+        /**
+         * Indicates the call underwent Assisted Dialing.
+         * @see TelecomManager#EXTRA_USE_ASSISTED_DIALING
+         */
+        public static final int FEATURES_ASSISTED_DIALING_USED = 1 << 4;
+
+        /** Call was on RTT at some point */
+        public static final int FEATURES_RTT = 1 << 5;
+
+        /** Call was VoLTE */
+        public static final int FEATURES_VOLTE = 1 << 6;
 
         /**
          * The phone number as the user entered it.
@@ -242,8 +309,10 @@ public class CallLog {
 
         /**
          * The cached name associated with the phone number, if it exists.
-         * This value is not guaranteed to be current, if the contact information
-         * associated with this number has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_NAME = "name";
@@ -251,8 +320,10 @@ public class CallLog {
         /**
          * The cached number type (Home, Work, etc) associated with the
          * phone number, if it exists.
-         * This value is not guaranteed to be current, if the contact information
-         * associated with this number has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: INTEGER</P>
          */
         public static final String CACHED_NUMBER_TYPE = "numbertype";
@@ -260,8 +331,10 @@ public class CallLog {
         /**
          * The cached number label, for a custom number type, associated with the
          * phone number, if it exists.
-         * This value is not guaranteed to be current, if the contact information
-         * associated with this number has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_NUMBER_LABEL = "numberlabel";
@@ -277,6 +350,13 @@ public class CallLog {
          * entries of type {@link #VOICEMAIL_TYPE} that have valid transcriptions.
          */
         public static final String TRANSCRIPTION = "transcription";
+
+        /**
+         * State of voicemail transcription entry. This will only be populated for call log
+         * entries of type {@link #VOICEMAIL_TYPE}.
+         * @hide
+         */
+        public static final String TRANSCRIPTION_STATE = "transcription_state";
 
         /**
          * Whether this item has been read or otherwise consumed by the user.
@@ -297,40 +377,50 @@ public class CallLog {
 
         /**
          * The cached URI to look up the contact associated with the phone number, if it exists.
-         * This value may not be current if the contact information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_LOOKUP_URI = "lookup_uri";
 
         /**
          * The cached phone number of the contact which matches this entry, if it exists.
-         * This value may not be current if the contact information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_MATCHED_NUMBER = "matched_number";
 
         /**
          * The cached normalized(E164) version of the phone number, if it exists.
-         * This value may not be current if the contact information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_NORMALIZED_NUMBER = "normalized_number";
 
         /**
          * The cached photo id of the picture associated with the phone number, if it exists.
-         * This value may not be current if the contact information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: INTEGER (long)</P>
          */
         public static final String CACHED_PHOTO_ID = "photo_id";
 
         /**
          * The cached photo URI of the picture associated with the phone number, if it exists.
-         * This value may not be current if the contact information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT (URI)</P>
          */
         public static final String CACHED_PHOTO_URI = "photo_uri";
@@ -338,9 +428,10 @@ public class CallLog {
         /**
          * The cached phone number, formatted with formatting rules based on the country the
          * user was in when the call was made or received.
-         * This value is not guaranteed to be present, and may not be current if the contact
-         * information associated with this number
-         * has changed.
+         *
+         * <p>This value is typically filled in by the dialer app for the caching purpose,
+         * so it's not guaranteed to be present, and may not be current if the contact
+         * information associated with this number has changed.
          * <P>Type: TEXT</P>
          */
         public static final String CACHED_FORMATTED_NUMBER = "formatted_number";
@@ -390,6 +481,36 @@ public class CallLog {
         public static final String SUB_ID = "sub_id";
 
         /**
+         * The post-dial portion of a dialed number, including any digits dialed after a
+         * {@link TelecomManager#DTMF_CHARACTER_PAUSE} or a {@link
+         * TelecomManager#DTMF_CHARACTER_WAIT} and these characters themselves.
+         * <P>Type: TEXT</P>
+         */
+        public static final String POST_DIAL_DIGITS = "post_dial_digits";
+
+        /**
+         * For an incoming call, the secondary line number the call was received via.
+         * When a SIM card has multiple phone numbers associated with it, the via number indicates
+         * which of the numbers associated with the SIM was called.
+         */
+        public static final String VIA_NUMBER = "via_number";
+
+        /**
+         * Indicates that the entry will be copied from primary user to other users.
+         * <P>Type: INTEGER</P>
+         *
+         * @hide
+         */
+        public static final String ADD_FOR_ALL_USERS = "add_for_all_users";
+
+        /**
+         * The date the row is last inserted, updated, or marked as deleted, in milliseconds
+         * since the epoch. Read only.
+         * <P>Type: INTEGER (long)</P>
+         */
+        public static final String LAST_MODIFIED = "last_modified";
+
+        /**
          * If a successful call is made that is longer than this duration, update the phone number
          * in the ContactsProvider with the normalized version of the number, based on the user's
          * current country code.
@@ -397,13 +518,107 @@ public class CallLog {
         private static final int MIN_DURATION_FOR_NORMALIZED_NUMBER_UPDATE_MS = 1000 * 10;
 
         /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set as the default value when a call was
+         * not blocked by a CallScreeningService or any other system call blocking method.
+         */
+        public static final int BLOCK_REASON_NOT_BLOCKED = 0;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked by a
+         * CallScreeningService. The {@link CallLog.Calls#CALL_SCREENING_COMPONENT_NAME} and
+         * {@link CallLog.Calls#CALL_SCREENING_APP_NAME} columns will indicate which call screening
+         * service was responsible for blocking the call.
+         */
+        public static final int BLOCK_REASON_CALL_SCREENING_SERVICE = 1;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because the user
+         * configured a contact to be sent directly to voicemail.
+         */
+        public static final int BLOCK_REASON_DIRECT_TO_VOICEMAIL = 2;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because it is
+         * in the BlockedNumbers provider.
+         */
+        public static final int BLOCK_REASON_BLOCKED_NUMBER = 3;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because the user
+         * has chosen to block all calls from unknown numbers.
+         */
+        public static final int BLOCK_REASON_UNKNOWN_NUMBER = 4;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because the user
+         * has chosen to block all calls from restricted numbers.
+         */
+        public static final int BLOCK_REASON_RESTRICTED_NUMBER = 5;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because the user
+         * has chosen to block all calls from pay phones.
+         */
+        public static final int BLOCK_REASON_PAY_PHONE = 6;
+
+        /**
+         * Value for {@link CallLog.Calls#BLOCK_REASON}, set when {@link CallLog.Calls#TYPE} is
+         * {@link CallLog.Calls#BLOCKED_TYPE} to indicate that a call was blocked because the user
+         * has chosen to block all calls from numbers not in their contacts.
+         */
+        public static final int BLOCK_REASON_NOT_IN_CONTACTS = 7;
+
+        /**
+         * The ComponentName of the CallScreeningService which blocked this call. Will be
+         * populated when the {@link CallLog.Calls#TYPE} is {@link CallLog.Calls#BLOCKED_TYPE}.
+         * <P>Type: TEXT</P>
+         */
+        public static final String CALL_SCREENING_COMPONENT_NAME = "call_screening_component_name";
+
+        /**
+         * The name of the app which blocked a call. Will be populated when the
+         * {@link CallLog.Calls#TYPE} is {@link CallLog.Calls#BLOCKED_TYPE}. Provided as a
+         * convenience so that the call log can still indicate which app blocked a call, even if
+         * that app is no longer installed.
+         * <P>Type: TEXT</P>
+         */
+        public static final String CALL_SCREENING_APP_NAME = "call_screening_app_name";
+
+        /**
+         * Where the {@link CallLog.Calls#TYPE} is {@link CallLog.Calls#BLOCKED_TYPE},
+         * indicates the reason why a call is blocked.
+         * <P>Type: INTEGER</P>
+         *
+         * <p>
+         * Allowed values:
+         * <ul>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_NOT_BLOCKED}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_CALL_SCREENING_SERVICE}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_DIRECT_TO_VOICEMAIL}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_BLOCKED_NUMBER}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_UNKNOWN_NUMBER}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_RESTRICTED_NUMBER}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_PAY_PHONE}</li>
+         * <li>{@link CallLog.Calls#BLOCK_REASON_NOT_IN_CONTACTS}</li>
+         * </ul>
+         * </p>
+         */
+        public static final String BLOCK_REASON = "block_reason";
+
+        /**
          * Adds a call to the call log.
          *
          * @param ci the CallerInfo object to get the target contact from.  Can be null
          * if the contact is unknown.
          * @param context the context used to get the ContentResolver
          * @param number the phone number to be added to the calls db
-         * @param presentation enum value from PhoneConstants.PRESENTATION_xxx, which
+         * @param presentation enum value from TelecomManager.PRESENTATION_xxx, which
          *        is set by the network and denotes the number presenting rules for
          *        "allowed", "payphone", "restricted" or "unknown"
          * @param callType enumerated values for "incoming", "outgoing", or "missed"
@@ -418,10 +633,14 @@ public class CallLog {
          * {@hide}
          */
         public static Uri addCall(CallerInfo ci, Context context, String number,
-                int presentation, int callType, int features, PhoneAccountHandle accountHandle,
+                int presentation, int callType, int features,
+                PhoneAccountHandle accountHandle,
                 long start, int duration, Long dataUsage) {
-            return addCall(ci, context, number, presentation, callType, features, accountHandle,
-                    start, duration, dataUsage, false, false);
+            return addCall(ci, context, number, "" /* postDialDigits */, "" /* viaNumber */,
+                presentation, callType, features, accountHandle, start, duration,
+                dataUsage, false /* addForAllUsers */, null /* userToBeInsertedTo */,
+                false /* isRead */, Calls.BLOCK_REASON_NOT_BLOCKED /* callBlockReason */,
+                null /* callScreeningAppName */, null /* callScreeningComponentName */);
         }
 
 
@@ -432,7 +651,9 @@ public class CallLog {
          * if the contact is unknown.
          * @param context the context used to get the ContentResolver
          * @param number the phone number to be added to the calls db
-         * @param presentation enum value from PhoneConstants.PRESENTATION_xxx, which
+         * @param viaNumber the secondary number that the incoming call received with. If the
+         *       call was received with the SIM assigned number, then this field must be ''.
+         * @param presentation enum value from TelecomManager.PRESENTATION_xxx, which
          *        is set by the network and denotes the number presenting rules for
          *        "allowed", "payphone", "restricted" or "unknown"
          * @param callType enumerated values for "incoming", "outgoing", or "missed"
@@ -444,16 +665,22 @@ public class CallLog {
          *                  the call.
          * @param addForAllUsers If true, the call is added to the call log of all currently
          *        running users. The caller must have the MANAGE_USERS permission if this is true.
-         *
+         * @param userToBeInsertedTo {@link UserHandle} of user that the call is going to be
+         *                           inserted to. null if it is inserted to the current user. The
+         *                           value is ignored if @{link addForAllUsers} is true.
          * @result The URI of the call log entry belonging to the user that made or received this
          *        call.
          * {@hide}
          */
         public static Uri addCall(CallerInfo ci, Context context, String number,
-                                  int presentation, int callType, int features, PhoneAccountHandle accountHandle,
-                                  long start, int duration, Long dataUsage, boolean addForAllUsers) {
-            return addCall(ci, context, number, presentation, callType, features, accountHandle,
-                    start, duration, dataUsage, addForAllUsers, false);
+                String postDialDigits, String viaNumber, int presentation, int callType,
+                int features, PhoneAccountHandle accountHandle, long start, int duration,
+                Long dataUsage, boolean addForAllUsers, UserHandle userToBeInsertedTo) {
+            return addCall(ci, context, number, postDialDigits, viaNumber, presentation, callType,
+                features, accountHandle, start, duration, dataUsage, addForAllUsers,
+                userToBeInsertedTo, false /* isRead */ , Calls.BLOCK_REASON_NOT_BLOCKED
+                /* callBlockReason */, null /* callScreeningAppName */,
+                null /* callScreeningComponentName */);
         }
 
         /**
@@ -463,7 +690,11 @@ public class CallLog {
          * if the contact is unknown.
          * @param context the context used to get the ContentResolver
          * @param number the phone number to be added to the calls db
-         * @param presentation enum value from PhoneConstants.PRESENTATION_xxx, which
+         * @param postDialDigits the post-dial digits that were dialed after the number,
+         *        if it was outgoing. Otherwise it is ''.
+         * @param viaNumber the secondary number that the incoming call received with. If the
+         *        call was received with the SIM assigned number, then this field must be ''.
+         * @param presentation enum value from TelecomManager.PRESENTATION_xxx, which
          *        is set by the network and denotes the number presenting rules for
          *        "allowed", "payphone", "restricted" or "unknown"
          * @param callType enumerated values for "incoming", "outgoing", or "missed"
@@ -475,52 +706,41 @@ public class CallLog {
          *                  the call.
          * @param addForAllUsers If true, the call is added to the call log of all currently
          *        running users. The caller must have the MANAGE_USERS permission if this is true.
-         * @param is_read Flag to show if the missed call log has been read by the user or not.
+         * @param userToBeInsertedTo {@link UserHandle} of user that the call is going to be
+         *                           inserted to. null if it is inserted to the current user. The
+         *                           value is ignored if @{link addForAllUsers} is true.
+         * @param isRead Flag to show if the missed call log has been read by the user or not.
          *                Used for call log restore of missed calls.
+         * @param callBlockReason The reason why the call is blocked.
+         * @param callScreeningAppName The call screening application name which block the call.
+         * @param callScreeningComponentName The call screening component name which block the call.
          *
          * @result The URI of the call log entry belonging to the user that made or received this
-         *        call.
+         *        call.  This could be of the shadow provider.  Do not return it to non-system apps,
+         *        as they don't have permissions.
          * {@hide}
          */
+        @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
         public static Uri addCall(CallerInfo ci, Context context, String number,
-                int presentation, int callType, int features, PhoneAccountHandle accountHandle,
-                long start, int duration, Long dataUsage, boolean addForAllUsers, boolean is_read) {
+                String postDialDigits, String viaNumber, int presentation, int callType,
+                int features, PhoneAccountHandle accountHandle, long start, int duration,
+                Long dataUsage, boolean addForAllUsers, UserHandle userToBeInsertedTo,
+                boolean isRead, int callBlockReason, CharSequence callScreeningAppName,
+                String callScreeningComponentName) {
+            if (VERBOSE_LOG) {
+                Log.v(LOG_TAG, String.format("Add call: number=%s, user=%s, for all=%s",
+                        number, userToBeInsertedTo, addForAllUsers));
+            }
             final ContentResolver resolver = context.getContentResolver();
-            int numberPresentation = PRESENTATION_ALLOWED;
 
-            TelecomManager tm = null;
-            try {
-                tm = TelecomManager.from(context);
-            } catch (UnsupportedOperationException e) {}
+            String accountAddress = getLogAccountAddress(context, accountHandle);
 
-            String accountAddress = null;
-            if (tm != null && accountHandle != null) {
-                PhoneAccount account = tm.getPhoneAccount(accountHandle);
-                if (account != null) {
-                    Uri address = account.getSubscriptionAddress();
-                    if (address != null) {
-                        accountAddress = address.getSchemeSpecificPart();
-                    }
-                }
-            }
-
-            // Remap network specified number presentation types
-            // PhoneConstants.PRESENTATION_xxx to calllog number presentation types
-            // Calls.PRESENTATION_xxx, in order to insulate the persistent calllog
-            // from any future radio changes.
-            // If the number field is empty set the presentation type to Unknown.
-            if (presentation == PhoneConstants.PRESENTATION_RESTRICTED) {
-                numberPresentation = PRESENTATION_RESTRICTED;
-            } else if (presentation == PhoneConstants.PRESENTATION_PAYPHONE) {
-                numberPresentation = PRESENTATION_PAYPHONE;
-            } else if (TextUtils.isEmpty(number)
-                    || presentation == PhoneConstants.PRESENTATION_UNKNOWN) {
-                numberPresentation = PRESENTATION_UNKNOWN;
-            }
+            int numberPresentation = getLogNumberPresentation(number, presentation);
+            String name = (ci != null) ? ci.getName() : "";
             if (numberPresentation != PRESENTATION_ALLOWED) {
                 number = "";
                 if (ci != null) {
-                    ci.name = "";
+                    name = "";
                 }
             }
 
@@ -535,6 +755,8 @@ public class CallLog {
             ContentValues values = new ContentValues(6);
 
             values.put(NUMBER, number);
+            values.put(POST_DIAL_DIGITS, postDialDigits);
+            values.put(VIA_NUMBER, viaNumber);
             values.put(NUMBER_PRESENTATION, Integer.valueOf(numberPresentation));
             values.put(TYPE, Integer.valueOf(callType));
             values.put(FEATURES, features);
@@ -547,12 +769,18 @@ public class CallLog {
             values.put(PHONE_ACCOUNT_ID, accountId);
             values.put(PHONE_ACCOUNT_ADDRESS, accountAddress);
             values.put(NEW, Integer.valueOf(1));
+            values.put(CACHED_NAME, name);
+            values.put(ADD_FOR_ALL_USERS, addForAllUsers ? 1 : 0);
 
             if (callType == MISSED_TYPE) {
-                values.put(IS_READ, Integer.valueOf(is_read ? 1 : 0));
+                values.put(IS_READ, Integer.valueOf(isRead ? 1 : 0));
             }
 
-            if ((ci != null) && (ci.contactIdOrZero > 0)) {
+            values.put(BLOCK_REASON, callBlockReason);
+            values.put(CALL_SCREENING_APP_NAME, charSequenceToString(callScreeningAppName));
+            values.put(CALL_SCREENING_COMPONENT_NAME, callScreeningComponentName);
+
+            if ((ci != null) && (ci.getContactId() > 0)) {
                 // Update usage information for the number associated with the contact ID.
                 // We need to use both the number and the ID for obtaining a data ID since other
                 // contacts may have the same number.
@@ -566,17 +794,18 @@ public class CallLog {
                     cursor = resolver.query(Phone.CONTENT_URI,
                             new String[] { Phone._ID },
                             Phone.CONTACT_ID + " =? AND " + Phone.NORMALIZED_NUMBER + " =?",
-                            new String[] { String.valueOf(ci.contactIdOrZero),
+                            new String[] { String.valueOf(ci.getContactId()),
                                     normalizedPhoneNumber},
                             null);
                 } else {
-                    final String phoneNumber = ci.phoneNumber != null ? ci.phoneNumber : number;
+                    final String phoneNumber = ci.getPhoneNumber() != null
+                        ? ci.getPhoneNumber() : number;
                     cursor = resolver.query(
                             Uri.withAppendedPath(Callable.CONTENT_FILTER_URI,
                                     Uri.encode(phoneNumber)),
                             new String[] { Phone._ID },
                             Phone.CONTACT_ID + " =?",
-                            new String[] { String.valueOf(ci.contactIdOrZero) },
+                            new String[] { String.valueOf(ci.getContactId()) },
                             null);
                 }
 
@@ -597,35 +826,106 @@ public class CallLog {
                 }
             }
 
+            /*
+                Writing the calllog works in the following way:
+                - All user entries
+                    - if user-0 is encrypted, insert to user-0's shadow only.
+                      (other users should also be encrypted, so nothing to do for other users.)
+                    - if user-0 is decrypted, insert to user-0's real provider, as well as
+                      all other users that are running and decrypted and should have calllog.
+
+                - Single user entry.
+                    - If the target user is encryted, insert to its shadow.
+                    - Otherwise insert to its real provider.
+
+                When the (real) calllog provider starts, it copies entries that it missed from
+                elsewhere.
+                - When user-0's (real) provider starts, it copies from user-0's shadow, and clears
+                  the shadow.
+
+                - When other users (real) providers start, unless it shouldn't have calllog entries,
+                     - Copy from the user's shadow, and clears the shadow.
+                     - Copy from user-0's entries that are FOR_ALL_USERS = 1.  (and don't clear it.)
+             */
+
             Uri result = null;
 
+            final UserManager userManager = context.getSystemService(UserManager.class);
+            final int currentUserId = userManager.getUserHandle();
+
             if (addForAllUsers) {
-                // Insert the entry for all currently running users, in order to trigger any
-                // ContentObservers currently set on the call log.
-                final UserManager userManager = (UserManager) context.getSystemService(
-                        Context.USER_SERVICE);
-                List<UserInfo> users = userManager.getUsers(true);
-                final int currentUserId = userManager.getUserHandle();
+                // First, insert to the system user.
+                final Uri uriForSystem = addEntryAndRemoveExpiredEntries(
+                        context, userManager, UserHandle.SYSTEM, values);
+                if (uriForSystem == null
+                        || SHADOW_AUTHORITY.equals(uriForSystem.getAuthority())) {
+                    // This means the system user is still encrypted and the entry has inserted
+                    // into the shadow.  This means other users are still all encrypted.
+                    // Nothing further to do; just return null.
+                    return null;
+                }
+                if (UserHandle.USER_SYSTEM == currentUserId) {
+                    result = uriForSystem;
+                }
+
+                // Otherwise, insert to all other users that are running and unlocked.
+
+                final List<UserInfo> users = userManager.getUsers(true);
+
                 final int count = users.size();
                 for (int i = 0; i < count; i++) {
-                    final UserInfo user = users.get(i);
-                    final UserHandle userHandle = user.getUserHandle();
+                    final UserInfo userInfo = users.get(i);
+                    final UserHandle userHandle = userInfo.getUserHandle();
+                    final int userId = userHandle.getIdentifier();
+
+                    if (userHandle.isSystem()) {
+                        // Already written.
+                        continue;
+                    }
+
+                    if (!shouldHaveSharedCallLogEntries(context, userManager, userId)) {
+                        // Shouldn't have calllog entries.
+                        continue;
+                    }
+
+                    // For other users, we write only when they're running *and* decrypted.
+                    // Other providers will copy from the system user's real provider, when they
+                    // start.
                     if (userManager.isUserRunning(userHandle)
-                            && !userManager.hasUserRestriction(UserManager.DISALLOW_OUTGOING_CALLS,
-                                    userHandle)
-                            && !user.isManagedProfile()) {
-                        Uri uri = addEntryAndRemoveExpiredEntries(context,
-                                ContentProvider.maybeAddUserId(CONTENT_URI, user.id), values);
-                        if (user.id == currentUserId) {
+                            && userManager.isUserUnlocked(userHandle)) {
+                        final Uri uri = addEntryAndRemoveExpiredEntries(context, userManager,
+                                userHandle, values);
+                        if (userId == currentUserId) {
                             result = uri;
                         }
                     }
                 }
             } else {
-                result = addEntryAndRemoveExpiredEntries(context, CONTENT_URI, values);
-            }
+                // Single-user entry. Just write to that user, assuming it's running.  If the
+                // user is encrypted, we write to the shadow calllog.
 
+                final UserHandle targetUserHandle = userToBeInsertedTo != null
+                        ? userToBeInsertedTo
+                        : UserHandle.of(currentUserId);
+                result = addEntryAndRemoveExpiredEntries(context, userManager, targetUserHandle,
+                        values);
+            }
             return result;
+        }
+
+        private static String charSequenceToString(CharSequence sequence) {
+            return sequence == null ? null : sequence.toString();
+        }
+
+        /** @hide */
+        public static boolean shouldHaveSharedCallLogEntries(Context context,
+                UserManager userManager, int userId) {
+            if (userManager.hasUserRestriction(UserManager.DISALLOW_OUTGOING_CALLS,
+                    UserHandle.of(userId))) {
+                return false;
+            }
+            final UserInfo userInfo = userManager.getUserInfo(userId);
+            return userInfo != null && !userInfo.isManagedProfile();
         }
 
         /**
@@ -639,11 +939,11 @@ public class CallLog {
             Cursor c = null;
             try {
                 c = resolver.query(
-                    CONTENT_URI,
+                    CONTENT_URI_LIMIT_1,
                     new String[] {NUMBER},
                     TYPE + " = " + OUTGOING_TYPE,
                     null,
-                    DEFAULT_SORT_ORDER + " LIMIT 1");
+                    DEFAULT_SORT_ORDER);
                 if (c == null || !c.moveToFirst()) {
                     return "";
                 }
@@ -653,14 +953,74 @@ public class CallLog {
             }
         }
 
-        private static Uri addEntryAndRemoveExpiredEntries(Context context, Uri uri,
-                ContentValues values) {
+        private static Uri addEntryAndRemoveExpiredEntries(Context context, UserManager userManager,
+                UserHandle user, ContentValues values) {
             final ContentResolver resolver = context.getContentResolver();
-            Uri result = resolver.insert(uri, values);
-            resolver.delete(uri, "_id IN " +
-                    "(SELECT _id FROM calls ORDER BY " + DEFAULT_SORT_ORDER
-                    + " LIMIT -1 OFFSET 500)", null);
-            return result;
+
+            // Since we're doing this operation on behalf of an app, we only
+            // want to use the actual "unlocked" state.
+            final Uri uri = ContentProvider.maybeAddUserId(
+                    userManager.isUserUnlocked(user) ? CONTENT_URI : SHADOW_CONTENT_URI,
+                    user.getIdentifier());
+
+            if (VERBOSE_LOG) {
+                Log.v(LOG_TAG, String.format("Inserting to %s", uri));
+            }
+
+            try {
+                // When cleaning up the call log, try to delete older call long entries on a per
+                // PhoneAccount basis first.  There can be multiple ConnectionServices causing
+                // the addition of entries in the call log.  With the introduction of Self-Managed
+                // ConnectionServices, we want to ensure that a misbehaving self-managed CS cannot
+                // spam the call log with its own entries, causing entries from Telephony to be
+                // removed.
+                final Uri result = resolver.insert(uri, values);
+                if (result != null) {
+                    String lastPathSegment = result.getLastPathSegment();
+                    // When inserting into the call log, if ContentProvider#insert detect an appops
+                    // denial a non-null "silent rejection" URI is returned which ends in 0.
+                    // Example: content://call_log/calls/0
+                    // The 0 in the last part of the path indicates a fake call id of 0.
+                    // A denial when logging calls from the platform is bad; there is no other
+                    // logging to indicate that this has happened so we will check for that scenario
+                    // here and log a warning so we have a hint as to what is going on.
+                    if (lastPathSegment != null && lastPathSegment.equals("0")) {
+                        Log.w(LOG_TAG, "Failed to insert into call log due to appops denial;"
+                                + " resultUri=" + result);
+                    }
+                } else {
+                    Log.w(LOG_TAG, "Failed to insert into call log; null result uri.");
+                }
+
+                if (values.containsKey(PHONE_ACCOUNT_ID)
+                        && !TextUtils.isEmpty(values.getAsString(PHONE_ACCOUNT_ID))
+                        && values.containsKey(PHONE_ACCOUNT_COMPONENT_NAME)
+                        && !TextUtils.isEmpty(values.getAsString(PHONE_ACCOUNT_COMPONENT_NAME))) {
+                    // Only purge entries for the same phone account.
+                    resolver.delete(uri, "_id IN " +
+                            "(SELECT _id FROM calls"
+                            + " WHERE " + PHONE_ACCOUNT_COMPONENT_NAME + " = ?"
+                            + " AND " + PHONE_ACCOUNT_ID + " = ?"
+                            + " ORDER BY " + DEFAULT_SORT_ORDER
+                            + " LIMIT -1 OFFSET 500)", new String[] {
+                            values.getAsString(PHONE_ACCOUNT_COMPONENT_NAME),
+                            values.getAsString(PHONE_ACCOUNT_ID)
+                    });
+                } else {
+                    // No valid phone account specified, so default to the old behavior.
+                    resolver.delete(uri, "_id IN " +
+                            "(SELECT _id FROM calls ORDER BY " + DEFAULT_SORT_ORDER
+                            + " LIMIT -1 OFFSET 500)", null);
+                }
+
+                return result;
+            } catch (IllegalArgumentException e) {
+                Log.w(LOG_TAG, "Failed to insert calllog", e);
+                // Even though we make sure the target user is running and decrypted before calling
+                // this method, there's a chance that the user just got shut down, in which case
+                // we'll still get "IllegalArgumentException: Unknown URL content://call_log/calls".
+                return null;
+            }
         }
 
         private static void updateDataUsageStatForData(ContentResolver resolver, String dataId) {
@@ -685,14 +1045,61 @@ public class CallLog {
             if (TextUtils.isEmpty(countryIso)) {
                 return;
             }
-            final String normalizedNumber = PhoneNumberUtils.formatNumberToE164(number,
-                    getCurrentCountryIso(context));
+            final String normalizedNumber = PhoneNumberUtils.formatNumberToE164(number, countryIso);
             if (TextUtils.isEmpty(normalizedNumber)) {
                 return;
             }
             final ContentValues values = new ContentValues();
             values.put(Phone.NORMALIZED_NUMBER, normalizedNumber);
             resolver.update(Data.CONTENT_URI, values, Data._ID + "=?", new String[] {dataId});
+        }
+
+        /**
+         * Remap network specified number presentation types
+         * TelecomManager.PRESENTATION_xxx to calllog number presentation types
+         * Calls.PRESENTATION_xxx, in order to insulate the persistent calllog
+         * from any future radio changes.
+         * If the number field is empty set the presentation type to Unknown.
+         */
+        private static int getLogNumberPresentation(String number, int presentation) {
+            if (presentation == TelecomManager.PRESENTATION_RESTRICTED) {
+                return presentation;
+            }
+
+            if (presentation == TelecomManager.PRESENTATION_PAYPHONE) {
+                return presentation;
+            }
+
+            if (TextUtils.isEmpty(number)
+                    || presentation == TelecomManager.PRESENTATION_UNKNOWN) {
+                return PRESENTATION_UNKNOWN;
+            }
+
+            return PRESENTATION_ALLOWED;
+        }
+
+        private static String getLogAccountAddress(Context context,
+                PhoneAccountHandle accountHandle) {
+            TelecomManager tm = null;
+            try {
+                tm = TelecomManager.from(context);
+            } catch (UnsupportedOperationException e) {
+                if (VERBOSE_LOG) {
+                    Log.v(LOG_TAG, "No TelecomManager found to get account address.");
+                }
+            }
+
+            String accountAddress = null;
+            if (tm != null && accountHandle != null) {
+                PhoneAccount account = tm.getPhoneAccount(accountHandle);
+                if (account != null) {
+                    Uri address = account.getSubscriptionAddress();
+                    if (address != null) {
+                        accountAddress = address.getSchemeSpecificPart();
+                    }
+                }
+            }
+            return accountAddress;
         }
 
         private static String getCurrentCountryIso(Context context) {

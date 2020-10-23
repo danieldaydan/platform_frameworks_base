@@ -13,14 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef TREEINFO_H
-#define TREEINFO_H
 
-#include <string>
+#pragma once
+
+#include "Properties.h"
+#include "utils/Macros.h"
 
 #include <utils/Timers.h>
+#include "SkSize.h"
 
-#include "utils/Macros.h"
+#include <string>
 
 namespace android {
 namespace uirenderer {
@@ -30,19 +32,33 @@ class CanvasContext;
 }
 
 class DamageAccumulator;
-class OpenGLRenderer;
+class LayerUpdateQueue;
+class RenderNode;
 class RenderState;
 
 class ErrorHandler {
 public:
     virtual void onError(const std::string& message) = 0;
+
+    virtual ~ErrorHandler() = default;
+};
+
+class TreeObserver {
+public:
+    // Called when a RenderNode's parent count hits 0.
+    // Due to the unordered nature of tree pushes, once prepareTree
+    // is finished it is possible that the node was "resurrected" and has
+    // a non-zero parent count.
+    virtual void onMaybeRemovedFromTree(RenderNode* node) = 0;
+
 protected:
-    ~ErrorHandler() {}
+    virtual ~TreeObserver() = default;
 };
 
 // This would be a struct, but we want to PREVENT_COPY_AND_ASSIGN
 class TreeInfo {
     PREVENT_COPY_AND_ASSIGN(TreeInfo);
+
 public:
     enum TraversalMode {
         // The full monty - sync, push, run animators, etc... Used by DrawFrameTask
@@ -55,76 +71,61 @@ public:
         MODE_RT_ONLY,
     };
 
-    explicit TreeInfo(TraversalMode mode, RenderState& renderState)
-        : mode(mode)
-        , prepareTextures(mode == MODE_FULL)
-        , runAnimations(true)
-        , damageAccumulator(nullptr)
-        , renderState(renderState)
-        , renderer(nullptr)
-        , errorHandler(nullptr)
-        , canvasContext(nullptr)
-    {}
+    TreeInfo(TraversalMode mode, renderthread::CanvasContext& canvasContext);
 
-    explicit TreeInfo(TraversalMode mode, const TreeInfo& clone)
-        : mode(mode)
-        , prepareTextures(mode == MODE_FULL)
-        , runAnimations(clone.runAnimations)
-        , damageAccumulator(clone.damageAccumulator)
-        , renderState(clone.renderState)
-        , renderer(clone.renderer)
-        , errorHandler(clone.errorHandler)
-        , canvasContext(clone.canvasContext)
-    {}
-
-    const TraversalMode mode;
+    TraversalMode mode;
     // TODO: Remove this? Currently this is used to signal to stop preparing
     // textures if we run out of cache space.
     bool prepareTextures;
+    renderthread::CanvasContext& canvasContext;
     // TODO: buildLayer uses this to suppress running any animations, but this
     // should probably be refactored somehow. The reason this is done is
     // because buildLayer is not setup for injecting the animationHook, as well
     // as this being otherwise wasted work as all the animators will be
     // re-evaluated when the frame is actually drawn
-    bool runAnimations;
+    bool runAnimations = true;
 
     // Must not be null during actual usage
-    DamageAccumulator* damageAccumulator;
-    RenderState& renderState;
-    // The renderer that will be drawing the next frame. Use this to push any
-    // layer updates or similar. May be NULL.
-    OpenGLRenderer* renderer;
-    ErrorHandler* errorHandler;
-    // May be NULL (TODO: can it really?)
-    renderthread::CanvasContext* canvasContext;
+    DamageAccumulator* damageAccumulator = nullptr;
+    int64_t damageGenerationId = 0;
+
+    LayerUpdateQueue* layerUpdateQueue = nullptr;
+    ErrorHandler* errorHandler = nullptr;
+
+    bool updateWindowPositions = false;
+
+    int disableForceDark;
+
+    const SkISize screenSize;
 
     struct Out {
-        Out()
-            : hasFunctors(false)
-            , hasAnimations(false)
-            , requiresUiRedraw(false)
-            , canDrawThisFrame(true)
-        {}
-        bool hasFunctors;
+        bool hasFunctors = false;
         // This is only updated if evaluateAnimations is true
-        bool hasAnimations;
+        bool hasAnimations = false;
         // This is set to true if there is an animation that RenderThread cannot
         // animate itself, such as if hasFunctors is true
         // This is only set if hasAnimations is true
-        bool requiresUiRedraw;
+        bool requiresUiRedraw = false;
         // This is set to true if draw() can be called this frame
         // false means that we must delay until the next vsync pulse as frame
         // production is outrunning consumption
         // NOTE that if this is false CanvasContext will set either requiresUiRedraw
         // *OR* will post itself for the next vsync automatically, use this
         // only to avoid calling draw()
-        bool canDrawThisFrame;
+        bool canDrawThisFrame = true;
+        // Sentinel for animatedImageDelay meaning there is no need to post such
+        // a message.
+        static constexpr nsecs_t kNoAnimatedImageDelay = -1;
+        // This is used to post a message to redraw when it is time to draw the
+        // next frame of an AnimatedImageDrawable.
+        nsecs_t animatedImageDelay = kNoAnimatedImageDelay;
     } out;
 
+    // This flag helps to disable projection for receiver nodes that do not have any backward
+    // projected children.
+    bool hasBackwardProjectedNodes = false;
     // TODO: Damage calculations
 };
 
 } /* namespace uirenderer */
 } /* namespace android */
-
-#endif /* TREEINFO_H */

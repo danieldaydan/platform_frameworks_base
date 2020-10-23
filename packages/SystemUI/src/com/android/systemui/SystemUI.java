@@ -16,36 +16,49 @@
 
 package com.android.systemui;
 
+import android.app.Notification;
 import android.content.Context;
 import android.content.res.Configuration;
+import android.os.Bundle;
+
+import androidx.annotation.NonNull;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
-import java.util.Map;
 
-public abstract class SystemUI {
-    public Context mContext;
-    public Map<Class<?>, Object> mComponents;
+/**
+ * A top-level module of system UI code (sometimes called "system UI services" elsewhere in code).
+ * Which SystemUI modules are loaded can be controlled via a config resource.
+ *
+ * @see SystemUIApplication#startServicesIfNeeded()
+ */
+public abstract class SystemUI implements Dumpable {
+    protected final Context mContext;
+
+    public SystemUI(Context context) {
+        mContext = context;
+    }
 
     public abstract void start();
 
     protected void onConfigurationChanged(Configuration newConfig) {
     }
 
-    public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+    @Override
+    public void dump(@NonNull FileDescriptor fd, @NonNull PrintWriter pw, @NonNull String[] args) {
     }
 
     protected void onBootCompleted() {
     }
 
-    @SuppressWarnings("unchecked")
-    public <T> T getComponent(Class<T> interfaceType) {
-        return (T) (mComponents != null ? mComponents.get(interfaceType) : null);
-    }
+    public static void overrideNotificationAppName(Context context, Notification.Builder n,
+            boolean system) {
+        final Bundle extras = new Bundle();
+        String appName = system
+                ? context.getString(com.android.internal.R.string.notification_app_name_system)
+                : context.getString(com.android.internal.R.string.notification_app_name_settings);
+        extras.putString(Notification.EXTRA_SUBSTITUTE_APP_NAME, appName);
 
-    public <T, C extends T> void putComponent(Class<T> interfaceType, C component) {
-        if (mComponents != null) {
-            mComponents.put(interfaceType, component);
-        }
+        n.addExtras(extras);
     }
 }

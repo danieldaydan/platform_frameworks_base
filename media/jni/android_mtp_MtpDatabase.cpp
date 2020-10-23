@@ -16,6 +16,26 @@
 
 #define LOG_TAG "MtpDatabaseJNI"
 #include "utils/Log.h"
+#include "utils/String8.h"
+
+#include "android_media_Streams.h"
+#include "mtp.h"
+#include "IMtpDatabase.h"
+#include "MtpDataPacket.h"
+#include "MtpObjectInfo.h"
+#include "MtpProperty.h"
+#include "MtpStringBuffer.h"
+#include "MtpUtils.h"
+
+#include "src/piex_types.h"
+#include "src/piex.h"
+
+#include <android_runtime/AndroidRuntime.h>
+#include <android_runtime/Log.h>
+#include <jni.h>
+#include <media/stagefright/NuMediaExtractor.h>
+#include <nativehelper/JNIHelp.h>
+#include <nativehelper/ScopedLocalRef.h>
 
 #include <assert.h>
 #include <fcntl.h>
@@ -24,32 +44,13 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#include "jni.h"
-#include "JNIHelp.h"
-#include "android_runtime/AndroidRuntime.h"
-#include "android_runtime/Log.h"
-
-#include "MtpDatabase.h"
-#include "MtpDataPacket.h"
-#include "MtpObjectInfo.h"
-#include "MtpProperty.h"
-#include "MtpStringBuffer.h"
-#include "MtpUtils.h"
-#include "mtp.h"
-
-extern "C" {
-#include "libexif/exif-content.h"
-#include "libexif/exif-data.h"
-#include "libexif/exif-tag.h"
-#include "libexif/exif-utils.h"
-}
-
 using namespace android;
 
 // ----------------------------------------------------------------------------
 
 static jmethodID method_beginSendObject;
 static jmethodID method_endSendObject;
+static jmethodID method_rescanFile;
 static jmethodID method_getObjectList;
 static jmethodID method_getNumObjects;
 static jmethodID method_getSupportedPlaybackFormats;
@@ -62,33 +63,36 @@ static jmethodID method_setDeviceProperty;
 static jmethodID method_getObjectPropertyList;
 static jmethodID method_getObjectInfo;
 static jmethodID method_getObjectFilePath;
-static jmethodID method_deleteFile;
+static jmethodID method_getThumbnailInfo;
+static jmethodID method_getThumbnailData;
+static jmethodID method_beginDeleteObject;
+static jmethodID method_endDeleteObject;
+static jmethodID method_beginMoveObject;
+static jmethodID method_endMoveObject;
+static jmethodID method_beginCopyObject;
+static jmethodID method_endCopyObject;
 static jmethodID method_getObjectReferences;
 static jmethodID method_setObjectReferences;
-static jmethodID method_sessionStarted;
-static jmethodID method_sessionEnded;
 
 static jfieldID field_context;
-static jfieldID field_batteryLevel;
-static jfieldID field_batteryScale;
 
-// MtpPropertyList fields
-static jfieldID field_mCount;
-static jfieldID field_mResult;
-static jfieldID field_mObjectHandles;
-static jfieldID field_mPropertyCodes;
-static jfieldID field_mDataTypes;
-static jfieldID field_mLongValues;
-static jfieldID field_mStringValues;
+// MtpPropertyList methods
+static jmethodID method_getCode;
+static jmethodID method_getCount;
+static jmethodID method_getObjectHandles;
+static jmethodID method_getPropertyCodes;
+static jmethodID method_getDataTypes;
+static jmethodID method_getLongValues;
+static jmethodID method_getStringValues;
 
 
-MtpDatabase* getMtpDatabase(JNIEnv *env, jobject database) {
-    return (MtpDatabase *)env->GetLongField(database, field_context);
+IMtpDatabase* getMtpDatabase(JNIEnv *env, jobject database) {
+    return (IMtpDatabase *)env->GetLongField(database, field_context);
 }
 
 // ----------------------------------------------------------------------------
 
-class MyMtpDatabase : public MtpDatabase {
+class MtpDatabase : public IMtpDatabase {
 private:
     jobject         mDatabase;
     jintArray       mIntBuffer;
@@ -96,21 +100,20 @@ private:
     jcharArray      mStringBuffer;
 
 public:
-                                    MyMtpDatabase(JNIEnv *env, jobject client);
-    virtual                         ~MyMtpDatabase();
+                                    MtpDatabase(JNIEnv *env, jobject client);
+    virtual                         ~MtpDatabase();
     void                            cleanup(JNIEnv *env);
 
     virtual MtpObjectHandle         beginSendObject(const char* path,
                                             MtpObjectFormat format,
                                             MtpObjectHandle parent,
-                                            MtpStorageID storage,
-                                            uint64_t size,
-                                            time_t modified);
+                                            MtpStorageID storage);
 
-    virtual void                    endSendObject(const char* path,
+    virtual void                    endSendObject(MtpObjectHandle handle, bool succeeded);
+
+    virtual void                    rescanFile(const char* path,
                                             MtpObjectHandle handle,
-                                            MtpObjectFormat format,
-                                            bool succeeded);
+                                            MtpObjectFormat format);
 
     virtual MtpObjectHandleList*    getObjectList(MtpStorageID storageID,
                                     MtpObjectFormat format,
@@ -154,10 +157,11 @@ public:
     virtual void*                   getThumbnail(MtpObjectHandle handle, size_t& outThumbSize);
 
     virtual MtpResponseCode         getObjectFilePath(MtpObjectHandle handle,
-                                            MtpString& outFilePath,
+                                            MtpStringBuffer& outFilePath,
                                             int64_t& outFileLength,
                                             MtpObjectFormat& outFormat);
-    virtual MtpResponseCode         deleteFile(MtpObjectHandle handle);
+    virtual MtpResponseCode         beginDeleteObject(MtpObjectHandle handle);
+    virtual void                    endDeleteObject(MtpObjectHandle handle, bool succeeded);
 
     bool                            getObjectPropertyInfo(MtpObjectProperty property, int& type);
     bool                            getDevicePropertyInfo(MtpDeviceProperty property, int& type);
@@ -172,9 +176,17 @@ public:
 
     virtual MtpProperty*            getDevicePropertyDesc(MtpDeviceProperty property);
 
-    virtual void                    sessionStarted();
+    virtual MtpResponseCode         beginMoveObject(MtpObjectHandle handle, MtpObjectHandle newParent,
+                                            MtpStorageID newStorage);
 
-    virtual void                    sessionEnded();
+    virtual void                    endMoveObject(MtpObjectHandle oldParent, MtpObjectHandle newParent,
+                                            MtpStorageID oldStorage, MtpStorageID newStorage,
+                                             MtpObjectHandle handle, bool succeeded);
+
+    virtual MtpResponseCode         beginCopyObject(MtpObjectHandle handle, MtpObjectHandle newParent,
+                                            MtpStorageID newStorage);
+    virtual void                    endCopyObject(MtpObjectHandle handle, bool succeeded);
+
 };
 
 // ----------------------------------------------------------------------------
@@ -189,7 +201,7 @@ static void checkAndClearExceptionFromCallback(JNIEnv* env, const char* methodNa
 
 // ----------------------------------------------------------------------------
 
-MyMtpDatabase::MyMtpDatabase(JNIEnv *env, jobject client)
+MtpDatabase::MtpDatabase(JNIEnv *env, jobject client)
     :   mDatabase(env->NewGlobalRef(client)),
         mIntBuffer(NULL),
         mLongBuffer(NULL),
@@ -202,7 +214,7 @@ MyMtpDatabase::MyMtpDatabase(JNIEnv *env, jobject client)
         return; // Already threw.
     }
     mIntBuffer = (jintArray)env->NewGlobalRef(intArray);
-    jlongArray longArray = env->NewLongArray(2);
+    jlongArray longArray = env->NewLongArray(3);
     if (!longArray) {
         return; // Already threw.
     }
@@ -215,27 +227,24 @@ MyMtpDatabase::MyMtpDatabase(JNIEnv *env, jobject client)
     mStringBuffer = (jcharArray)env->NewGlobalRef(charArray);
 }
 
-void MyMtpDatabase::cleanup(JNIEnv *env) {
+void MtpDatabase::cleanup(JNIEnv *env) {
     env->DeleteGlobalRef(mDatabase);
     env->DeleteGlobalRef(mIntBuffer);
     env->DeleteGlobalRef(mLongBuffer);
     env->DeleteGlobalRef(mStringBuffer);
 }
 
-MyMtpDatabase::~MyMtpDatabase() {
+MtpDatabase::~MtpDatabase() {
 }
 
-MtpObjectHandle MyMtpDatabase::beginSendObject(const char* path,
-                                            MtpObjectFormat format,
-                                            MtpObjectHandle parent,
-                                            MtpStorageID storage,
-                                            uint64_t size,
-                                            time_t modified) {
+MtpObjectHandle MtpDatabase::beginSendObject(const char* path,
+                                               MtpObjectFormat format,
+                                               MtpObjectHandle parent,
+                                               MtpStorageID storage) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jstring pathStr = env->NewStringUTF(path);
     MtpObjectHandle result = env->CallIntMethod(mDatabase, method_beginSendObject,
-            pathStr, (jint)format, (jint)parent, (jint)storage,
-            (jlong)size, (jlong)modified);
+            pathStr, (jint)format, (jint)parent, (jint)storage);
 
     if (pathStr)
         env->DeleteLocalRef(pathStr);
@@ -243,21 +252,28 @@ MtpObjectHandle MyMtpDatabase::beginSendObject(const char* path,
     return result;
 }
 
-void MyMtpDatabase::endSendObject(const char* path, MtpObjectHandle handle,
-                                MtpObjectFormat format, bool succeeded) {
+void MtpDatabase::endSendObject(MtpObjectHandle handle, bool succeeded) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    env->CallVoidMethod(mDatabase, method_endSendObject, (jint)handle, (jboolean)succeeded);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+}
+
+void MtpDatabase::rescanFile(const char* path, MtpObjectHandle handle,
+                                  MtpObjectFormat format) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jstring pathStr = env->NewStringUTF(path);
-    env->CallVoidMethod(mDatabase, method_endSendObject, pathStr,
-                        (jint)handle, (jint)format, (jboolean)succeeded);
+    env->CallVoidMethod(mDatabase, method_rescanFile, pathStr,
+                        (jint)handle, (jint)format);
 
     if (pathStr)
         env->DeleteLocalRef(pathStr);
     checkAndClearExceptionFromCallback(env, __FUNCTION__);
 }
 
-MtpObjectHandleList* MyMtpDatabase::getObjectList(MtpStorageID storageID,
-                                    MtpObjectFormat format,
-                                    MtpObjectHandle parent) {
+MtpObjectHandleList* MtpDatabase::getObjectList(MtpStorageID storageID,
+                                                  MtpObjectFormat format,
+                                                  MtpObjectHandle parent) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase, method_getObjectList,
                 (jint)storageID, (jint)format, (jint)parent);
@@ -267,7 +283,7 @@ MtpObjectHandleList* MyMtpDatabase::getObjectList(MtpStorageID storageID,
     jint* handles = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(handles[i]);
+        list->push_back(handles[i]);
     env->ReleaseIntArrayElements(array, handles, 0);
     env->DeleteLocalRef(array);
 
@@ -275,9 +291,9 @@ MtpObjectHandleList* MyMtpDatabase::getObjectList(MtpStorageID storageID,
     return list;
 }
 
-int MyMtpDatabase::getNumObjects(MtpStorageID storageID,
-                                MtpObjectFormat format,
-                                MtpObjectHandle parent) {
+int MtpDatabase::getNumObjects(MtpStorageID storageID,
+                                 MtpObjectFormat format,
+                                 MtpObjectHandle parent) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     int result = env->CallIntMethod(mDatabase, method_getNumObjects,
                 (jint)storageID, (jint)format, (jint)parent);
@@ -286,7 +302,7 @@ int MyMtpDatabase::getNumObjects(MtpStorageID storageID,
     return result;
 }
 
-MtpObjectFormatList* MyMtpDatabase::getSupportedPlaybackFormats() {
+MtpObjectFormatList* MtpDatabase::getSupportedPlaybackFormats() {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase,
             method_getSupportedPlaybackFormats);
@@ -296,7 +312,7 @@ MtpObjectFormatList* MyMtpDatabase::getSupportedPlaybackFormats() {
     jint* formats = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(formats[i]);
+        list->push_back(formats[i]);
     env->ReleaseIntArrayElements(array, formats, 0);
     env->DeleteLocalRef(array);
 
@@ -304,7 +320,7 @@ MtpObjectFormatList* MyMtpDatabase::getSupportedPlaybackFormats() {
     return list;
 }
 
-MtpObjectFormatList* MyMtpDatabase::getSupportedCaptureFormats() {
+MtpObjectFormatList* MtpDatabase::getSupportedCaptureFormats() {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase,
             method_getSupportedCaptureFormats);
@@ -314,7 +330,7 @@ MtpObjectFormatList* MyMtpDatabase::getSupportedCaptureFormats() {
     jint* formats = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(formats[i]);
+        list->push_back(formats[i]);
     env->ReleaseIntArrayElements(array, formats, 0);
     env->DeleteLocalRef(array);
 
@@ -322,7 +338,7 @@ MtpObjectFormatList* MyMtpDatabase::getSupportedCaptureFormats() {
     return list;
 }
 
-MtpObjectPropertyList* MyMtpDatabase::getSupportedObjectProperties(MtpObjectFormat format) {
+MtpObjectPropertyList* MtpDatabase::getSupportedObjectProperties(MtpObjectFormat format) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase,
             method_getSupportedObjectProperties, (jint)format);
@@ -332,7 +348,7 @@ MtpObjectPropertyList* MyMtpDatabase::getSupportedObjectProperties(MtpObjectForm
     jint* properties = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(properties[i]);
+        list->push_back(properties[i]);
     env->ReleaseIntArrayElements(array, properties, 0);
     env->DeleteLocalRef(array);
 
@@ -340,7 +356,7 @@ MtpObjectPropertyList* MyMtpDatabase::getSupportedObjectProperties(MtpObjectForm
     return list;
 }
 
-MtpDevicePropertyList* MyMtpDatabase::getSupportedDeviceProperties() {
+MtpDevicePropertyList* MtpDatabase::getSupportedDeviceProperties() {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase,
             method_getSupportedDeviceProperties);
@@ -350,7 +366,7 @@ MtpDevicePropertyList* MyMtpDatabase::getSupportedDeviceProperties() {
     jint* properties = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(properties[i]);
+        list->push_back(properties[i]);
     env->ReleaseIntArrayElements(array, properties, 0);
     env->DeleteLocalRef(array);
 
@@ -358,47 +374,41 @@ MtpDevicePropertyList* MyMtpDatabase::getSupportedDeviceProperties() {
     return list;
 }
 
-MtpResponseCode MyMtpDatabase::getObjectPropertyValue(MtpObjectHandle handle,
-                                            MtpObjectProperty property,
-                                            MtpDataPacket& packet) {
+MtpResponseCode MtpDatabase::getObjectPropertyValue(MtpObjectHandle handle,
+                                                      MtpObjectProperty property,
+                                                      MtpDataPacket& packet) {
+    static_assert(sizeof(jint) >= sizeof(MtpObjectHandle),
+                  "Casting MtpObjectHandle to jint loses a value");
+    static_assert(sizeof(jint) >= sizeof(MtpObjectProperty),
+                  "Casting MtpObjectProperty to jint loses a value");
     JNIEnv* env = AndroidRuntime::getJNIEnv();
-    jobject list = env->CallObjectMethod(mDatabase, method_getObjectPropertyList,
-                (jlong)handle, 0, (jlong)property, 0, 0);
-    MtpResponseCode result = env->GetIntField(list, field_mResult);
-    int count = env->GetIntField(list, field_mCount);
-    if (result == MTP_RESPONSE_OK && count != 1)
+    jobject list = env->CallObjectMethod(
+            mDatabase,
+            method_getObjectPropertyList,
+            static_cast<jint>(handle),
+            0,
+            static_cast<jint>(property),
+            0,
+            0);
+    MtpResponseCode result = env->CallIntMethod(list, method_getCode);
+    jint count = env->CallIntMethod(list, method_getCount);
+    if (count != 1)
         result = MTP_RESPONSE_GENERAL_ERROR;
 
     if (result == MTP_RESPONSE_OK) {
-        jintArray objectHandlesArray = (jintArray)env->GetObjectField(list, field_mObjectHandles);
-        jintArray propertyCodesArray = (jintArray)env->GetObjectField(list, field_mPropertyCodes);
-        jintArray dataTypesArray = (jintArray)env->GetObjectField(list, field_mDataTypes);
-        jlongArray longValuesArray = (jlongArray)env->GetObjectField(list, field_mLongValues);
-        jobjectArray stringValuesArray = (jobjectArray)env->GetObjectField(list, field_mStringValues);
+        jintArray objectHandlesArray = (jintArray)env->CallObjectMethod(list, method_getObjectHandles);
+        jintArray propertyCodesArray = (jintArray)env->CallObjectMethod(list, method_getPropertyCodes);
+        jintArray dataTypesArray = (jintArray)env->CallObjectMethod(list, method_getDataTypes);
+        jlongArray longValuesArray = (jlongArray)env->CallObjectMethod(list, method_getLongValues);
+        jobjectArray stringValuesArray = (jobjectArray)env->CallObjectMethod(list, method_getStringValues);
 
         jint* objectHandles = env->GetIntArrayElements(objectHandlesArray, 0);
         jint* propertyCodes = env->GetIntArrayElements(propertyCodesArray, 0);
         jint* dataTypes = env->GetIntArrayElements(dataTypesArray, 0);
-        jlong* longValues = (longValuesArray ? env->GetLongArrayElements(longValuesArray, 0) : NULL);
+        jlong* longValues = env->GetLongArrayElements(longValuesArray, 0);
 
         int type = dataTypes[0];
         jlong longValue = (longValues ? longValues[0] : 0);
-
-        // special case date properties, which are strings to MTP
-        // but stored internally as a uint64
-        if (property == MTP_PROPERTY_DATE_MODIFIED || property == MTP_PROPERTY_DATE_ADDED) {
-            char    date[20];
-            formatDateTime(longValue, date, sizeof(date));
-            packet.putString(date);
-            goto out;
-        }
-        // release date is stored internally as just the year
-        if (property == MTP_PROPERTY_ORIGINAL_RELEASE_DATE) {
-            char    date[20];
-            snprintf(date, sizeof(date), "%04" PRId64 "0101T000000", longValue);
-            packet.putString(date);
-            goto out;
-        }
 
         switch (type) {
             case MTP_TYPE_INT8:
@@ -429,7 +439,7 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyValue(MtpObjectHandle handle,
                 packet.putInt128(longValue);
                 break;
             case MTP_TYPE_UINT128:
-                packet.putInt128(longValue);
+                packet.putUInt128(longValue);
                 break;
             case MTP_TYPE_STR:
             {
@@ -448,20 +458,16 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyValue(MtpObjectHandle handle,
                 ALOGE("unsupported type in getObjectPropertyValue\n");
                 result = MTP_RESPONSE_INVALID_OBJECT_PROP_FORMAT;
         }
-out:
         env->ReleaseIntArrayElements(objectHandlesArray, objectHandles, 0);
         env->ReleaseIntArrayElements(propertyCodesArray, propertyCodes, 0);
         env->ReleaseIntArrayElements(dataTypesArray, dataTypes, 0);
-        if (longValues)
-            env->ReleaseLongArrayElements(longValuesArray, longValues, 0);
+        env->ReleaseLongArrayElements(longValuesArray, longValues, 0);
 
         env->DeleteLocalRef(objectHandlesArray);
         env->DeleteLocalRef(propertyCodesArray);
         env->DeleteLocalRef(dataTypesArray);
-        if (longValuesArray)
-            env->DeleteLocalRef(longValuesArray);
-        if (stringValuesArray)
-            env->DeleteLocalRef(stringValuesArray);
+        env->DeleteLocalRef(longValuesArray);
+        env->DeleteLocalRef(stringValuesArray);
     }
 
     env->DeleteLocalRef(list);
@@ -526,9 +532,9 @@ static bool readLongValue(int type, MtpDataPacket& packet, jlong& longValue) {
     return true;
 }
 
-MtpResponseCode MyMtpDatabase::setObjectPropertyValue(MtpObjectHandle handle,
-                                            MtpObjectProperty property,
-                                            MtpDataPacket& packet) {
+MtpResponseCode MtpDatabase::setObjectPropertyValue(MtpObjectHandle handle,
+                                                      MtpObjectProperty property,
+                                                      MtpDataPacket& packet) {
     int         type;
 
     if (!getObjectPropertyInfo(property, type))
@@ -557,81 +563,74 @@ fail:
     return result;
 }
 
-MtpResponseCode MyMtpDatabase::getDevicePropertyValue(MtpDeviceProperty property,
-                                            MtpDataPacket& packet) {
+MtpResponseCode MtpDatabase::getDevicePropertyValue(MtpDeviceProperty property,
+                                                      MtpDataPacket& packet) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
+    int type;
 
-    if (property == MTP_DEVICE_PROPERTY_BATTERY_LEVEL) {
-        // special case - implemented here instead of Java
-        packet.putUInt8((uint8_t)env->GetIntField(mDatabase, field_batteryLevel));
-        return MTP_RESPONSE_OK;
-    } else {
-        int type;
+    if (!getDevicePropertyInfo(property, type))
+        return MTP_RESPONSE_DEVICE_PROP_NOT_SUPPORTED;
 
-        if (!getDevicePropertyInfo(property, type))
-            return MTP_RESPONSE_DEVICE_PROP_NOT_SUPPORTED;
-
-        jint result = env->CallIntMethod(mDatabase, method_getDeviceProperty,
-                    (jint)property, mLongBuffer, mStringBuffer);
-        if (result != MTP_RESPONSE_OK) {
-            checkAndClearExceptionFromCallback(env, __FUNCTION__);
-            return result;
-        }
-
-        jlong* longValues = env->GetLongArrayElements(mLongBuffer, 0);
-        jlong longValue = longValues[0];
-        env->ReleaseLongArrayElements(mLongBuffer, longValues, 0);
-
-        switch (type) {
-            case MTP_TYPE_INT8:
-                packet.putInt8(longValue);
-                break;
-            case MTP_TYPE_UINT8:
-                packet.putUInt8(longValue);
-                break;
-            case MTP_TYPE_INT16:
-                packet.putInt16(longValue);
-                break;
-            case MTP_TYPE_UINT16:
-                packet.putUInt16(longValue);
-                break;
-            case MTP_TYPE_INT32:
-                packet.putInt32(longValue);
-                break;
-            case MTP_TYPE_UINT32:
-                packet.putUInt32(longValue);
-                break;
-            case MTP_TYPE_INT64:
-                packet.putInt64(longValue);
-                break;
-            case MTP_TYPE_UINT64:
-                packet.putUInt64(longValue);
-                break;
-            case MTP_TYPE_INT128:
-                packet.putInt128(longValue);
-                break;
-            case MTP_TYPE_UINT128:
-                packet.putInt128(longValue);
-                break;
-            case MTP_TYPE_STR:
-            {
-                jchar* str = env->GetCharArrayElements(mStringBuffer, 0);
-                packet.putString(str);
-                env->ReleaseCharArrayElements(mStringBuffer, str, 0);
-                break;
-             }
-            default:
-                ALOGE("unsupported type in getDevicePropertyValue\n");
-                return MTP_RESPONSE_INVALID_DEVICE_PROP_FORMAT;
-        }
-
+    jint result = env->CallIntMethod(mDatabase, method_getDeviceProperty,
+                (jint)property, mLongBuffer, mStringBuffer);
+    if (result != MTP_RESPONSE_OK) {
         checkAndClearExceptionFromCallback(env, __FUNCTION__);
-        return MTP_RESPONSE_OK;
+        return result;
     }
+
+    jlong* longValues = env->GetLongArrayElements(mLongBuffer, 0);
+    jlong longValue = longValues[0];
+    env->ReleaseLongArrayElements(mLongBuffer, longValues, 0);
+
+    switch (type) {
+        case MTP_TYPE_INT8:
+            packet.putInt8(longValue);
+            break;
+        case MTP_TYPE_UINT8:
+            packet.putUInt8(longValue);
+            break;
+        case MTP_TYPE_INT16:
+            packet.putInt16(longValue);
+            break;
+        case MTP_TYPE_UINT16:
+            packet.putUInt16(longValue);
+            break;
+        case MTP_TYPE_INT32:
+            packet.putInt32(longValue);
+            break;
+        case MTP_TYPE_UINT32:
+            packet.putUInt32(longValue);
+            break;
+        case MTP_TYPE_INT64:
+            packet.putInt64(longValue);
+            break;
+        case MTP_TYPE_UINT64:
+            packet.putUInt64(longValue);
+            break;
+        case MTP_TYPE_INT128:
+            packet.putInt128(longValue);
+            break;
+        case MTP_TYPE_UINT128:
+            packet.putInt128(longValue);
+            break;
+        case MTP_TYPE_STR:
+        {
+            jchar* str = env->GetCharArrayElements(mStringBuffer, 0);
+            packet.putString(str);
+            env->ReleaseCharArrayElements(mStringBuffer, str, 0);
+            break;
+        }
+        default:
+            ALOGE("unsupported type in getDevicePropertyValue\n");
+            return MTP_RESPONSE_INVALID_DEVICE_PROP_FORMAT;
+    }
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+    return MTP_RESPONSE_OK;
 }
 
-MtpResponseCode MyMtpDatabase::setDevicePropertyValue(MtpDeviceProperty property,
-                                            MtpDataPacket& packet) {
+MtpResponseCode MtpDatabase::setDevicePropertyValue(MtpDeviceProperty property,
+                                                      MtpDataPacket& packet) {
     int         type;
 
     if (!getDevicePropertyInfo(property, type))
@@ -660,30 +659,38 @@ fail:
     return result;
 }
 
-MtpResponseCode MyMtpDatabase::resetDeviceProperty(MtpDeviceProperty /*property*/) {
+MtpResponseCode MtpDatabase::resetDeviceProperty(MtpDeviceProperty /*property*/) {
     return -1;
 }
 
-MtpResponseCode MyMtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
-                                            uint32_t format, uint32_t property,
-                                            int groupCode, int depth,
-                                            MtpDataPacket& packet) {
+MtpResponseCode MtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
+                                                     uint32_t format, uint32_t property,
+                                                     int groupCode, int depth,
+                                                     MtpDataPacket& packet) {
+    static_assert(sizeof(jint) >= sizeof(MtpObjectHandle),
+                  "Casting MtpObjectHandle to jint loses a value");
     JNIEnv* env = AndroidRuntime::getJNIEnv();
-    jobject list = env->CallObjectMethod(mDatabase, method_getObjectPropertyList,
-                (jlong)handle, (jint)format, (jlong)property, (jint)groupCode, (jint)depth);
+    jobject list = env->CallObjectMethod(
+            mDatabase,
+            method_getObjectPropertyList,
+            static_cast<jint>(handle),
+            static_cast<jint>(format),
+            static_cast<jint>(property),
+            static_cast<jint>(groupCode),
+            static_cast<jint>(depth));
     checkAndClearExceptionFromCallback(env, __FUNCTION__);
     if (!list)
         return MTP_RESPONSE_GENERAL_ERROR;
-    int count = env->GetIntField(list, field_mCount);
-    MtpResponseCode result = env->GetIntField(list, field_mResult);
+    int count = env->CallIntMethod(list, method_getCount);
+    MtpResponseCode result = env->CallIntMethod(list, method_getCode);
 
     packet.putUInt32(count);
     if (count > 0) {
-        jintArray objectHandlesArray = (jintArray)env->GetObjectField(list, field_mObjectHandles);
-        jintArray propertyCodesArray = (jintArray)env->GetObjectField(list, field_mPropertyCodes);
-        jintArray dataTypesArray = (jintArray)env->GetObjectField(list, field_mDataTypes);
-        jlongArray longValuesArray = (jlongArray)env->GetObjectField(list, field_mLongValues);
-        jobjectArray stringValuesArray = (jobjectArray)env->GetObjectField(list, field_mStringValues);
+        jintArray objectHandlesArray = (jintArray)env->CallObjectMethod(list, method_getObjectHandles);
+        jintArray propertyCodesArray = (jintArray)env->CallObjectMethod(list, method_getPropertyCodes);
+        jintArray dataTypesArray = (jintArray)env->CallObjectMethod(list, method_getDataTypes);
+        jlongArray longValuesArray = (jlongArray)env->CallObjectMethod(list, method_getLongValues);
+        jobjectArray stringValuesArray = (jobjectArray)env->CallObjectMethod(list, method_getStringValues);
 
         jint* objectHandles = env->GetIntArrayElements(objectHandlesArray, 0);
         jint* propertyCodes = env->GetIntArrayElements(propertyCodesArray, 0);
@@ -695,6 +702,24 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
             packet.putUInt16(propertyCodes[i]);
             int type = dataTypes[i];
             packet.putUInt16(type);
+
+            if (type == MTP_TYPE_STR) {
+                jstring value = (jstring)env->GetObjectArrayElement(stringValuesArray, i);
+                const char *valueStr = (value ? env->GetStringUTFChars(value, NULL) : NULL);
+                if (valueStr) {
+                    packet.putString(valueStr);
+                    env->ReleaseStringUTFChars(value, valueStr);
+                } else {
+                    packet.putEmptyString();
+                }
+                env->DeleteLocalRef(value);
+                continue;
+            }
+
+            if (!longValues) {
+                ALOGE("bad longValuesArray value in MyMtpDatabase::getObjectPropertyList");
+                continue;
+            }
 
             switch (type) {
                 case MTP_TYPE_INT8:
@@ -727,20 +752,8 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
                 case MTP_TYPE_UINT128:
                     packet.putUInt128(longValues[i]);
                     break;
-                case MTP_TYPE_STR: {
-                    jstring value = (jstring)env->GetObjectArrayElement(stringValuesArray, i);
-                    const char *valueStr = (value ? env->GetStringUTFChars(value, NULL) : NULL);
-                    if (valueStr) {
-                        packet.putString(valueStr);
-                        env->ReleaseStringUTFChars(value, valueStr);
-                    } else {
-                        packet.putEmptyString();
-                    }
-                    env->DeleteLocalRef(value);
-                    break;
-                }
                 default:
-                    ALOGE("bad or unsupported data type in MyMtpDatabase::getObjectPropertyList");
+                    ALOGE("bad or unsupported data type in MtpDatabase::getObjectPropertyList");
                     break;
             }
         }
@@ -748,16 +761,13 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
         env->ReleaseIntArrayElements(objectHandlesArray, objectHandles, 0);
         env->ReleaseIntArrayElements(propertyCodesArray, propertyCodes, 0);
         env->ReleaseIntArrayElements(dataTypesArray, dataTypes, 0);
-        if (longValues)
-            env->ReleaseLongArrayElements(longValuesArray, longValues, 0);
+        env->ReleaseLongArrayElements(longValuesArray, longValues, 0);
 
         env->DeleteLocalRef(objectHandlesArray);
         env->DeleteLocalRef(propertyCodesArray);
         env->DeleteLocalRef(dataTypesArray);
-        if (longValuesArray)
-            env->DeleteLocalRef(longValuesArray);
-        if (stringValuesArray)
-            env->DeleteLocalRef(stringValuesArray);
+        env->DeleteLocalRef(longValuesArray);
+        env->DeleteLocalRef(stringValuesArray);
     }
 
     env->DeleteLocalRef(list);
@@ -765,25 +775,9 @@ MtpResponseCode MyMtpDatabase::getObjectPropertyList(MtpObjectHandle handle,
     return result;
 }
 
-static void foreachentry(ExifEntry *entry, void* /* user */) {
-    char buf[1024];
-    ALOGI("entry %x, format %d, size %d: %s",
-            entry->tag, entry->format, entry->size, exif_entry_get_value(entry, buf, sizeof(buf)));
-}
-
-static void foreachcontent(ExifContent *content, void *user) {
-    ALOGI("content %d", exif_content_get_ifd(content));
-    exif_content_foreach_entry(content, foreachentry, user);
-}
-
-static long getLongFromExifEntry(ExifEntry *e) {
-    ExifByteOrder o = exif_data_get_byte_order(e->parent->parent);
-    return exif_get_long(e->data, o);
-}
-
-MtpResponseCode MyMtpDatabase::getObjectInfo(MtpObjectHandle handle,
-                                            MtpObjectInfo& info) {
-    MtpString       path;
+MtpResponseCode MtpDatabase::getObjectInfo(MtpObjectHandle handle,
+                                             MtpObjectInfo& info) {
+    MtpStringBuffer path;
     int64_t         length;
     MtpObjectFormat format;
 
@@ -818,29 +812,60 @@ MtpResponseCode MyMtpDatabase::getObjectInfo(MtpObjectHandle handle,
     info.mAssociationType = MTP_ASSOCIATION_TYPE_UNDEFINED;
 
     jchar* str = env->GetCharArrayElements(mStringBuffer, 0);
-    MtpString temp(reinterpret_cast<char16_t*>(str));
-    info.mName = strdup((const char *)temp);
+    MtpStringBuffer temp(str);
+    info.mName = strdup(temp);
     env->ReleaseCharArrayElements(mStringBuffer, str, 0);
 
     // read EXIF data for thumbnail information
-    if (info.mFormat == MTP_FORMAT_EXIF_JPEG || info.mFormat == MTP_FORMAT_JFIF) {
+    switch (info.mFormat) {
+        case MTP_FORMAT_EXIF_JPEG:
+        case MTP_FORMAT_HEIF:
+        case MTP_FORMAT_JFIF:
+        case MTP_FORMAT_PNG:
+        case MTP_FORMAT_BMP:
+        case MTP_FORMAT_GIF: {
+            env = AndroidRuntime::getJNIEnv();
+            if (env->CallBooleanMethod(
+                    mDatabase, method_getThumbnailInfo, (jint)handle, mLongBuffer)) {
 
-        ExifData *exifdata = exif_data_new_from_file(path);
-        if (exifdata) {
-            if ((false)) {
-                exif_data_foreach_content(exifdata, foreachcontent, NULL);
+                jlong* longValues = env->GetLongArrayElements(mLongBuffer, 0);
+                jlong size = longValues[0];
+                jlong w = longValues[1];
+                jlong h = longValues[2];
+                if (size > 0 && size <= UINT32_MAX &&
+                        w > 0 && w <= UINT32_MAX &&
+                        h > 0 && h <= UINT32_MAX) {
+                    info.mThumbCompressedSize = size;
+                    info.mThumbFormat = MTP_FORMAT_EXIF_JPEG;
+                    info.mImagePixWidth = w;
+                    info.mImagePixHeight = h;
+                }
+                env->ReleaseLongArrayElements(mLongBuffer, longValues, 0);
+            }
+            break;
+        }
+
+        // Except DNG, all supported RAW image formats are not defined in PTP 1.2 specification.
+        // Most of RAW image formats are based on TIFF or TIFF/EP. To render Fuji's RAF format,
+        // it checks MTP_FORMAT_DEFINED case since it's designed as a custom format.
+        case MTP_FORMAT_DNG:
+        case MTP_FORMAT_TIFF:
+        case MTP_FORMAT_TIFF_EP:
+        case MTP_FORMAT_DEFINED: {
+            String8 temp(path);
+            std::unique_ptr<FileStream> stream(new FileStream(temp));
+            piex::PreviewImageData image_data;
+            if (!GetExifFromRawImage(stream.get(), temp, image_data)) {
+                // Couldn't parse EXIF data from a image file via piex.
+                break;
             }
 
-            // XXX get this from exif, or parse jpeg header instead?
-            ExifEntry *w = exif_content_get_entry(
-                    exifdata->ifd[EXIF_IFD_EXIF], EXIF_TAG_PIXEL_X_DIMENSION);
-            ExifEntry *h = exif_content_get_entry(
-                    exifdata->ifd[EXIF_IFD_EXIF], EXIF_TAG_PIXEL_Y_DIMENSION);
-            info.mThumbCompressedSize = exifdata->data ? exifdata->size : 0;
+            info.mThumbCompressedSize = image_data.thumbnail.length;
             info.mThumbFormat = MTP_FORMAT_EXIF_JPEG;
-            info.mImagePixWidth = w ? getLongFromExifEntry(w) : 0;
-            info.mImagePixHeight = h ? getLongFromExifEntry(h) : 0;
-            exif_data_unref(exifdata);
+            info.mImagePixWidth = image_data.full_width;
+            info.mImagePixHeight = image_data.full_height;
+
+            break;
         }
     }
 
@@ -848,36 +873,81 @@ MtpResponseCode MyMtpDatabase::getObjectInfo(MtpObjectHandle handle,
     return MTP_RESPONSE_OK;
 }
 
-void* MyMtpDatabase::getThumbnail(MtpObjectHandle handle, size_t& outThumbSize) {
-    MtpString path;
+void* MtpDatabase::getThumbnail(MtpObjectHandle handle, size_t& outThumbSize) {
+    MtpStringBuffer path;
     int64_t length;
     MtpObjectFormat format;
     void* result = NULL;
     outThumbSize = 0;
 
-    if (getObjectFilePath(handle, path, length, format) == MTP_RESPONSE_OK
-            && (format == MTP_FORMAT_EXIF_JPEG || format == MTP_FORMAT_JFIF)) {
-
-        ExifData *exifdata = exif_data_new_from_file(path);
-        if (exifdata) {
-            if (exifdata->data) {
-                result = malloc(exifdata->size);
-                if (result) {
-                    memcpy(result, exifdata->data, exifdata->size);
-                    outThumbSize = exifdata->size;
+    if (getObjectFilePath(handle, path, length, format) == MTP_RESPONSE_OK) {
+        switch (format) {
+            case MTP_FORMAT_EXIF_JPEG:
+            case MTP_FORMAT_HEIF:
+            case MTP_FORMAT_JFIF:
+            case MTP_FORMAT_PNG:
+            case MTP_FORMAT_BMP:
+            case MTP_FORMAT_GIF: {
+                JNIEnv* env = AndroidRuntime::getJNIEnv();
+                jbyteArray thumbData = (jbyteArray) env->CallObjectMethod(
+                        mDatabase, method_getThumbnailData, (jint)handle);
+                if (thumbData == NULL) {
+                    return nullptr;
                 }
+                jsize thumbSize = env->GetArrayLength(thumbData);
+                result = malloc(thumbSize);
+                if (result) {
+                    env->GetByteArrayRegion(thumbData, 0, thumbSize, (jbyte*)result);
+                    outThumbSize = thumbSize;
+                }
+                env->DeleteLocalRef(thumbData);
+                break;
             }
-            exif_data_unref(exifdata);
+
+            // See the above comment on getObjectInfo() method.
+            case MTP_FORMAT_DNG:
+            case MTP_FORMAT_TIFF:
+            case MTP_FORMAT_TIFF_EP:
+            case MTP_FORMAT_DEFINED: {
+                String8 temp(path);
+                std::unique_ptr<FileStream> stream(new FileStream(temp));
+                piex::PreviewImageData image_data;
+                if (!GetExifFromRawImage(stream.get(), temp, image_data)) {
+                    // Couldn't parse EXIF data from a image file via piex.
+                    break;
+                }
+
+                if (image_data.thumbnail.length == 0
+                        || image_data.thumbnail.format != ::piex::Image::kJpegCompressed) {
+                    // No thumbnail or non jpeg thumbnail.
+                    break;
+                }
+
+                result = malloc(image_data.thumbnail.length);
+                if (result) {
+                    piex::Error err = stream.get()->GetData(
+                            image_data.thumbnail.offset,
+                            image_data.thumbnail.length,
+                            (std::uint8_t *)result);
+                    if (err == piex::Error::kOk) {
+                        outThumbSize = image_data.thumbnail.length;
+                    } else {
+                        free(result);
+                        result = NULL;
+                    }
+                }
+                break;
+            }
         }
     }
 
     return result;
 }
 
-MtpResponseCode MyMtpDatabase::getObjectFilePath(MtpObjectHandle handle,
-                                            MtpString& outFilePath,
-                                            int64_t& outFileLength,
-                                            MtpObjectFormat& outFormat) {
+MtpResponseCode MtpDatabase::getObjectFilePath(MtpObjectHandle handle,
+                                                 MtpStringBuffer& outFilePath,
+                                                 int64_t& outFileLength,
+                                                 MtpObjectFormat& outFormat) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jint result = env->CallIntMethod(mDatabase, method_getObjectFilePath,
                 (jint)handle, mStringBuffer, mLongBuffer);
@@ -887,8 +957,7 @@ MtpResponseCode MyMtpDatabase::getObjectFilePath(MtpObjectHandle handle,
     }
 
     jchar* str = env->GetCharArrayElements(mStringBuffer, 0);
-    outFilePath.setTo(reinterpret_cast<char16_t*>(str),
-                      strlen16(reinterpret_cast<char16_t*>(str)));
+    outFilePath.set(str);
     env->ReleaseCharArrayElements(mStringBuffer, str, 0);
 
     jlong* longValues = env->GetLongArrayElements(mLongBuffer, 0);
@@ -900,13 +969,59 @@ MtpResponseCode MyMtpDatabase::getObjectFilePath(MtpObjectHandle handle,
     return result;
 }
 
-MtpResponseCode MyMtpDatabase::deleteFile(MtpObjectHandle handle) {
+MtpResponseCode MtpDatabase::beginDeleteObject(MtpObjectHandle handle) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
-    MtpResponseCode result = env->CallIntMethod(mDatabase, method_deleteFile, (jint)handle);
+    MtpResponseCode result = env->CallIntMethod(mDatabase, method_beginDeleteObject, (jint)handle);
 
     checkAndClearExceptionFromCallback(env, __FUNCTION__);
     return result;
 }
+
+void MtpDatabase::endDeleteObject(MtpObjectHandle handle, bool succeeded) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    env->CallVoidMethod(mDatabase, method_endDeleteObject, (jint)handle, (jboolean) succeeded);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+}
+
+MtpResponseCode MtpDatabase::beginMoveObject(MtpObjectHandle handle, MtpObjectHandle newParent,
+        MtpStorageID newStorage) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    MtpResponseCode result = env->CallIntMethod(mDatabase, method_beginMoveObject,
+                (jint)handle, (jint)newParent, (jint) newStorage);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+    return result;
+}
+
+void MtpDatabase::endMoveObject(MtpObjectHandle oldParent, MtpObjectHandle newParent,
+                                            MtpStorageID oldStorage, MtpStorageID newStorage,
+                                             MtpObjectHandle handle, bool succeeded) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    env->CallVoidMethod(mDatabase, method_endMoveObject,
+                (jint)oldParent, (jint) newParent, (jint) oldStorage, (jint) newStorage,
+                (jint) handle, (jboolean) succeeded);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+}
+
+MtpResponseCode MtpDatabase::beginCopyObject(MtpObjectHandle handle, MtpObjectHandle newParent,
+        MtpStorageID newStorage) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    MtpResponseCode result = env->CallIntMethod(mDatabase, method_beginCopyObject,
+                (jint)handle, (jint)newParent, (jint) newStorage);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+    return result;
+}
+
+void MtpDatabase::endCopyObject(MtpObjectHandle handle, bool succeeded) {
+    JNIEnv* env = AndroidRuntime::getJNIEnv();
+    env->CallVoidMethod(mDatabase, method_endCopyObject, (jint)handle, (jboolean)succeeded);
+
+    checkAndClearExceptionFromCallback(env, __FUNCTION__);
+}
+
 
 struct PropertyTableEntry {
     MtpObjectProperty   property;
@@ -946,9 +1061,10 @@ static const PropertyTableEntry   kDevicePropertyTable[] = {
     {   MTP_DEVICE_PROPERTY_DEVICE_FRIENDLY_NAME,       MTP_TYPE_STR },
     {   MTP_DEVICE_PROPERTY_IMAGE_SIZE,                 MTP_TYPE_STR },
     {   MTP_DEVICE_PROPERTY_BATTERY_LEVEL,              MTP_TYPE_UINT8 },
+    {   MTP_DEVICE_PROPERTY_PERCEIVED_DEVICE_TYPE,      MTP_TYPE_UINT32 },
 };
 
-bool MyMtpDatabase::getObjectPropertyInfo(MtpObjectProperty property, int& type) {
+bool MtpDatabase::getObjectPropertyInfo(MtpObjectProperty property, int& type) {
     int count = sizeof(kObjectPropertyTable) / sizeof(kObjectPropertyTable[0]);
     const PropertyTableEntry* entry = kObjectPropertyTable;
     for (int i = 0; i < count; i++, entry++) {
@@ -960,7 +1076,7 @@ bool MyMtpDatabase::getObjectPropertyInfo(MtpObjectProperty property, int& type)
     return false;
 }
 
-bool MyMtpDatabase::getDevicePropertyInfo(MtpDeviceProperty property, int& type) {
+bool MtpDatabase::getDevicePropertyInfo(MtpDeviceProperty property, int& type) {
     int count = sizeof(kDevicePropertyTable) / sizeof(kDevicePropertyTable[0]);
     const PropertyTableEntry* entry = kDevicePropertyTable;
     for (int i = 0; i < count; i++, entry++) {
@@ -972,7 +1088,7 @@ bool MyMtpDatabase::getDevicePropertyInfo(MtpDeviceProperty property, int& type)
     return false;
 }
 
-MtpObjectHandleList* MyMtpDatabase::getObjectReferences(MtpObjectHandle handle) {
+MtpObjectHandleList* MtpDatabase::getObjectReferences(MtpObjectHandle handle) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     jintArray array = (jintArray)env->CallObjectMethod(mDatabase, method_getObjectReferences,
                 (jint)handle);
@@ -982,7 +1098,7 @@ MtpObjectHandleList* MyMtpDatabase::getObjectReferences(MtpObjectHandle handle) 
     jint* handles = env->GetIntArrayElements(array, 0);
     jsize length = env->GetArrayLength(array);
     for (int i = 0; i < length; i++)
-        list->push(handles[i]);
+        list->push_back(handles[i]);
     env->ReleaseIntArrayElements(array, handles, 0);
     env->DeleteLocalRef(array);
 
@@ -990,8 +1106,8 @@ MtpObjectHandleList* MyMtpDatabase::getObjectReferences(MtpObjectHandle handle) 
     return list;
 }
 
-MtpResponseCode MyMtpDatabase::setObjectReferences(MtpObjectHandle handle,
-                                                    MtpObjectHandleList* references) {
+MtpResponseCode MtpDatabase::setObjectReferences(MtpObjectHandle handle,
+                                                   MtpObjectHandleList* references) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     int count = references->size();
     jintArray array = env->NewIntArray(count);
@@ -1011,8 +1127,8 @@ MtpResponseCode MyMtpDatabase::setObjectReferences(MtpObjectHandle handle,
     return result;
 }
 
-MtpProperty* MyMtpDatabase::getObjectPropertyDesc(MtpObjectProperty property,
-                                            MtpObjectFormat format) {
+MtpProperty* MtpDatabase::getObjectPropertyDesc(MtpObjectProperty property,
+                                                  MtpObjectFormat format) {
     static const int channelEnum[] = {
                                         1,  // mono
                                         2,  // stereo
@@ -1092,55 +1208,58 @@ MtpProperty* MyMtpDatabase::getObjectPropertyDesc(MtpObjectProperty property,
     return result;
 }
 
-MtpProperty* MyMtpDatabase::getDevicePropertyDesc(MtpDeviceProperty property) {
+MtpProperty* MtpDatabase::getDevicePropertyDesc(MtpDeviceProperty property) {
     JNIEnv* env = AndroidRuntime::getJNIEnv();
     MtpProperty* result = NULL;
     bool writable = false;
 
-    switch (property) {
-        case MTP_DEVICE_PROPERTY_SYNCHRONIZATION_PARTNER:
-        case MTP_DEVICE_PROPERTY_DEVICE_FRIENDLY_NAME:
-            writable = true;
-            // fall through
-        case MTP_DEVICE_PROPERTY_IMAGE_SIZE: {
-            result = new MtpProperty(property, MTP_TYPE_STR, writable);
-
-            // get current value
-            jint ret = env->CallIntMethod(mDatabase, method_getDeviceProperty,
-                        (jint)property, mLongBuffer, mStringBuffer);
-            if (ret == MTP_RESPONSE_OK) {
+    // get current value
+    jint ret = env->CallIntMethod(mDatabase, method_getDeviceProperty,
+        (jint)property, mLongBuffer, mStringBuffer);
+    if (ret == MTP_RESPONSE_OK) {
+        switch (property) {
+            case MTP_DEVICE_PROPERTY_SYNCHRONIZATION_PARTNER:
+            case MTP_DEVICE_PROPERTY_DEVICE_FRIENDLY_NAME:
+                writable = true;
+                // fall through
+                FALLTHROUGH_INTENDED;
+            case MTP_DEVICE_PROPERTY_IMAGE_SIZE:
+            {
+                result = new MtpProperty(property, MTP_TYPE_STR, writable);
                 jchar* str = env->GetCharArrayElements(mStringBuffer, 0);
                 result->setCurrentValue(str);
                 // for read-only properties it is safe to assume current value is default value
                 if (!writable)
                     result->setDefaultValue(str);
                 env->ReleaseCharArrayElements(mStringBuffer, str, 0);
-            } else {
-                ALOGE("unable to read device property, response: %04X", ret);
+                break;
             }
-            break;
+            case MTP_DEVICE_PROPERTY_BATTERY_LEVEL:
+            {
+                result = new MtpProperty(property, MTP_TYPE_UINT8);
+                jlong* arr = env->GetLongArrayElements(mLongBuffer, 0);
+                result->setFormRange(0, arr[1], 1);
+                result->mCurrentValue.u.u8 = (uint8_t) arr[0];
+                env->ReleaseLongArrayElements(mLongBuffer, arr, 0);
+                break;
+            }
+            case MTP_DEVICE_PROPERTY_PERCEIVED_DEVICE_TYPE:
+            {
+                jlong* arr = env->GetLongArrayElements(mLongBuffer, 0);
+                result = new MtpProperty(property, MTP_TYPE_UINT32);
+                result->mCurrentValue.u.u32 = (uint32_t) arr[0];
+                env->ReleaseLongArrayElements(mLongBuffer, arr, 0);
+                break;
+            }
+            default:
+                ALOGE("Unrecognized property %x", property);
         }
-        case MTP_DEVICE_PROPERTY_BATTERY_LEVEL:
-            result = new MtpProperty(property, MTP_TYPE_UINT8);
-            result->setFormRange(0, env->GetIntField(mDatabase, field_batteryScale), 1);
-            result->mCurrentValue.u.u8 = (uint8_t)env->GetIntField(mDatabase, field_batteryLevel);
-            break;
+    } else {
+        ALOGE("unable to read device property, response: %04X", ret);
     }
 
     checkAndClearExceptionFromCallback(env, __FUNCTION__);
     return result;
-}
-
-void MyMtpDatabase::sessionStarted() {
-    JNIEnv* env = AndroidRuntime::getJNIEnv();
-    env->CallVoidMethod(mDatabase, method_sessionStarted);
-    checkAndClearExceptionFromCallback(env, __FUNCTION__);
-}
-
-void MyMtpDatabase::sessionEnded() {
-    JNIEnv* env = AndroidRuntime::getJNIEnv();
-    env->CallVoidMethod(mDatabase, method_sessionEnded);
-    checkAndClearExceptionFromCallback(env, __FUNCTION__);
 }
 
 // ----------------------------------------------------------------------------
@@ -1148,7 +1267,7 @@ void MyMtpDatabase::sessionEnded() {
 static void
 android_mtp_MtpDatabase_setup(JNIEnv *env, jobject thiz)
 {
-    MyMtpDatabase* database = new MyMtpDatabase(env, thiz);
+    MtpDatabase* database = new MtpDatabase(env, thiz);
     env->SetLongField(thiz, field_context, (jlong)database);
     checkAndClearExceptionFromCallback(env, __FUNCTION__);
 }
@@ -1156,7 +1275,7 @@ android_mtp_MtpDatabase_setup(JNIEnv *env, jobject thiz)
 static void
 android_mtp_MtpDatabase_finalize(JNIEnv *env, jobject thiz)
 {
-    MyMtpDatabase* database = (MyMtpDatabase *)env->GetLongField(thiz, field_context);
+    MtpDatabase* database = (MtpDatabase *)env->GetLongField(thiz, field_context);
     database->cleanup(env);
     delete database;
     env->SetLongField(thiz, field_context, 0);
@@ -1183,6 +1302,13 @@ static const JNINativeMethod gMtpPropertyGroupMethods[] = {
                                         (void *)android_mtp_MtpPropertyGroup_format_date_time},
 };
 
+#define GET_METHOD_ID(name, jclass, signature)                              \
+    method_##name = env->GetMethodID(jclass, #name, signature);             \
+    if (method_##name == NULL) {                                            \
+        ALOGE("Can't find " #name);                                         \
+        return -1;                                                          \
+    }                                                                       \
+
 int register_android_mtp_MtpDatabase(JNIEnv *env)
 {
     jclass clazz;
@@ -1192,160 +1318,50 @@ int register_android_mtp_MtpDatabase(JNIEnv *env)
         ALOGE("Can't find android/mtp/MtpDatabase");
         return -1;
     }
-    method_beginSendObject = env->GetMethodID(clazz, "beginSendObject", "(Ljava/lang/String;IIIJJ)I");
-    if (method_beginSendObject == NULL) {
-        ALOGE("Can't find beginSendObject");
-        return -1;
-    }
-    method_endSendObject = env->GetMethodID(clazz, "endSendObject", "(Ljava/lang/String;IIZ)V");
-    if (method_endSendObject == NULL) {
-        ALOGE("Can't find endSendObject");
-        return -1;
-    }
-    method_getObjectList = env->GetMethodID(clazz, "getObjectList", "(III)[I");
-    if (method_getObjectList == NULL) {
-        ALOGE("Can't find getObjectList");
-        return -1;
-    }
-    method_getNumObjects = env->GetMethodID(clazz, "getNumObjects", "(III)I");
-    if (method_getNumObjects == NULL) {
-        ALOGE("Can't find getNumObjects");
-        return -1;
-    }
-    method_getSupportedPlaybackFormats = env->GetMethodID(clazz, "getSupportedPlaybackFormats", "()[I");
-    if (method_getSupportedPlaybackFormats == NULL) {
-        ALOGE("Can't find getSupportedPlaybackFormats");
-        return -1;
-    }
-    method_getSupportedCaptureFormats = env->GetMethodID(clazz, "getSupportedCaptureFormats", "()[I");
-    if (method_getSupportedCaptureFormats == NULL) {
-        ALOGE("Can't find getSupportedCaptureFormats");
-        return -1;
-    }
-    method_getSupportedObjectProperties = env->GetMethodID(clazz, "getSupportedObjectProperties", "(I)[I");
-    if (method_getSupportedObjectProperties == NULL) {
-        ALOGE("Can't find getSupportedObjectProperties");
-        return -1;
-    }
-    method_getSupportedDeviceProperties = env->GetMethodID(clazz, "getSupportedDeviceProperties", "()[I");
-    if (method_getSupportedDeviceProperties == NULL) {
-        ALOGE("Can't find getSupportedDeviceProperties");
-        return -1;
-    }
-    method_setObjectProperty = env->GetMethodID(clazz, "setObjectProperty", "(IIJLjava/lang/String;)I");
-    if (method_setObjectProperty == NULL) {
-        ALOGE("Can't find setObjectProperty");
-        return -1;
-    }
-    method_getDeviceProperty = env->GetMethodID(clazz, "getDeviceProperty", "(I[J[C)I");
-    if (method_getDeviceProperty == NULL) {
-        ALOGE("Can't find getDeviceProperty");
-        return -1;
-    }
-    method_setDeviceProperty = env->GetMethodID(clazz, "setDeviceProperty", "(IJLjava/lang/String;)I");
-    if (method_setDeviceProperty == NULL) {
-        ALOGE("Can't find setDeviceProperty");
-        return -1;
-    }
-    method_getObjectPropertyList = env->GetMethodID(clazz, "getObjectPropertyList",
-            "(JIJII)Landroid/mtp/MtpPropertyList;");
-    if (method_getObjectPropertyList == NULL) {
-        ALOGE("Can't find getObjectPropertyList");
-        return -1;
-    }
-    method_getObjectInfo = env->GetMethodID(clazz, "getObjectInfo", "(I[I[C[J)Z");
-    if (method_getObjectInfo == NULL) {
-        ALOGE("Can't find getObjectInfo");
-        return -1;
-    }
-    method_getObjectFilePath = env->GetMethodID(clazz, "getObjectFilePath", "(I[C[J)I");
-    if (method_getObjectFilePath == NULL) {
-        ALOGE("Can't find getObjectFilePath");
-        return -1;
-    }
-    method_deleteFile = env->GetMethodID(clazz, "deleteFile", "(I)I");
-    if (method_deleteFile == NULL) {
-        ALOGE("Can't find deleteFile");
-        return -1;
-    }
-    method_getObjectReferences = env->GetMethodID(clazz, "getObjectReferences", "(I)[I");
-    if (method_getObjectReferences == NULL) {
-        ALOGE("Can't find getObjectReferences");
-        return -1;
-    }
-    method_setObjectReferences = env->GetMethodID(clazz, "setObjectReferences", "(I[I)I");
-    if (method_setObjectReferences == NULL) {
-        ALOGE("Can't find setObjectReferences");
-        return -1;
-    }
-    method_sessionStarted = env->GetMethodID(clazz, "sessionStarted", "()V");
-    if (method_sessionStarted == NULL) {
-        ALOGE("Can't find sessionStarted");
-        return -1;
-    }
-    method_sessionEnded = env->GetMethodID(clazz, "sessionEnded", "()V");
-    if (method_sessionEnded == NULL) {
-        ALOGE("Can't find sessionEnded");
-        return -1;
-    }
+    GET_METHOD_ID(beginSendObject, clazz, "(Ljava/lang/String;III)I");
+    GET_METHOD_ID(endSendObject, clazz, "(IZ)V");
+    GET_METHOD_ID(rescanFile, clazz, "(Ljava/lang/String;II)V");
+    GET_METHOD_ID(getObjectList, clazz, "(III)[I");
+    GET_METHOD_ID(getNumObjects, clazz, "(III)I");
+    GET_METHOD_ID(getSupportedPlaybackFormats, clazz, "()[I");
+    GET_METHOD_ID(getSupportedCaptureFormats, clazz, "()[I");
+    GET_METHOD_ID(getSupportedObjectProperties, clazz, "(I)[I");
+    GET_METHOD_ID(getSupportedDeviceProperties, clazz, "()[I");
+    GET_METHOD_ID(setObjectProperty, clazz, "(IIJLjava/lang/String;)I");
+    GET_METHOD_ID(getDeviceProperty, clazz, "(I[J[C)I");
+    GET_METHOD_ID(setDeviceProperty, clazz, "(IJLjava/lang/String;)I");
+    GET_METHOD_ID(getObjectPropertyList, clazz, "(IIIII)Landroid/mtp/MtpPropertyList;");
+    GET_METHOD_ID(getObjectInfo, clazz, "(I[I[C[J)Z");
+    GET_METHOD_ID(getObjectFilePath, clazz, "(I[C[J)I");
+    GET_METHOD_ID(getThumbnailInfo, clazz, "(I[J)Z");
+    GET_METHOD_ID(getThumbnailData, clazz, "(I)[B");
+    GET_METHOD_ID(beginDeleteObject, clazz, "(I)I");
+    GET_METHOD_ID(endDeleteObject, clazz, "(IZ)V");
+    GET_METHOD_ID(beginMoveObject, clazz, "(III)I");
+    GET_METHOD_ID(endMoveObject, clazz, "(IIIIIZ)V");
+    GET_METHOD_ID(beginCopyObject, clazz, "(III)I");
+    GET_METHOD_ID(endCopyObject, clazz, "(IZ)V");
+    GET_METHOD_ID(getObjectReferences, clazz, "(I)[I");
+    GET_METHOD_ID(setObjectReferences, clazz, "(I[I)I");
 
     field_context = env->GetFieldID(clazz, "mNativeContext", "J");
     if (field_context == NULL) {
         ALOGE("Can't find MtpDatabase.mNativeContext");
         return -1;
     }
-    field_batteryLevel = env->GetFieldID(clazz, "mBatteryLevel", "I");
-    if (field_batteryLevel == NULL) {
-        ALOGE("Can't find MtpDatabase.mBatteryLevel");
-        return -1;
-    }
-    field_batteryScale = env->GetFieldID(clazz, "mBatteryScale", "I");
-    if (field_batteryScale == NULL) {
-        ALOGE("Can't find MtpDatabase.mBatteryScale");
-        return -1;
-    }
 
-    // now set up fields for MtpPropertyList class
     clazz = env->FindClass("android/mtp/MtpPropertyList");
     if (clazz == NULL) {
         ALOGE("Can't find android/mtp/MtpPropertyList");
         return -1;
     }
-    field_mCount = env->GetFieldID(clazz, "mCount", "I");
-    if (field_mCount == NULL) {
-        ALOGE("Can't find MtpPropertyList.mCount");
-        return -1;
-    }
-    field_mResult = env->GetFieldID(clazz, "mResult", "I");
-    if (field_mResult == NULL) {
-        ALOGE("Can't find MtpPropertyList.mResult");
-        return -1;
-    }
-    field_mObjectHandles = env->GetFieldID(clazz, "mObjectHandles", "[I");
-    if (field_mObjectHandles == NULL) {
-        ALOGE("Can't find MtpPropertyList.mObjectHandles");
-        return -1;
-    }
-    field_mPropertyCodes = env->GetFieldID(clazz, "mPropertyCodes", "[I");
-    if (field_mPropertyCodes == NULL) {
-        ALOGE("Can't find MtpPropertyList.mPropertyCodes");
-        return -1;
-    }
-    field_mDataTypes = env->GetFieldID(clazz, "mDataTypes", "[I");
-    if (field_mDataTypes == NULL) {
-        ALOGE("Can't find MtpPropertyList.mDataTypes");
-        return -1;
-    }
-    field_mLongValues = env->GetFieldID(clazz, "mLongValues", "[J");
-    if (field_mLongValues == NULL) {
-        ALOGE("Can't find MtpPropertyList.mLongValues");
-        return -1;
-    }
-    field_mStringValues = env->GetFieldID(clazz, "mStringValues", "[Ljava/lang/String;");
-    if (field_mStringValues == NULL) {
-        ALOGE("Can't find MtpPropertyList.mStringValues");
-        return -1;
-    }
+    GET_METHOD_ID(getCode, clazz, "()I");
+    GET_METHOD_ID(getCount, clazz, "()I");
+    GET_METHOD_ID(getObjectHandles, clazz, "()[I");
+    GET_METHOD_ID(getPropertyCodes, clazz, "()[I");
+    GET_METHOD_ID(getDataTypes, clazz, "()[I");
+    GET_METHOD_ID(getLongValues, clazz, "()[J");
+    GET_METHOD_ID(getStringValues, clazz, "()[Ljava/lang/String;");
 
     if (AndroidRuntime::registerNativeMethods(env,
                 "android/mtp/MtpDatabase", gMtpDatabaseMethods, NELEM(gMtpDatabaseMethods)))

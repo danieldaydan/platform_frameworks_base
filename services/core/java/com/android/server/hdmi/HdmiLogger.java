@@ -17,10 +17,10 @@
 package com.android.server.hdmi;
 
 import android.annotation.Nullable;
-import android.os.Build;
 import android.os.SystemClock;
 import android.util.Pair;
 import android.util.Slog;
+import android.util.Log;
 
 import java.util.HashMap;
 
@@ -40,9 +40,9 @@ import java.util.HashMap;
 final class HdmiLogger {
     private static final String TAG = "HDMI";
     // Logging duration for same error message.
-    private static final long ERROR_LOG_DURATTION_MILLIS = 20 * 1000;  // 20s
+    private static final long ERROR_LOG_DURATION_MILLIS = 20 * 1000;  // 20s
 
-    private static final boolean IS_USER_BUILD = "user".equals(Build.TYPE);
+    private static final boolean DEBUG = Log.isLoggable(TAG, Log.DEBUG);
 
     private static final ThreadLocal<HdmiLogger> sLogger = new ThreadLocal<>();
 
@@ -71,6 +71,10 @@ final class HdmiLogger {
         getLogger().errorInternal(toLogString(logMessage, objs));
     }
 
+    static final void error(String logMessage, Exception e, Object... objs) {
+        getLogger().errorInternal(toLogString(logMessage + e, objs));
+    }
+
     private void errorInternal(String logMessage) {
         String log = updateLog(mErrorTimingCache, logMessage);
         if (!log.isEmpty()) {
@@ -83,10 +87,9 @@ final class HdmiLogger {
     }
 
     private void debugInternal(String logMessage) {
-        if (true || IS_USER_BUILD) {
-            return;
+        if (DEBUG) {
+            Slog.d(TAG, logMessage);
         }
-        Slog.d(TAG, logMessage);
     }
 
     private static final String toLogString(String logMessage, Object[] objs) {
@@ -134,6 +137,6 @@ final class HdmiLogger {
     }
 
     private static boolean shouldLogNow(@Nullable Pair<Long, Integer> timing, long curTime) {
-        return timing == null || curTime - timing.first > ERROR_LOG_DURATTION_MILLIS;
+        return timing == null || curTime - timing.first > ERROR_LOG_DURATION_MILLIS;
     }
 }

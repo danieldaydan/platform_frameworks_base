@@ -18,10 +18,9 @@ package com.android.internal.app;
 
 import static android.view.ViewGroup.LayoutParams.MATCH_PARENT;
 
-import com.android.internal.R;
-
 import android.annotation.Nullable;
 import android.app.AlertDialog;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.res.TypedArray;
@@ -29,7 +28,9 @@ import android.database.Cursor;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
 import android.os.Message;
+import android.text.Layout;
 import android.text.TextUtils;
+import android.text.method.MovementMethod;
 import android.util.AttributeSet;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -41,9 +42,7 @@ import android.view.ViewGroup.LayoutParams;
 import android.view.ViewParent;
 import android.view.ViewStub;
 import android.view.Window;
-import android.view.WindowInsets;
 import android.view.WindowManager;
-import android.widget.AbsListView;
 import android.widget.AdapterView;
 import android.widget.AdapterView.OnItemClickListener;
 import android.widget.ArrayAdapter;
@@ -59,17 +58,22 @@ import android.widget.ScrollView;
 import android.widget.SimpleCursorAdapter;
 import android.widget.TextView;
 
+import com.android.internal.R;
+
 import java.lang.ref.WeakReference;
 
 public class AlertController {
+    public static final int MICRO = 1;
 
     private final Context mContext;
     private final DialogInterface mDialogInterface;
-    private final Window mWindow;
+    protected final Window mWindow;
 
+    @UnsupportedAppUsage
     private CharSequence mTitle;
-    private CharSequence mMessage;
-    private ListView mListView;
+    protected CharSequence mMessage;
+    protected ListView mListView;
+    @UnsupportedAppUsage
     private View mView;
 
     private int mViewLayoutResId;
@@ -92,16 +96,21 @@ public class AlertController {
     private CharSequence mButtonNeutralText;
     private Message mButtonNeutralMessage;
 
-    private ScrollView mScrollView;
+    protected ScrollView mScrollView;
 
     private int mIconId = 0;
     private Drawable mIcon;
 
     private ImageView mIconView;
     private TextView mTitleView;
-    private TextView mMessageView;
+    protected TextView mMessageView;
+    private MovementMethod mMessageMovementMethod;
+    @Layout.HyphenationFrequency
+    private Integer mMessageHyphenationFrequency;
+    @UnsupportedAppUsage
     private View mCustomTitleView;
 
+    @UnsupportedAppUsage
     private boolean mForceInverseBackground;
 
     private ListAdapter mAdapter;
@@ -114,6 +123,8 @@ public class AlertController {
     private int mMultiChoiceItemLayout;
     private int mSingleChoiceItemLayout;
     private int mListItemLayout;
+
+    private boolean mShowTitle;
 
     private int mButtonPanelLayoutHint = AlertDialog.LAYOUT_HINT_NONE;
 
@@ -150,7 +161,7 @@ public class AlertController {
         private WeakReference<DialogInterface> mDialog;
 
         public ButtonHandler(DialogInterface dialog) {
-            mDialog = new WeakReference<DialogInterface>(dialog);
+            mDialog = new WeakReference<>(dialog);
         }
 
         @Override
@@ -175,7 +186,23 @@ public class AlertController {
         return outValue.data != 0;
     }
 
-    public AlertController(Context context, DialogInterface di, Window window) {
+    public static final AlertController create(Context context, DialogInterface di, Window window) {
+        final TypedArray a = context.obtainStyledAttributes(
+                null, R.styleable.AlertDialog, R.attr.alertDialogStyle,
+                R.style.Theme_DeviceDefault_Settings);
+        int controllerType = a.getInt(R.styleable.AlertDialog_controllerType, 0);
+        a.recycle();
+
+        switch (controllerType) {
+            case MICRO:
+                return new MicroAlertController(context, di, window);
+            default:
+                return new AlertController(context, di, window);
+        }
+    }
+
+    @UnsupportedAppUsage
+    protected AlertController(Context context, DialogInterface di, Window window) {
         mContext = context;
         mDialogInterface = di;
         mWindow = window;
@@ -200,8 +227,12 @@ public class AlertController {
         mListItemLayout = a.getResourceId(
                 R.styleable.AlertDialog_listItemLayout,
                 R.layout.select_dialog_item);
+        mShowTitle = a.getBoolean(R.styleable.AlertDialog_showTitle, true);
 
         a.recycle();
+
+        /* We use a custom title so never request a window title */
+        window.requestFeature(Window.FEATURE_NO_TITLE);
     }
 
     static boolean canTextInput(View v) {
@@ -226,13 +257,16 @@ public class AlertController {
         return false;
     }
 
+    public void installContent(AlertParams params) {
+        params.apply(this);
+        installContent();
+    }
+
+    @UnsupportedAppUsage
     public void installContent() {
-        /* We use a custom title so never request a window title */
-        mWindow.requestFeature(Window.FEATURE_NO_TITLE);
         int contentView = selectContentView();
         mWindow.setContentView(contentView);
         setupView();
-        setupDecor();
     }
 
     private int selectContentView() {
@@ -246,24 +280,43 @@ public class AlertController {
         return mAlertDialogLayout;
     }
 
+    @UnsupportedAppUsage
     public void setTitle(CharSequence title) {
         mTitle = title;
         if (mTitleView != null) {
             mTitleView.setText(title);
         }
+        mWindow.setTitle(title);
     }
 
     /**
      * @see AlertDialog.Builder#setCustomTitle(View)
      */
+    @UnsupportedAppUsage
     public void setCustomTitle(View customTitleView) {
         mCustomTitleView = customTitleView;
     }
 
+    @UnsupportedAppUsage
     public void setMessage(CharSequence message) {
         mMessage = message;
         if (mMessageView != null) {
             mMessageView.setText(message);
+        }
+    }
+
+    public void setMessageMovementMethod(MovementMethod movementMethod) {
+        mMessageMovementMethod = movementMethod;
+        if (mMessageView != null) {
+            mMessageView.setMovementMethod(movementMethod);
+        }
+    }
+
+    public void setMessageHyphenationFrequency(
+            @Layout.HyphenationFrequency int hyphenationFrequency) {
+        mMessageHyphenationFrequency = hyphenationFrequency;
+        if (mMessageView != null) {
+            mMessageView.setHyphenationFrequency(hyphenationFrequency);
         }
     }
 
@@ -279,6 +332,7 @@ public class AlertController {
     /**
      * Set the view to display in the dialog.
      */
+    @UnsupportedAppUsage
     public void setView(View view) {
         mView = view;
         mViewLayoutResId = 0;
@@ -318,6 +372,7 @@ public class AlertController {
      * @param listener The {@link DialogInterface.OnClickListener} to use.
      * @param msg The {@link Message} to be sent when clicked.
      */
+    @UnsupportedAppUsage
     public void setButton(int whichButton, CharSequence text,
             DialogInterface.OnClickListener listener, Message msg) {
 
@@ -353,12 +408,14 @@ public class AlertController {
      * @param resId the resource identifier of the drawable to use as the icon,
      *            or 0 for no icon
      */
+    @UnsupportedAppUsage
     public void setIcon(int resId) {
         mIcon = null;
         mIconId = resId;
 
         if (mIconView != null) {
             if (resId != 0) {
+                mIconView.setVisibility(View.VISIBLE);
                 mIconView.setImageResource(mIconId);
             } else {
                 mIconView.setVisibility(View.GONE);
@@ -371,12 +428,14 @@ public class AlertController {
      *
      * @param icon the drawable to use as the icon or null for no icon
      */
+    @UnsupportedAppUsage
     public void setIcon(Drawable icon) {
         mIcon = icon;
         mIconId = 0;
 
         if (mIconView != null) {
             if (icon != null) {
+                mIconView.setVisibility(View.VISIBLE);
                 mIconView.setImageDrawable(icon);
             } else {
                 mIconView.setVisibility(View.GONE);
@@ -400,10 +459,12 @@ public class AlertController {
         mForceInverseBackground = forceInverseBackground;
     }
 
+    @UnsupportedAppUsage
     public ListView getListView() {
         return mListView;
     }
 
+    @UnsupportedAppUsage
     public Button getButton(int whichButton) {
         switch (whichButton) {
             case DialogInterface.BUTTON_POSITIVE:
@@ -418,34 +479,15 @@ public class AlertController {
     }
 
     @SuppressWarnings({"UnusedDeclaration"})
+    @UnsupportedAppUsage
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         return mScrollView != null && mScrollView.executeKeyEvent(event);
     }
 
     @SuppressWarnings({"UnusedDeclaration"})
+    @UnsupportedAppUsage
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         return mScrollView != null && mScrollView.executeKeyEvent(event);
-    }
-
-    private void setupDecor() {
-        final View decor = mWindow.getDecorView();
-        final View parent = mWindow.findViewById(R.id.parentPanel);
-        if (parent != null && decor != null) {
-            decor.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
-                @Override
-                public WindowInsets onApplyWindowInsets(View view, WindowInsets insets) {
-                    if (insets.isRound()) {
-                        // TODO: Get the padding as a function of the window size.
-                        int roundOffset = mContext.getResources().getDimensionPixelOffset(
-                                R.dimen.alert_dialog_round_padding);
-                        parent.setPadding(roundOffset, roundOffset, roundOffset, roundOffset);
-                    }
-                    return insets.consumeSystemWindowInsets();
-                }
-            });
-            decor.setFitsSystemWindows(true);
-            decor.requestApplyInsets();
-        }
     }
 
     /**
@@ -515,6 +557,13 @@ public class AlertController {
         final boolean hasButtonPanel = buttonPanel != null
                 && buttonPanel.getVisibility() != View.GONE;
 
+        if (!parentPanel.isInTouchMode()) {
+            final View content = hasCustomPanel ? customPanel : contentPanel;
+            if (!requestFocusForContent(content)) {
+                requestFocusForDefaultButton();
+            }
+        }
+
         // Only display the text spacer if we don't have buttons.
         if (!hasButtonPanel) {
             if (contentPanel != null) {
@@ -533,9 +582,15 @@ public class AlertController {
             }
 
             // Only show the divider if we have a title.
-            final View divider;
+            View divider = null;
             if (mMessage != null || mListView != null || hasCustomPanel) {
-                divider = topPanel.findViewById(R.id.titleDivider);
+                if (!hasCustomPanel) {
+                    divider = topPanel.findViewById(R.id.titleDividerNoCustom);
+                }
+                if (divider == null) {
+                    divider = topPanel.findViewById(R.id.titleDivider);
+                }
+
             } else {
                 divider = topPanel.findViewById(R.id.titleDividerTop);
             }
@@ -543,6 +598,17 @@ public class AlertController {
             if (divider != null) {
                 divider.setVisibility(View.VISIBLE);
             }
+        } else {
+            if (contentPanel != null) {
+                final View spacer = contentPanel.findViewById(R.id.textSpacerNoTitle);
+                if (spacer != null) {
+                    spacer.setVisibility(View.VISIBLE);
+                }
+            }
+        }
+
+        if (mListView instanceof RecycleListView) {
+            ((RecycleListView) mListView).setHasDecor(hasTopPanel, hasButtonPanel);
         }
 
         // Update scroll indicators as needed.
@@ -561,6 +627,29 @@ public class AlertController {
         setBackground(a, topPanel, contentPanel, customPanel, buttonPanel,
                 hasTopPanel, hasCustomPanel, hasButtonPanel);
         a.recycle();
+    }
+
+    private boolean requestFocusForContent(View content) {
+        if (content != null && content.requestFocus()) {
+            return true;
+        }
+
+        if (mListView != null) {
+            mListView.setSelection(0);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void requestFocusForDefaultButton() {
+        if (mButtonPositive.getVisibility() == View.VISIBLE) {
+            mButtonPositive.requestFocus();
+        } else if (mButtonNegative.getVisibility() == View.VISIBLE) {
+            mButtonNegative.requestFocus();
+        } else if (mButtonNeutral.getVisibility() == View.VISIBLE) {
+            mButtonNeutral.requestFocus();
+        }
     }
 
     private void setupCustomContent(ViewGroup customPanel) {
@@ -597,22 +686,22 @@ public class AlertController {
         }
     }
 
-    private void setupTitle(ViewGroup topPanel) {
-        if (mCustomTitleView != null) {
+    protected void setupTitle(ViewGroup topPanel) {
+        if (mCustomTitleView != null && mShowTitle) {
             // Add the custom title view directly to the topPanel layout
-            LayoutParams lp = new LayoutParams(
+            final LayoutParams lp = new LayoutParams(
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
 
             topPanel.addView(mCustomTitleView, 0, lp);
 
             // Hide the title template
-            View titleTemplate = mWindow.findViewById(R.id.title_template);
+            final View titleTemplate = mWindow.findViewById(R.id.title_template);
             titleTemplate.setVisibility(View.GONE);
         } else {
             mIconView = (ImageView) mWindow.findViewById(R.id.icon);
 
             final boolean hasTextTitle = !TextUtils.isEmpty(mTitle);
-            if (hasTextTitle) {
+            if (hasTextTitle && mShowTitle) {
                 // Display the title if a title is supplied, else hide it.
                 mTitleView = (TextView) mWindow.findViewById(R.id.alertTitle);
                 mTitleView.setText(mTitle);
@@ -643,7 +732,7 @@ public class AlertController {
         }
     }
 
-    private void setupContent(ViewGroup contentPanel) {
+    protected void setupContent(ViewGroup contentPanel) {
         mScrollView = (ScrollView) contentPanel.findViewById(R.id.scrollView);
         mScrollView.setFocusable(false);
 
@@ -655,6 +744,12 @@ public class AlertController {
 
         if (mMessage != null) {
             mMessageView.setText(mMessage);
+            if (mMessageMovementMethod != null) {
+                mMessageView.setMovementMethod(mMessageMovementMethod);
+            }
+            if (mMessageHyphenationFrequency != null) {
+                mMessageView.setHyphenationFrequency(mMessageHyphenationFrequency);
+            }
         } else {
             mMessageView.setVisibility(View.GONE);
             mScrollView.removeView(mMessageView);
@@ -680,7 +775,7 @@ public class AlertController {
         }
     }
 
-    private void setupButtons(ViewGroup buttonPanel) {
+    protected void setupButtons(ViewGroup buttonPanel) {
         int BIT_BUTTON_POSITIVE = 1;
         int BIT_BUTTON_NEGATIVE = 2;
         int BIT_BUTTON_NEUTRAL = 4;
@@ -872,29 +967,43 @@ public class AlertController {
             final int checkedItem = mCheckedItem;
             if (checkedItem > -1) {
                 listView.setItemChecked(checkedItem, true);
-                listView.setSelection(checkedItem);
+                listView.setSelectionFromTop(checkedItem,
+                        a.getDimensionPixelSize(R.styleable.AlertDialog_selectionScrollOffset, 0));
             }
         }
     }
 
     public static class RecycleListView extends ListView {
+        private final int mPaddingTopNoTitle;
+        private final int mPaddingBottomNoButtons;
+
         boolean mRecycleOnMeasure = true;
 
+        @UnsupportedAppUsage
         public RecycleListView(Context context) {
-            super(context);
+            this(context, null);
         }
 
+        @UnsupportedAppUsage
         public RecycleListView(Context context, AttributeSet attrs) {
             super(context, attrs);
+
+            final TypedArray ta = context.obtainStyledAttributes(
+                    attrs, R.styleable.RecycleListView);
+            mPaddingBottomNoButtons = ta.getDimensionPixelOffset(
+                    R.styleable.RecycleListView_paddingBottomNoButtons, -1);
+            mPaddingTopNoTitle = ta.getDimensionPixelOffset(
+                    R.styleable.RecycleListView_paddingTopNoTitle, -1);
         }
 
-        public RecycleListView(Context context, AttributeSet attrs, int defStyleAttr) {
-            super(context, attrs, defStyleAttr);
-        }
-
-        public RecycleListView(
-                Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
-            super(context, attrs, defStyleAttr, defStyleRes);
+        public void setHasDecor(boolean hasTitle, boolean hasButtons) {
+            if (!hasButtons || !hasTitle) {
+                final int paddingLeft = getPaddingLeft();
+                final int paddingTop = hasTitle ? getPaddingTop() : mPaddingTopNoTitle;
+                final int paddingRight = getPaddingRight();
+                final int paddingBottom = hasButtons ? getPaddingBottom() : mPaddingBottomNoButtons;
+                setPadding(paddingLeft, paddingTop, paddingRight, paddingBottom);
+            }
         }
 
         @Override
@@ -904,44 +1013,74 @@ public class AlertController {
     }
 
     public static class AlertParams {
+        @UnsupportedAppUsage
         public final Context mContext;
+        @UnsupportedAppUsage
         public final LayoutInflater mInflater;
 
+        @UnsupportedAppUsage
         public int mIconId = 0;
+        @UnsupportedAppUsage
         public Drawable mIcon;
         public int mIconAttrId = 0;
+        @UnsupportedAppUsage
         public CharSequence mTitle;
+        @UnsupportedAppUsage
         public View mCustomTitleView;
+        @UnsupportedAppUsage
         public CharSequence mMessage;
+        @UnsupportedAppUsage
         public CharSequence mPositiveButtonText;
+        @UnsupportedAppUsage
         public DialogInterface.OnClickListener mPositiveButtonListener;
+        @UnsupportedAppUsage
         public CharSequence mNegativeButtonText;
+        @UnsupportedAppUsage
         public DialogInterface.OnClickListener mNegativeButtonListener;
+        @UnsupportedAppUsage
         public CharSequence mNeutralButtonText;
+        @UnsupportedAppUsage
         public DialogInterface.OnClickListener mNeutralButtonListener;
+        @UnsupportedAppUsage
         public boolean mCancelable;
+        @UnsupportedAppUsage
         public DialogInterface.OnCancelListener mOnCancelListener;
+        @UnsupportedAppUsage
         public DialogInterface.OnDismissListener mOnDismissListener;
+        @UnsupportedAppUsage
         public DialogInterface.OnKeyListener mOnKeyListener;
+        @UnsupportedAppUsage
         public CharSequence[] mItems;
+        @UnsupportedAppUsage
         public ListAdapter mAdapter;
+        @UnsupportedAppUsage
         public DialogInterface.OnClickListener mOnClickListener;
         public int mViewLayoutResId;
+        @UnsupportedAppUsage
         public View mView;
         public int mViewSpacingLeft;
         public int mViewSpacingTop;
         public int mViewSpacingRight;
         public int mViewSpacingBottom;
         public boolean mViewSpacingSpecified = false;
+        @UnsupportedAppUsage
         public boolean[] mCheckedItems;
+        @UnsupportedAppUsage
         public boolean mIsMultiChoice;
+        @UnsupportedAppUsage
         public boolean mIsSingleChoice;
+        @UnsupportedAppUsage
         public int mCheckedItem = -1;
+        @UnsupportedAppUsage
         public DialogInterface.OnMultiChoiceClickListener mOnCheckboxClickListener;
+        @UnsupportedAppUsage
         public Cursor mCursor;
+        @UnsupportedAppUsage
         public String mLabelColumn;
+        @UnsupportedAppUsage
         public String mIsCheckedColumn;
         public boolean mForceInverseBackground;
+        @UnsupportedAppUsage
         public AdapterView.OnItemSelectedListener mOnItemSelectedListener;
         public OnPrepareListViewListener mOnPrepareListViewListener;
         public boolean mRecycleOnMeasure = true;
@@ -959,12 +1098,14 @@ public class AlertController {
             void onPrepareListView(ListView listView);
         }
 
+        @UnsupportedAppUsage
         public AlertParams(Context context) {
             mContext = context;
             mCancelable = true;
             mInflater = (LayoutInflater) context.getSystemService(Context.LAYOUT_INFLATER_SERVICE);
         }
 
+        @UnsupportedAppUsage
         public void apply(AlertController dialog) {
             if (mCustomTitleView != null) {
                 dialog.setCustomTitle(mCustomTitleView);
@@ -1061,7 +1202,8 @@ public class AlertController {
                         public void bindView(View view, Context context, Cursor cursor) {
                             CheckedTextView text = (CheckedTextView) view.findViewById(R.id.text1);
                             text.setText(cursor.getString(mLabelIndex));
-                            listView.setItemChecked(cursor.getPosition(),
+                            listView.setItemChecked(
+                                    cursor.getPosition(),
                                     cursor.getInt(mIsCheckedIndex) == 1);
                         }
 

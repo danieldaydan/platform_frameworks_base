@@ -49,13 +49,6 @@ abstract class DisplayAdapter {
      */
     private static final AtomicInteger NEXT_DISPLAY_MODE_ID = new AtomicInteger(1);  // 0 = no mode.
 
-    /**
-     * Used to generate globally unique color transform ids.
-     *
-     * Valid IDs start at 1 with 0 as the sentinel value for the default mode.
-     */
-    private static final AtomicInteger NEXT_COLOR_TRANSFORM_ID = new AtomicInteger(1);
-
     // Called with SyncRoot lock held.
     public DisplayAdapter(DisplayManagerService.SyncRoot syncRoot,
             Context context, Handler handler, Listener listener, String name) {
@@ -116,24 +109,14 @@ abstract class DisplayAdapter {
      */
     protected final void sendDisplayDeviceEventLocked(
             final DisplayDevice device, final int event) {
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                mListener.onDisplayDeviceEvent(device, event);
-            }
-        });
+        mHandler.post(() -> mListener.onDisplayDeviceEvent(device, event));
     }
 
     /**
      * Sends a request to perform traversals.
      */
     protected final void sendTraversalRequestLocked() {
-        mHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                mListener.onTraversalRequested();
-            }
-        });
+        mHandler.post(() -> mListener.onTraversalRequested());
     }
 
     public static Display.Mode createMode(int width, int height, float refreshRate) {
@@ -141,13 +124,8 @@ abstract class DisplayAdapter {
                 NEXT_DISPLAY_MODE_ID.getAndIncrement(), width, height, refreshRate);
     }
 
-    public static Display.ColorTransform createColorTransform(int colorTransform) {
-        return new Display.ColorTransform(
-                NEXT_COLOR_TRANSFORM_ID.getAndIncrement(), colorTransform);
-    }
-
     public interface Listener {
-        public void onDisplayDeviceEvent(DisplayDevice device, int event);
-        public void onTraversalRequested();
+        void onDisplayDeviceEvent(DisplayDevice device, int event);
+        void onTraversalRequested();
     }
 }

@@ -73,7 +73,6 @@ final class StrictModeViolationDialog extends BaseErrorDialog {
                       mHandler.obtainMessage(ACTION_OK_AND_REPORT));
         }
 
-        setTitle(res.getText(com.android.internal.R.string.aerr_title));
         getWindow().addPrivateFlags(PRIVATE_FLAG_SYSTEM_ERROR);
         getWindow().setTitle("Strict Mode Violation: " + app.info.processName);
 
@@ -86,8 +85,8 @@ final class StrictModeViolationDialog extends BaseErrorDialog {
     private final Handler mHandler = new Handler() {
         public void handleMessage(Message msg) {
             synchronized (mService) {
-                if (mProc != null && mProc.crashDialog == StrictModeViolationDialog.this) {
-                    mProc.crashDialog = null;
+                if (mProc != null) {
+                    mProc.getDialogController().clearViolationDialogs();
                 }
             }
             mResult.set(msg.what);

@@ -20,10 +20,14 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession;
 import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraOfflineSession;
+import android.hardware.camera2.CameraOfflineSession.CameraOfflineSessionCallback;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.hardware.camera2.utils.SurfaceUtils;
 import android.os.Handler;
+import android.os.ConditionVariable;
 import android.util.Range;
 import android.view.Surface;
 
@@ -32,6 +36,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.Executor;
 
 import static com.android.internal.util.Preconditions.*;
 
@@ -49,6 +54,7 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
         extends CameraConstrainedHighSpeedCaptureSession implements CameraCaptureSessionCore {
     private final CameraCharacteristics mCharacteristics;
     private final CameraCaptureSessionImpl mSessionImpl;
+    private final ConditionVariable mInitialized = new ConditionVariable();
 
     /**
      * Create a new CameraCaptureSession.
@@ -57,15 +63,16 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
      * There must be no pending actions
      * (e.g. no pending captures, no repeating requests, no flush).</p>
      */
-    CameraConstrainedHighSpeedCaptureSessionImpl(int id, List<Surface> outputs,
-            CameraCaptureSession.StateCallback callback, Handler stateHandler,
+    CameraConstrainedHighSpeedCaptureSessionImpl(int id,
+            CameraCaptureSession.StateCallback callback, Executor stateExecutor,
             android.hardware.camera2.impl.CameraDeviceImpl deviceImpl,
-            Handler deviceStateHandler, boolean configureSuccess,
+            Executor deviceStateExecutor, boolean configureSuccess,
             CameraCharacteristics characteristics) {
         mCharacteristics = characteristics;
         CameraCaptureSession.StateCallback wrapperCallback = new WrapperCallback(callback);
-        mSessionImpl = new CameraCaptureSessionImpl(id, /*input*/null, outputs, wrapperCallback,
-                stateHandler, deviceImpl, deviceStateHandler, configureSuccess);
+        mSessionImpl = new CameraCaptureSessionImpl(id, /*input*/null, wrapperCallback,
+                stateExecutor, deviceImpl, deviceStateExecutor, configureSuccess);
+        mInitialized.open();
     }
 
     @Override
@@ -93,7 +100,10 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
         // Note that after this step, the requestMetadata is mutated (swapped) and can not be used
         // for next request builder creation.
         CaptureRequest.Builder singleTargetRequestBuilder = new CaptureRequest.Builder(
-                requestMetadata, /*reprocess*/false, CameraCaptureSession.SESSION_ID_NONE);
+                requestMetadata, /*reprocess*/false, CameraCaptureSession.SESSION_ID_NONE,
+                request.getLogicalCameraId(), /*physicalCameraIdSet*/ null);
+        // Carry over userTag, as native metadata doesn't have this field.
+        singleTargetRequestBuilder.setTag(request.getTag());
 
         // Overwrite the capture intent to make sure a good value is set.
         Iterator<Surface> iterator = outputSurfaces.iterator();
@@ -116,7 +126,9 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
             // CaptureRequest.Builder creation.
             requestMetadata = new CameraMetadataNative(request.getNativeCopy());
             doubleTargetRequestBuilder = new CaptureRequest.Builder(
-                    requestMetadata, /*reprocess*/false, CameraCaptureSession.SESSION_ID_NONE);
+                    requestMetadata, /*reprocess*/false, CameraCaptureSession.SESSION_ID_NONE,
+                    request.getLogicalCameraId(), /*physicalCameraIdSet*/null);
+            doubleTargetRequestBuilder.setTag(request.getTag());
             doubleTargetRequestBuilder.set(CaptureRequest.CONTROL_CAPTURE_INTENT,
                     CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD);
             doubleTargetRequestBuilder.addTarget(firstSurface);
@@ -186,6 +198,13 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
     }
 
     @Override
+    public int captureSingleRequest(CaptureRequest request, Executor executor,
+            CaptureCallback listener) throws CameraAccessException {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support"
+                + " this method");
+    }
+
+    @Override
     public int captureBurst(List<CaptureRequest> requests, CaptureCallback listener,
             Handler handler) throws CameraAccessException {
         if (!isConstrainedHighSpeedRequestList(requests)) {
@@ -197,8 +216,26 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
     }
 
     @Override
+    public int captureBurstRequests(List<CaptureRequest> requests, Executor executor,
+            CaptureCallback listener) throws CameraAccessException {
+        if (!isConstrainedHighSpeedRequestList(requests)) {
+            throw new IllegalArgumentException(
+                "Only request lists created by createHighSpeedRequestList() can be submitted to " +
+                "a constrained high speed capture session");
+        }
+        return mSessionImpl.captureBurstRequests(requests, executor, listener);
+    }
+
+    @Override
     public int setRepeatingRequest(CaptureRequest request, CaptureCallback listener,
             Handler handler) throws CameraAccessException {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support"
+                + " this method");
+    }
+
+    @Override
+    public int setSingleRepeatingRequest(CaptureRequest request, Executor executor,
+            CaptureCallback listener) throws CameraAccessException {
         throw new UnsupportedOperationException("Constrained high speed session doesn't support"
                 + " this method");
     }
@@ -215,6 +252,17 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
     }
 
     @Override
+    public int setRepeatingBurstRequests(List<CaptureRequest> requests, Executor executor,
+            CaptureCallback listener) throws CameraAccessException {
+        if (!isConstrainedHighSpeedRequestList(requests)) {
+            throw new IllegalArgumentException(
+                "Only request lists created by createHighSpeedRequestList() can be submitted to " +
+                "a constrained high speed capture session");
+        }
+        return mSessionImpl.setRepeatingBurstRequests(requests, executor, listener);
+    }
+
+    @Override
     public void stopRepeating() throws CameraAccessException {
         mSessionImpl.stopRepeating();
     }
@@ -227,6 +275,32 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
     @Override
     public Surface getInputSurface() {
         return null;
+    }
+
+    @Override
+    public void updateOutputConfiguration(OutputConfiguration config)
+            throws CameraAccessException {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support"
+                + " this method");
+    }
+
+    @Override
+    public CameraOfflineSession switchToOffline(Collection<Surface> offlineOutputs,
+            Executor executor, CameraOfflineSessionCallback listener) throws CameraAccessException {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support"
+                + " this method");
+    }
+
+    @Override
+    public boolean supportsOfflineProcessing(Surface surface) {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support" +
+                " offline mode");
+    }
+
+    @Override
+    public void closeWithoutDraining() {
+        throw new UnsupportedOperationException("Constrained high speed session doesn't support"
+                + " this method");
     }
 
     @Override
@@ -256,6 +330,12 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
         return mSessionImpl.isAborting();
     }
 
+    @Override
+    public void finalizeOutputConfigurations(List<OutputConfiguration> deferredOutputConfigs)
+            throws CameraAccessException {
+        mSessionImpl.finalizeOutputConfigurations(deferredOutputConfigs);
+    }
+
     private class WrapperCallback extends StateCallback {
         private final StateCallback mCallback;
 
@@ -263,31 +343,42 @@ public class CameraConstrainedHighSpeedCaptureSessionImpl
             mCallback = callback;
         }
 
+        @Override
         public void onConfigured(CameraCaptureSession session) {
+            mInitialized.block();
             mCallback.onConfigured(CameraConstrainedHighSpeedCaptureSessionImpl.this);
         }
 
+        @Override
         public void onConfigureFailed(CameraCaptureSession session) {
+            mInitialized.block();
             mCallback.onConfigureFailed(CameraConstrainedHighSpeedCaptureSessionImpl.this);
         }
 
+        @Override
         public void onReady(CameraCaptureSession session) {
             mCallback.onReady(CameraConstrainedHighSpeedCaptureSessionImpl.this);
         }
 
+        @Override
         public void onActive(CameraCaptureSession session) {
             mCallback.onActive(CameraConstrainedHighSpeedCaptureSessionImpl.this);
         }
 
+        @Override
+        public void onCaptureQueueEmpty(CameraCaptureSession session) {
+            mCallback.onCaptureQueueEmpty(CameraConstrainedHighSpeedCaptureSessionImpl.this);
+        }
+
+        @Override
         public void onClosed(CameraCaptureSession session) {
             mCallback.onClosed(CameraConstrainedHighSpeedCaptureSessionImpl.this);
         }
 
+        @Override
         public void onSurfacePrepared(CameraCaptureSession session, Surface surface) {
             mCallback.onSurfacePrepared(CameraConstrainedHighSpeedCaptureSessionImpl.this,
                     surface);
         }
-
-
     }
 }

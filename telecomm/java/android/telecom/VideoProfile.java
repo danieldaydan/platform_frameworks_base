@@ -16,13 +16,25 @@
 
 package android.telecom;
 
+import android.annotation.FloatRange;
+import android.annotation.IntDef;
+import android.annotation.IntRange;
 import android.os.Parcel;
 import android.os.Parcelable;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 /**
  * Represents attributes of video calls.
  */
 public class VideoProfile implements Parcelable {
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({QUALITY_UNKNOWN, QUALITY_HIGH, QUALITY_MEDIUM, QUALITY_LOW, QUALITY_DEFAULT})
+    public @interface VideoQuality {}
+
     /**
      * "Unknown" video quality.
      * @hide
@@ -47,6 +59,15 @@ public class VideoProfile implements Parcelable {
      * Use default video quality.
      */
     public static final int QUALITY_DEFAULT = 4;
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(
+            flag = true,
+            prefix = { "STATE_" },
+            value = {STATE_AUDIO_ONLY, STATE_TX_ENABLED, STATE_RX_ENABLED, STATE_BIDIRECTIONAL,
+                    STATE_PAUSED})
+    public @interface VideoState {}
 
     /**
      * Used when answering or dialing a call to indicate that the call does not have a video
@@ -107,7 +128,7 @@ public class VideoProfile implements Parcelable {
      *
      * @param videoState The video state.
      */
-    public VideoProfile(int videoState) {
+    public VideoProfile(@VideoState int videoState) {
         this(videoState, QUALITY_DEFAULT);
     }
 
@@ -117,7 +138,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @param quality The video quality.
      */
-    public VideoProfile(int videoState, int quality) {
+    public VideoProfile(@VideoState int videoState, @VideoQuality int quality) {
         mVideoState = videoState;
         mQuality = quality;
     }
@@ -130,6 +151,7 @@ public class VideoProfile implements Parcelable {
      * {@link VideoProfile#STATE_RX_ENABLED},
      * {@link VideoProfile#STATE_PAUSED}.
      */
+    @VideoState
     public int getVideoState() {
         return mVideoState;
     }
@@ -139,6 +161,7 @@ public class VideoProfile implements Parcelable {
      * Valid values: {@link VideoProfile#QUALITY_HIGH}, {@link VideoProfile#QUALITY_MEDIUM},
      * {@link VideoProfile#QUALITY_LOW}, {@link VideoProfile#QUALITY_DEFAULT}.
      */
+    @VideoQuality
     public int getQuality() {
         return mQuality;
     }
@@ -146,7 +169,7 @@ public class VideoProfile implements Parcelable {
     /**
      * Responsible for creating VideoProfile objects from deserialized Parcels.
      **/
-    public static final Parcelable.Creator<VideoProfile> CREATOR =
+    public static final @android.annotation.NonNull Parcelable.Creator<VideoProfile> CREATOR =
             new Parcelable.Creator<VideoProfile> () {
                 /**
                  * Creates a MediaProfile instances from a parcel.
@@ -211,11 +234,11 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return String representation of the video state.
      */
-    public static String videoStateToString(int videoState) {
+    public static String videoStateToString(@VideoState int videoState) {
         StringBuilder sb = new StringBuilder();
         sb.append("Audio");
 
-        if (isAudioOnly(videoState)) {
+        if (videoState == STATE_AUDIO_ONLY) {
             sb.append(" Only");
         } else {
             if (isTransmissionEnabled(videoState)) {
@@ -236,11 +259,14 @@ public class VideoProfile implements Parcelable {
 
     /**
      * Indicates whether the video state is audio only.
+     * <p>
+     * Note: Considers only whether either both the {@link #STATE_RX_ENABLED} or
+     * {@link #STATE_TX_ENABLED} bits are off, but not {@link #STATE_PAUSED}.
      *
      * @param videoState The video state.
      * @return {@code True} if the video state is audio only, {@code false} otherwise.
      */
-    public static boolean isAudioOnly(int videoState) {
+    public static boolean isAudioOnly(@VideoState int videoState) {
         return !hasState(videoState, VideoProfile.STATE_TX_ENABLED)
                 && !hasState(videoState, VideoProfile.STATE_RX_ENABLED);
     }
@@ -251,7 +277,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return {@code True} if video transmission or reception is enabled, {@code false} otherwise.
      */
-    public static boolean isVideo(int videoState) {
+    public static boolean isVideo(@VideoState int videoState) {
         return hasState(videoState, VideoProfile.STATE_TX_ENABLED)
                 || hasState(videoState, VideoProfile.STATE_RX_ENABLED)
                 || hasState(videoState, VideoProfile.STATE_BIDIRECTIONAL);
@@ -263,7 +289,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return {@code True} if video transmission is enabled, {@code false} otherwise.
      */
-    public static boolean isTransmissionEnabled(int videoState) {
+    public static boolean isTransmissionEnabled(@VideoState int videoState) {
         return hasState(videoState, VideoProfile.STATE_TX_ENABLED);
     }
 
@@ -273,7 +299,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return {@code True} if video reception is enabled, {@code false} otherwise.
      */
-    public static boolean isReceptionEnabled(int videoState) {
+    public static boolean isReceptionEnabled(@VideoState int videoState) {
         return hasState(videoState, VideoProfile.STATE_RX_ENABLED);
     }
 
@@ -283,7 +309,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return {@code True} if the video is bi-directional, {@code false} otherwise.
      */
-    public static boolean isBidirectional(int videoState) {
+    public static boolean isBidirectional(@VideoState int videoState) {
         return hasState(videoState, VideoProfile.STATE_BIDIRECTIONAL);
     }
 
@@ -293,7 +319,7 @@ public class VideoProfile implements Parcelable {
      * @param videoState The video state.
      * @return {@code True} if the video is paused, {@code false} otherwise.
      */
-    public static boolean isPaused(int videoState) {
+    public static boolean isPaused(@VideoState int videoState) {
         return hasState(videoState, VideoProfile.STATE_PAUSED);
     }
 
@@ -304,7 +330,7 @@ public class VideoProfile implements Parcelable {
      * @param state The state to check.
      * @return {@code True} if the state is set.
      */
-    private static boolean hasState(int videoState, int state) {
+    private static boolean hasState(@VideoState int videoState, @VideoState int state) {
         return (videoState & state) == state;
     }
 
@@ -339,21 +365,20 @@ public class VideoProfile implements Parcelable {
          * @param width The width of the camera video (in pixels).
          * @param height The height of the camera video (in pixels).
          */
-        public CameraCapabilities(int width, int height) {
+        public CameraCapabilities(@IntRange(from = 0) int width, @IntRange(from = 0) int height) {
             this(width, height, false, 1.0f);
         }
 
         /**
-         * Create a call camera capabilities instance that optionally
-         * supports zoom.
+         * Create a call camera capabilities instance that optionally supports zoom.
          *
          * @param width The width of the camera video (in pixels).
          * @param height The height of the camera video (in pixels).
          * @param zoomSupported True when camera supports zoom.
          * @param maxZoom Maximum zoom supported by camera.
-         * @hide
          */
-        public CameraCapabilities(int width, int height, boolean zoomSupported, float maxZoom) {
+        public CameraCapabilities(@IntRange(from = 0) int width,  @IntRange(from = 0) int height,
+                                   boolean zoomSupported,  @FloatRange(from = 1.0f) float maxZoom) {
             mWidth = width;
             mHeight = height;
             mZoomSupported = zoomSupported;
@@ -363,7 +388,7 @@ public class VideoProfile implements Parcelable {
         /**
          * Responsible for creating CallCameraCapabilities objects from deserialized Parcels.
          **/
-        public static final Parcelable.Creator<CameraCapabilities> CREATOR =
+        public static final @android.annotation.NonNull Parcelable.Creator<CameraCapabilities> CREATOR =
                 new Parcelable.Creator<CameraCapabilities> () {
                     /**
                      * Creates a CallCameraCapabilities instances from a parcel.
@@ -429,16 +454,14 @@ public class VideoProfile implements Parcelable {
         }
 
         /**
-         * Whether the camera supports zoom.
-         * @hide
+         * Returns {@code true} is zoom is supported, {@code false} otherwise.
          */
         public boolean isZoomSupported() {
             return mZoomSupported;
         }
 
         /**
-         * The maximum zoom supported by the camera.
-         * @hide
+         * Returns the maximum zoom supported by the camera.
          */
         public float getMaxZoom() {
             return mMaxZoom;

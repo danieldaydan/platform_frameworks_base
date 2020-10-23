@@ -16,10 +16,13 @@
 package com.android.server.hdmi;
 
 import android.hardware.hdmi.HdmiControlManager;
-import android.hardware.hdmi.IHdmiControlCallback;
 import android.hardware.hdmi.HdmiPlaybackClient.OneTouchPlayCallback;
+import android.hardware.hdmi.IHdmiControlCallback;
 import android.os.RemoteException;
 import android.util.Slog;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Feature action that performs one touch play against TV/Display device. This action is initiated
@@ -47,12 +50,12 @@ final class OneTouchPlayAction extends HdmiCecFeatureAction {
     private static final int LOOP_COUNTER_MAX = 10;
 
     private final int mTargetAddress;
-    private final IHdmiControlCallback mCallback;
+    private final List<IHdmiControlCallback> mCallbacks = new ArrayList<>();
 
     private int mPowerStatusCounter = 0;
 
     // Factory method. Ensures arguments are valid.
-    static OneTouchPlayAction create(HdmiCecLocalDevicePlayback source,
+    static OneTouchPlayAction create(HdmiCecLocalDeviceSource source,
             int targetAddress, IHdmiControlCallback callback) {
         if (source == null || callback == null) {
             Slog.e(TAG, "Wrong arguments");
@@ -66,7 +69,7 @@ final class OneTouchPlayAction extends HdmiCecFeatureAction {
             IHdmiControlCallback callback) {
         super(localDevice);
         mTargetAddress = targetAddress;
-        mCallback = callback;
+        addCallback(callback);
     }
 
     @Override
@@ -74,18 +77,28 @@ final class OneTouchPlayAction extends HdmiCecFeatureAction {
         sendCommand(HdmiCecMessageBuilder.buildTextViewOn(getSourceAddress(), mTargetAddress));
         broadcastActiveSource();
         queryDevicePowerStatus();
-        mState = STATE_WAITING_FOR_REPORT_POWER_STATUS;
         addTimer(mState, HdmiConfig.TIMEOUT_MS);
         return true;
     }
 
     private void broadcastActiveSource() {
-        sendCommand(HdmiCecMessageBuilder.buildActiveSource(getSourceAddress(), getSourcePath()));
-        // Because only playback device can create this action, it's safe to cast.
-        playback().setActiveSource(true);
+        // Because only source device can create this action, it's safe to cast.
+        HdmiCecLocalDeviceSource source = source();
+        source.mService.setAndBroadcastActiveSourceFromOneDeviceType(
+                mTargetAddress, getSourcePath());
+        // When OneTouchPlay is called, client side should be responsible to send out the intent
+        // of which internal source, for example YouTube, it would like to switch to.
+        // Here we only update the active port and the active source records in the local
+        // device as well as claiming Active Source.
+        if (source.mService.audioSystem() != null) {
+            source = source.mService.audioSystem();
+        }
+        source.setRoutingPort(Constants.CEC_SWITCH_HOME);
+        source.setLocalActivePort(Constants.CEC_SWITCH_HOME);
     }
 
     private void queryDevicePowerStatus() {
+        mState = STATE_WAITING_FOR_REPORT_POWER_STATUS;
         sendCommand(HdmiCecMessageBuilder.buildGiveDevicePowerStatus(getSourceAddress(),
                 mTargetAddress));
     }
@@ -125,9 +138,15 @@ final class OneTouchPlayAction extends HdmiCecFeatureAction {
         }
     }
 
+    public void addCallback(IHdmiControlCallback callback) {
+        mCallbacks.add(callback);
+    }
+
     private void invokeCallback(int result) {
         try {
-            mCallback.onComplete(result);
+            for (IHdmiControlCallback callback : mCallbacks) {
+                callback.onComplete(result);
+            }
         } catch (RemoteException e) {
             Slog.e(TAG, "Callback failed:" + e);
         }

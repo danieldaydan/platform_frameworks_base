@@ -20,17 +20,26 @@
 #include <system/audio.h>
 
 // keep these values in sync with AudioFormat.java
-#define ENCODING_PCM_16BIT  2
-#define ENCODING_PCM_8BIT   3
-#define ENCODING_PCM_FLOAT  4
-#define ENCODING_AC3        5
-#define ENCODING_E_AC3      6
-#define ENCODING_DTS        7
-#define ENCODING_DTS_HD     8
-#define ENCODING_MP3        9
-#define ENCODING_AAC_LC     10
-#define ENCODING_AAC_HE_V1  11
-#define ENCODING_AAC_HE_V2  12
+#define ENCODING_PCM_16BIT      2
+#define ENCODING_PCM_8BIT       3
+#define ENCODING_PCM_FLOAT      4
+#define ENCODING_AC3            5
+#define ENCODING_E_AC3          6
+#define ENCODING_DTS            7
+#define ENCODING_DTS_HD         8
+#define ENCODING_MP3            9
+#define ENCODING_AAC_LC         10
+#define ENCODING_AAC_HE_V1      11
+#define ENCODING_AAC_HE_V2      12
+#define ENCODING_IEC61937       13
+#define ENCODING_DOLBY_TRUEHD   14
+#define ENCODING_AAC_ELD        15
+#define ENCODING_AAC_XHE        16
+#define ENCODING_AC4            17
+#define ENCODING_E_AC3_JOC      18
+#define ENCODING_DOLBY_MAT      19
+#define ENCODING_OPUS           20
+
 #define ENCODING_INVALID    0
 #define ENCODING_DEFAULT    1
 
@@ -38,6 +47,7 @@
 
 #define CHANNEL_INVALID 0
 #define CHANNEL_OUT_DEFAULT 1
+#define CHANNEL_IN_DEFAULT 1
 
 static inline audio_format_t audioFormatToNative(int audioFormat)
 {
@@ -64,8 +74,24 @@ static inline audio_format_t audioFormatToNative(int audioFormat)
         return AUDIO_FORMAT_AAC_HE_V1;
     case ENCODING_AAC_HE_V2:
         return AUDIO_FORMAT_AAC_HE_V2;
+    case ENCODING_IEC61937:
+        return AUDIO_FORMAT_IEC61937;
+    case ENCODING_DOLBY_TRUEHD:
+        return AUDIO_FORMAT_DOLBY_TRUEHD;
+    case ENCODING_AAC_ELD:
+        return AUDIO_FORMAT_AAC_ELD;
+    case ENCODING_AAC_XHE:
+        return AUDIO_FORMAT_AAC_XHE;
+    case ENCODING_AC4:
+        return AUDIO_FORMAT_AC4;
+    case ENCODING_E_AC3_JOC:
+        return AUDIO_FORMAT_E_AC3_JOC;
     case ENCODING_DEFAULT:
         return AUDIO_FORMAT_DEFAULT;
+    case ENCODING_DOLBY_MAT:
+        return AUDIO_FORMAT_MAT;
+    case ENCODING_OPUS:
+        return AUDIO_FORMAT_OPUS;
     default:
         return AUDIO_FORMAT_INVALID;
     }
@@ -103,11 +129,49 @@ static inline int audioFormatFromNative(audio_format_t nativeFormat)
         return ENCODING_AAC_HE_V1;
     case AUDIO_FORMAT_AAC_HE_V2:
         return ENCODING_AAC_HE_V2;
+    case AUDIO_FORMAT_IEC61937:
+        return ENCODING_IEC61937;
+    case AUDIO_FORMAT_DOLBY_TRUEHD:
+        return ENCODING_DOLBY_TRUEHD;
+    case AUDIO_FORMAT_AAC_ELD:
+        return ENCODING_AAC_ELD;
+    case AUDIO_FORMAT_AAC_XHE:
+        return ENCODING_AAC_XHE;
+    case AUDIO_FORMAT_AC4:
+        return ENCODING_AC4;
+    case AUDIO_FORMAT_E_AC3_JOC:
+        return ENCODING_E_AC3_JOC;
+    case AUDIO_FORMAT_MAT:
+    case AUDIO_FORMAT_MAT_1_0:
+    case AUDIO_FORMAT_MAT_2_0:
+    case AUDIO_FORMAT_MAT_2_1:
+        return ENCODING_DOLBY_MAT;
+    case AUDIO_FORMAT_OPUS:
+        return ENCODING_OPUS;
     case AUDIO_FORMAT_DEFAULT:
         return ENCODING_DEFAULT;
     default:
         return ENCODING_INVALID;
     }
+}
+
+// This function converts Java channel masks to a native channel mask.
+// validity should be checked with audio_is_output_channel().
+static inline audio_channel_mask_t nativeChannelMaskFromJavaChannelMasks(
+        jint channelPositionMask, jint channelIndexMask)
+{
+    // 0 is the java android.media.AudioFormat.CHANNEL_INVALID value
+    if (channelIndexMask != 0) {  // channel index mask takes priority
+        // To convert to a native channel mask, the Java channel index mask
+        // requires adding the index representation.
+        return audio_channel_mask_from_representation_and_bits(
+                        AUDIO_CHANNEL_REPRESENTATION_INDEX,
+                        channelIndexMask);
+    }
+    // To convert to a native channel mask, the Java channel position mask
+    // requires a shift by 2 to skip the two deprecated channel
+    // configurations "default" and "mono".
+    return (audio_channel_mask_t)((uint32_t)channelPositionMask >> 2);
 }
 
 static inline audio_channel_mask_t outChannelMaskToNative(int channelMask)
@@ -133,12 +197,22 @@ static inline int outChannelMaskFromNative(audio_channel_mask_t nativeMask)
 
 static inline audio_channel_mask_t inChannelMaskToNative(int channelMask)
 {
-    return (audio_channel_mask_t)channelMask;
+    switch (channelMask) {
+        case CHANNEL_IN_DEFAULT:
+            return AUDIO_CHANNEL_NONE;
+        default:
+            return (audio_channel_mask_t)channelMask;
+    }
 }
 
 static inline int inChannelMaskFromNative(audio_channel_mask_t nativeMask)
 {
-    return (int)nativeMask;
+    switch (nativeMask) {
+        case AUDIO_CHANNEL_NONE:
+            return CHANNEL_IN_DEFAULT;
+        default:
+            return (int)nativeMask;
+    }
 }
 
 #endif // ANDROID_MEDIA_AUDIOFORMAT_H

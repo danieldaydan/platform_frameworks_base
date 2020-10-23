@@ -21,7 +21,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.test.AndroidTestCase;
-import android.test.suitebuilder.annotation.MediumTest;
 import android.util.Log;
 
 import java.io.File;
@@ -109,7 +108,7 @@ public class BinderThreadPriorityTest extends AndroidTestCase {
     }
 
     public static String expectedSchedulerGroup(int prio) {
-        return prio < Process.THREAD_PRIORITY_BACKGROUND ? "/" : "/bg_non_interactive";
+        return "/";
     }
 
     public void testPassPriorityToService() throws Exception {

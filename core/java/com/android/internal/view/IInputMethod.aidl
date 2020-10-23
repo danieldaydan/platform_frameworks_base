@@ -22,9 +22,12 @@ import android.view.InputChannel;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputBinding;
 import android.view.inputmethod.InputMethodSubtype;
+import com.android.internal.inputmethod.IInputMethodPrivilegedOperations;
+import com.android.internal.view.IInlineSuggestionsRequestCallback;
 import com.android.internal.view.IInputContext;
 import com.android.internal.view.IInputMethodSession;
 import com.android.internal.view.IInputSessionCallback;
+import com.android.internal.view.InlineSuggestionsRequestInfo;
 
 /**
  * Top-level interface to an input method component (implemented in a
@@ -32,15 +35,17 @@ import com.android.internal.view.IInputSessionCallback;
  * {@hide}
  */
 oneway interface IInputMethod {
-    void attachToken(IBinder token);
+    void initializeInternal(IBinder token, int displayId, IInputMethodPrivilegedOperations privOps);
+
+    void onCreateInlineSuggestionsRequest(in InlineSuggestionsRequestInfo requestInfo,
+            in IInlineSuggestionsRequestCallback cb);
 
     void bindInput(in InputBinding binding);
 
     void unbindInput();
 
-    void startInput(in IInputContext inputContext, in EditorInfo attribute);
-
-    void restartInput(in IInputContext inputContext, in EditorInfo attribute);
+    void startInput(in IBinder startInputToken, in IInputContext inputContext, int missingMethods,
+            in EditorInfo attribute, boolean restarting, boolean preRenderImeViews);
 
     void createSession(in InputChannel channel, IInputSessionCallback callback);
 
@@ -48,9 +53,9 @@ oneway interface IInputMethod {
 
     void revokeSession(IInputMethodSession session);
 
-    void showSoftInput(int flags, in ResultReceiver resultReceiver);
+    void showSoftInput(in IBinder showInputToken, int flags, in ResultReceiver resultReceiver);
 
-    void hideSoftInput(int flags, in ResultReceiver resultReceiver);
+    void hideSoftInput(in IBinder hideInputToken, int flags, in ResultReceiver resultReceiver);
 
     void changeInputMethodSubtype(in InputMethodSubtype subtype);
 }

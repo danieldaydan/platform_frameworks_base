@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#define ATRACE_TAG ATRACE_TAG_VIEW
-
 #include "DrawFrameTask.h"
 
 #include <utils/Log.h>
@@ -34,19 +32,21 @@ namespace renderthread {
 DrawFrameTask::DrawFrameTask()
         : mRenderThread(nullptr)
         , mContext(nullptr)
-        , mSyncResult(kSync_OK) {
-}
+        , mContentDrawBounds(0, 0, 0, 0)
+        , mSyncResult(SyncResult::OK) {}
 
-DrawFrameTask::~DrawFrameTask() {
-}
+DrawFrameTask::~DrawFrameTask() {}
 
-void DrawFrameTask::setContext(RenderThread* thread, CanvasContext* context) {
+void DrawFrameTask::setContext(RenderThread* thread, CanvasContext* context,
+                               RenderNode* targetNode) {
     mRenderThread = thread;
     mContext = context;
+    mTargetNode = targetNode;
 }
 
 void DrawFrameTask::pushLayerUpdate(DeferredLayerUpdater* layer) {
-    LOG_ALWAYS_FATAL_IF(!mContext, "Lifecycle violation, there's no context to pushLayerUpdate with!");
+    LOG_ALWAYS_FATAL_IF(!mContext,
+                        "Lifecycle violation, there's no context to pushLayerUpdate with!");
 
     for (size_t i = 0; i < mLayers.size(); i++) {
         if (mLayers[i].get() == layer) {
@@ -68,8 +68,8 @@ void DrawFrameTask::removeLayerUpdate(DeferredLayerUpdater* layer) {
 int DrawFrameTask::drawFrame() {
     LOG_ALWAYS_FATAL_IF(!mContext, "Cannot drawFrame with no CanvasContext!");
 
-    mSyncResult = kSync_OK;
-    mSyncQueued = systemTime(CLOCK_MONOTONIC);
+    mSyncResult = SyncResult::OK;
+    mSyncQueued = systemTime(SYSTEM_TIME_MONOTONIC);
     postAndWait();
 
     return mSyncResult;
@@ -77,7 +77,7 @@ int DrawFrameTask::drawFrame() {
 
 void DrawFrameTask::postAndWait() {
     AutoMutex _lock(mLock);
-    mRenderThread->queue(this);
+    mRenderThread->queue().post([this]() { run(); });
     mSignal.wait(mLock);
 }
 
@@ -87,21 +87,37 @@ void DrawFrameTask::run() {
     bool canUnblockUiThread;
     bool canDrawThisFrame;
     {
-        TreeInfo info(TreeInfo::MODE_FULL, mRenderThread->renderState());
+        TreeInfo info(TreeInfo::MODE_FULL, *mContext);
         canUnblockUiThread = syncFrameState(info);
         canDrawThisFrame = info.out.canDrawThisFrame;
+
+        if (mFrameCompleteCallback) {
+            mContext->addFrameCompleteListener(std::move(mFrameCompleteCallback));
+            mFrameCompleteCallback = nullptr;
+        }
     }
 
     // Grab a copy of everything we need
     CanvasContext* context = mContext;
+    std::function<void(int64_t)> callback = std::move(mFrameCallback);
+    mFrameCallback = nullptr;
 
     // From this point on anything in "this" is *UNSAFE TO ACCESS*
     if (canUnblockUiThread) {
         unblockUiThread();
     }
 
+    // Even if we aren't drawing this vsync pulse the next frame number will still be accurate
+    if (CC_UNLIKELY(callback)) {
+        context->enqueueFrameWork(
+                [callback, frameNr = context->getFrameNumber()]() { callback(frameNr); });
+    }
+
     if (CC_LIKELY(canDrawThisFrame)) {
         context->draw();
+    } else {
+        // wait on fences so tasks don't overlap next frame
+        context->waitOnFences();
     }
 
     if (!canUnblockUiThread) {
@@ -113,25 +129,35 @@ bool DrawFrameTask::syncFrameState(TreeInfo& info) {
     ATRACE_CALL();
     int64_t vsync = mFrameInfo[static_cast<int>(FrameInfoIndex::Vsync)];
     mRenderThread->timeLord().vsyncReceived(vsync);
-    mContext->makeCurrent();
-    Caches::getInstance().textureCache.resetMarkInUse(mContext);
+    bool canDraw = mContext->makeCurrent();
+    mContext->unpinImages();
 
     for (size_t i = 0; i < mLayers.size(); i++) {
-        mContext->processLayerUpdate(mLayers[i].get());
+        mLayers[i]->apply();
     }
     mLayers.clear();
-    mContext->prepareTree(info, mFrameInfo, mSyncQueued);
+    mContext->setContentDrawBounds(mContentDrawBounds);
+    mContext->prepareTree(info, mFrameInfo, mSyncQueued, mTargetNode);
 
     // This is after the prepareTree so that any pending operations
     // (RenderNode tree state, prefetched layers, etc...) will be flushed.
-    if (CC_UNLIKELY(!mContext->hasSurface())) {
-        mSyncResult |= kSync_LostSurfaceRewardIfFound;
+    if (CC_UNLIKELY(!mContext->hasSurface() || !canDraw)) {
+        if (!mContext->hasSurface()) {
+            mSyncResult |= SyncResult::LostSurfaceRewardIfFound;
+        } else {
+            // If we have a surface but can't draw we must be stopped
+            mSyncResult |= SyncResult::ContextIsStopped;
+        }
+        info.out.canDrawThisFrame = false;
     }
 
     if (info.out.hasAnimations) {
         if (info.out.requiresUiRedraw) {
-            mSyncResult |= kSync_UIRedrawRequired;
+            mSyncResult |= SyncResult::UIRedrawRequired;
         }
+    }
+    if (!info.out.canDrawThisFrame) {
+        mSyncResult |= SyncResult::FrameDropped;
     }
     // If prepareTextures is false, we ran out of texture cache space
     return info.prepareTextures;

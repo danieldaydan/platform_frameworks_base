@@ -16,6 +16,8 @@
 
 package android.util;
 
+import android.compat.annotation.UnsupportedAppUsage;
+
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -60,6 +62,7 @@ import java.util.Map;
  * Support Package</a> for earlier releases.
  */
 public class LruCache<K, V> {
+    @UnsupportedAppUsage
     private final LinkedHashMap<K, V> map;
 
     /** Size of this cache in units. Not necessarily the number of elements. */
@@ -258,7 +261,7 @@ public class LruCache<K, V> {
      * @param evicted true if the entry is being removed to make space, false
      *     if the removal was caused by a {@link #put} or {@link #remove}.
      * @param newValue the new value for {@code key}, if it exists. If non-null,
-     *     this removal was caused by a {@link #put}. Otherwise it was caused by
+     *     this removal was caused by a {@link #put} or a {@link #get}. Otherwise it was caused by
      *     an eviction or a {@link #remove}.
      */
     protected void entryRemoved(boolean evicted, K key, V oldValue, V newValue) {}

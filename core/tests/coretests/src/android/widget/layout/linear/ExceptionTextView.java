@@ -16,13 +16,10 @@
 
 package android.widget.layout.linear;
 
-import junit.framework.Assert;
-
-import android.widget.EditText;
 import android.content.Context;
-import android.util.AttributeSet;
 import android.text.BoringLayout;
-
+import android.util.AttributeSet;
+import android.widget.EditText;
 
 /**
  * A special EditText that sets {@link #isFailed()} to true as its internal makeNewLayout() method is called
@@ -50,10 +47,8 @@ public class ExceptionTextView extends EditText {
     }
 
     @Override
-    protected void makeNewLayout(int w, int hintWidth,
-                                 BoringLayout.Metrics boring,
-                                 BoringLayout.Metrics hintMetrics,
-                                 int ellipsizedWidth, boolean bringIntoView) {
+    public void makeNewLayout(int w, int hintWidth, BoringLayout.Metrics boring,
+            BoringLayout.Metrics hintMetrics, int ellipsizedWidth, boolean bringIntoView) {
         if (w < 0) {
             mFailed = true;
             w = 100;

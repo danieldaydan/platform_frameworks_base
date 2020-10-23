@@ -17,230 +17,265 @@
 
 #define LOG_TAG "SysPropJNI"
 
-#include "cutils/properties.h"
+#include <utility>
+#include <optional>
+
+#include "android-base/logging.h"
+#include "android-base/parsebool.h"
+#include "android-base/parseint.h"
+#include "android-base/properties.h"
 #include "utils/misc.h"
 #include <utils/Log.h>
 #include "jni.h"
 #include "core_jni_helpers.h"
 #include <nativehelper/JNIHelp.h>
+#include <nativehelper/ScopedPrimitiveArray.h>
+#include <nativehelper/ScopedUtfChars.h>
 
-namespace android
+#if defined(__BIONIC__)
+# include <sys/system_properties.h>
+#else
+struct prop_info;
+#endif
+
+namespace android {
+namespace {
+
+using android::base::ParseBoolResult;
+
+template<typename Functor>
+void ReadProperty(const prop_info* prop, Functor&& functor)
 {
-
-static jstring SystemProperties_getSS(JNIEnv *env, jobject clazz,
-                                      jstring keyJ, jstring defJ)
-{
-    int len;
-    const char* key;
-    char buf[PROPERTY_VALUE_MAX];
-    jstring rvJ = NULL;
-
-    if (keyJ == NULL) {
-        jniThrowNullPointerException(env, "key must not be null.");
-        goto error;
-    }
-
-    key = env->GetStringUTFChars(keyJ, NULL);
-
-    len = property_get(key, buf, "");
-    if ((len <= 0) && (defJ != NULL)) {
-        rvJ = defJ;
-    } else if (len >= 0) {
-        rvJ = env->NewStringUTF(buf);
-    } else {
-        rvJ = env->NewStringUTF("");
-    }
-
-    env->ReleaseStringUTFChars(keyJ, key);
-
-error:
-    return rvJ;
+#if defined(__BIONIC__)
+    auto thunk = [](void* cookie,
+                    const char* /*name*/,
+                    const char* value,
+                    uint32_t /*serial*/) {
+        std::forward<Functor>(*static_cast<Functor*>(cookie))(value);
+    };
+    __system_property_read_callback(prop, thunk, &functor);
+#else
+    LOG(FATAL) << "fast property access supported only on device";
+#endif
 }
 
-static jstring SystemProperties_getS(JNIEnv *env, jobject clazz,
-                                      jstring keyJ)
+template<typename Functor>
+void ReadProperty(JNIEnv* env, jstring keyJ, Functor&& functor)
 {
-    return SystemProperties_getSS(env, clazz, keyJ, NULL);
+    ScopedUtfChars key(env, keyJ);
+    if (!key.c_str()) {
+        return;
+    }
+#if defined(__BIONIC__)
+    const prop_info* prop = __system_property_find(key.c_str());
+    if (!prop) {
+        return;
+    }
+    ReadProperty(prop, std::forward<Functor>(functor));
+#else
+    std::forward<Functor>(functor)(
+        android::base::GetProperty(key.c_str(), "").c_str());
+#endif
 }
 
-static jint SystemProperties_get_int(JNIEnv *env, jobject clazz,
-                                      jstring keyJ, jint defJ)
+jstring SystemProperties_getSS(JNIEnv* env, jclass clazz, jstring keyJ,
+                               jstring defJ)
 {
-    int len;
-    const char* key;
-    char buf[PROPERTY_VALUE_MAX];
-    char* end;
-    jint result = defJ;
-
-    if (keyJ == NULL) {
-        jniThrowNullPointerException(env, "key must not be null.");
-        goto error;
+    jstring ret = defJ;
+    ReadProperty(env, keyJ, [&](const char* value) {
+        if (value[0]) {
+            ret = env->NewStringUTF(value);
+        }
+    });
+    if (ret == nullptr && !env->ExceptionCheck()) {
+      ret = env->NewStringUTF("");  // Legacy behavior
     }
+    return ret;
+}
 
-    key = env->GetStringUTFChars(keyJ, NULL);
+template <typename T>
+T SystemProperties_get_integral(JNIEnv *env, jclass, jstring keyJ,
+                                       T defJ)
+{
+    T ret = defJ;
+    ReadProperty(env, keyJ, [&](const char* value) {
+        android::base::ParseInt<T>(value, &ret);
+    });
+    return ret;
+}
 
-    len = property_get(key, buf, "");
-    if (len > 0) {
-        result = strtol(buf, &end, 0);
-        if (end == buf) {
-            result = defJ;
+static jboolean jbooleanFromParseBoolResult(ParseBoolResult parseResult, jboolean defJ) {
+    jboolean ret;
+    switch (parseResult) {
+        case ParseBoolResult::kError:
+            ret = defJ;
+            break;
+        case ParseBoolResult::kFalse:
+            ret = JNI_FALSE;
+            break;
+        case ParseBoolResult::kTrue:
+            ret = JNI_TRUE;
+            break;
+    }
+    return ret;
+}
+
+jboolean SystemProperties_get_boolean(JNIEnv *env, jclass, jstring keyJ,
+                                      jboolean defJ)
+{
+    ParseBoolResult parseResult = ParseBoolResult::kError;
+    ReadProperty(env, keyJ, [&](const char* value) {
+        parseResult = android::base::ParseBool(value);
+    });
+    return jbooleanFromParseBoolResult(parseResult, defJ);
+}
+
+jlong SystemProperties_find(JNIEnv* env, jclass, jstring keyJ)
+{
+#if defined(__BIONIC__)
+    ScopedUtfChars key(env, keyJ);
+    if (!key.c_str()) {
+        return 0;
+    }
+    const prop_info* prop = __system_property_find(key.c_str());
+    return reinterpret_cast<jlong>(prop);
+#else
+    LOG(FATAL) << "fast property access supported only on device";
+    __builtin_unreachable();  // Silence warning
+#endif
+}
+
+jstring SystemProperties_getH(JNIEnv* env, jclass clazz, jlong propJ)
+{
+    jstring ret;
+    auto prop = reinterpret_cast<const prop_info*>(propJ);
+    ReadProperty(prop, [&](const char* value) {
+        ret = env->NewStringUTF(value);
+    });
+    return ret;
+}
+
+template <typename T>
+T SystemProperties_get_integralH(CRITICAL_JNI_PARAMS_COMMA jlong propJ, T defJ)
+{
+    T ret = defJ;
+    auto prop = reinterpret_cast<const prop_info*>(propJ);
+    ReadProperty(prop, [&](const char* value) {
+        android::base::ParseInt<T>(value, &ret);
+    });
+    return ret;
+}
+
+jboolean SystemProperties_get_booleanH(CRITICAL_JNI_PARAMS_COMMA jlong propJ, jboolean defJ)
+{
+    ParseBoolResult parseResult = ParseBoolResult::kError;
+    auto prop = reinterpret_cast<const prop_info*>(propJ);
+    ReadProperty(prop, [&](const char* value) {
+        parseResult = android::base::ParseBool(value);
+    });
+    return jbooleanFromParseBoolResult(parseResult, defJ);
+}
+
+void SystemProperties_set(JNIEnv *env, jobject clazz, jstring keyJ,
+                          jstring valJ)
+{
+    ScopedUtfChars key(env, keyJ);
+    if (!key.c_str()) {
+        return;
+    }
+    std::optional<ScopedUtfChars> value;
+    if (valJ != nullptr) {
+        value.emplace(env, valJ);
+        if (!value->c_str()) {
+            return;
         }
     }
-
-    env->ReleaseStringUTFChars(keyJ, key);
-
-error:
-    return result;
-}
-
-static jlong SystemProperties_get_long(JNIEnv *env, jobject clazz,
-                                      jstring keyJ, jlong defJ)
-{
-    int len;
-    const char* key;
-    char buf[PROPERTY_VALUE_MAX];
-    char* end;
-    jlong result = defJ;
-
-    if (keyJ == NULL) {
-        jniThrowNullPointerException(env, "key must not be null.");
-        goto error;
-    }
-
-    key = env->GetStringUTFChars(keyJ, NULL);
-
-    len = property_get(key, buf, "");
-    if (len > 0) {
-        result = strtoll(buf, &end, 0);
-        if (end == buf) {
-            result = defJ;
-        }
-    }
-
-    env->ReleaseStringUTFChars(keyJ, key);
-
-error:
-    return result;
-}
-
-static jboolean SystemProperties_get_boolean(JNIEnv *env, jobject clazz,
-                                      jstring keyJ, jboolean defJ)
-{
-    int len;
-    const char* key;
-    char buf[PROPERTY_VALUE_MAX];
-    jboolean result = defJ;
-
-    if (keyJ == NULL) {
-        jniThrowNullPointerException(env, "key must not be null.");
-        goto error;
-    }
-
-    key = env->GetStringUTFChars(keyJ, NULL);
-
-    len = property_get(key, buf, "");
-    if (len == 1) {
-        char ch = buf[0];
-        if (ch == '0' || ch == 'n')
-            result = false;
-        else if (ch == '1' || ch == 'y')
-            result = true;
-    } else if (len > 1) {
-         if (!strcmp(buf, "no") || !strcmp(buf, "false") || !strcmp(buf, "off")) {
-            result = false;
-        } else if (!strcmp(buf, "yes") || !strcmp(buf, "true") || !strcmp(buf, "on")) {
-            result = true;
-        }
-    }
-
-    env->ReleaseStringUTFChars(keyJ, key);
-
-error:
-    return result;
-}
-
-static void SystemProperties_set(JNIEnv *env, jobject clazz,
-                                      jstring keyJ, jstring valJ)
-{
-    int err;
-    const char* key;
-    const char* val;
-
-    if (keyJ == NULL) {
-        jniThrowNullPointerException(env, "key must not be null.");
-        return ;
-    }
-    key = env->GetStringUTFChars(keyJ, NULL);
-
-    if (valJ == NULL) {
-        val = "";       /* NULL pointer not allowed here */
-    } else {
-        val = env->GetStringUTFChars(valJ, NULL);
-    }
-
-    err = property_set(key, val);
-
-    env->ReleaseStringUTFChars(keyJ, key);
-
-    if (valJ != NULL) {
-        env->ReleaseStringUTFChars(valJ, val);
-    }
-
-    if (err < 0) {
+    bool success;
+#if defined(__BIONIC__)
+    success = !__system_property_set(key.c_str(), value ? value->c_str() : "");
+#else
+    success = android::base::SetProperty(key.c_str(), value ? value->c_str() : "");
+#endif
+    if (!success) {
         jniThrowException(env, "java/lang/RuntimeException",
-                          "failed to set system property");
+                          "failed to set system property (check logcat for reason)");
     }
 }
 
-static JavaVM* sVM = NULL;
-static jclass sClazz = NULL;
-static jmethodID sCallChangeCallbacks;
+JavaVM* sVM = nullptr;
+jclass sClazz = nullptr;
+jmethodID sCallChangeCallbacks;
 
-static void do_report_sysprop_change() {
+void do_report_sysprop_change() {
     //ALOGI("Java SystemProperties: VM=%p, Clazz=%p", sVM, sClazz);
-    if (sVM != NULL && sClazz != NULL) {
+    if (sVM != nullptr && sClazz != nullptr) {
         JNIEnv* env;
         if (sVM->GetEnv((void **)&env, JNI_VERSION_1_4) >= 0) {
             //ALOGI("Java SystemProperties: calling %p", sCallChangeCallbacks);
             env->CallStaticVoidMethod(sClazz, sCallChangeCallbacks);
+            // There should not be any exceptions. But we must guarantee
+            // there are none on return.
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                LOG(ERROR) << "Exception pending after sysprop_change!";
+            }
         }
     }
 }
 
-static void SystemProperties_add_change_callback(JNIEnv *env, jobject clazz)
+void SystemProperties_add_change_callback(JNIEnv *env, jobject clazz)
 {
     // This is called with the Java lock held.
-    if (sVM == NULL) {
+    if (sVM == nullptr) {
         env->GetJavaVM(&sVM);
     }
-    if (sClazz == NULL) {
+    if (sClazz == nullptr) {
         sClazz = (jclass) env->NewGlobalRef(clazz);
         sCallChangeCallbacks = env->GetStaticMethodID(sClazz, "callChangeCallbacks", "()V");
         add_sysprop_change_callback(do_report_sysprop_change, -10000);
     }
 }
 
-static const JNINativeMethod method_table[] = {
-    { "native_get", "(Ljava/lang/String;)Ljava/lang/String;",
-      (void*) SystemProperties_getS },
-    { "native_get", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-      (void*) SystemProperties_getSS },
-    { "native_get_int", "(Ljava/lang/String;I)I",
-      (void*) SystemProperties_get_int },
-    { "native_get_long", "(Ljava/lang/String;J)J",
-      (void*) SystemProperties_get_long },
-    { "native_get_boolean", "(Ljava/lang/String;Z)Z",
-      (void*) SystemProperties_get_boolean },
-    { "native_set", "(Ljava/lang/String;Ljava/lang/String;)V",
-      (void*) SystemProperties_set },
-    { "native_add_change_callback", "()V",
-      (void*) SystemProperties_add_change_callback },
-};
+void SystemProperties_report_sysprop_change(JNIEnv /**env*/, jobject /*clazz*/)
+{
+    report_sysprop_change();
+}
+
+}  // namespace
 
 int register_android_os_SystemProperties(JNIEnv *env)
 {
-    return RegisterMethodsOrDie(env, "android/os/SystemProperties", method_table,
-                                NELEM(method_table));
+    const JNINativeMethod method_table[] = {
+        { "native_get",
+          "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+          (void*) SystemProperties_getSS },
+        { "native_get_int", "(Ljava/lang/String;I)I",
+          (void*) SystemProperties_get_integral<jint> },
+        { "native_get_long", "(Ljava/lang/String;J)J",
+          (void*) SystemProperties_get_integral<jlong> },
+        { "native_get_boolean", "(Ljava/lang/String;Z)Z",
+          (void*) SystemProperties_get_boolean },
+        { "native_find",
+          "(Ljava/lang/String;)J",
+          (void*) SystemProperties_find },
+        { "native_get",
+          "(J)Ljava/lang/String;",
+          (void*) SystemProperties_getH },
+        { "native_get_int", "(JI)I",
+          (void*) SystemProperties_get_integralH<jint> },
+        { "native_get_long", "(JJ)J",
+          (void*) SystemProperties_get_integralH<jlong> },
+        { "native_get_boolean", "(JZ)Z",
+          (void*) SystemProperties_get_booleanH },
+        { "native_set", "(Ljava/lang/String;Ljava/lang/String;)V",
+          (void*) SystemProperties_set },
+        { "native_add_change_callback", "()V",
+          (void*) SystemProperties_add_change_callback },
+        { "native_report_sysprop_change", "()V",
+          (void*) SystemProperties_report_sysprop_change },
+    };
+    return RegisterMethodsOrDie(env, "android/os/SystemProperties",
+                                method_table, NELEM(method_table));
 }
 
-};
+}  // namespace android

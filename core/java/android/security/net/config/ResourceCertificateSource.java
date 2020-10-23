@@ -25,6 +25,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Set;
 
 import com.android.org.conscrypt.TrustedCertificateIndex;
@@ -43,7 +44,7 @@ public class ResourceCertificateSource implements CertificateSource {
 
     public ResourceCertificateSource(int resourceId, Context context) {
         mResourceId = resourceId;
-        mContext = context.getApplicationContext();
+        mContext = context;
     }
 
     private void ensureInitialized() {
@@ -99,5 +100,24 @@ public class ResourceCertificateSource implements CertificateSource {
             return null;
         }
         return anchor.getTrustedCert();
+    }
+
+    @Override
+    public Set<X509Certificate> findAllByIssuerAndSignature(X509Certificate cert) {
+        ensureInitialized();
+        Set<java.security.cert.TrustAnchor> anchors = mIndex.findAllByIssuerAndSignature(cert);
+        if (anchors.isEmpty()) {
+            return Collections.<X509Certificate>emptySet();
+        }
+        Set<X509Certificate> certs = new ArraySet<X509Certificate>(anchors.size());
+        for (java.security.cert.TrustAnchor anchor : anchors) {
+            certs.add(anchor.getTrustedCert());
+        }
+        return certs;
+    }
+
+    @Override
+    public void handleTrustStorageUpdate() {
+        // Nothing to do, resource sources never change.
     }
 }

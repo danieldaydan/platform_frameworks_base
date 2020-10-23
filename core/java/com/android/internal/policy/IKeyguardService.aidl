@@ -16,6 +16,7 @@
 package com.android.internal.policy;
 
 import com.android.internal.policy.IKeyguardDrawnCallback;
+import com.android.internal.policy.IKeyguardDismissCallback;
 import com.android.internal.policy.IKeyguardStateCallback;
 import com.android.internal.policy.IKeyguardExitCallback;
 
@@ -28,13 +29,13 @@ oneway interface IKeyguardService {
      * FLAG_SHOW_ON_LOCK_SCREEN.
      *
      * @param isOccluded Whether the Keyguard is occluded by another window.
+     * @param animate Whether to play an animation for the state change.
      */
-    void setOccluded(boolean isOccluded);
+    void setOccluded(boolean isOccluded, boolean animate);
 
     void addStateMonitorCallback(IKeyguardStateCallback callback);
     void verifyUnlock(IKeyguardExitCallback callback);
-    void keyguardDone(boolean authenticated, boolean wakeup);
-    void dismiss();
+    void dismiss(IKeyguardDismissCallback callback, CharSequence message);
     void onDreamingStarted();
     void onDreamingStopped();
 
@@ -50,14 +51,22 @@ oneway interface IKeyguardService {
      * Called when the device has finished going to sleep.
      *
      * @param why {@link #OFF_BECAUSE_OF_USER}, {@link #OFF_BECAUSE_OF_ADMIN},
-     * or {@link #OFF_BECAUSE_OF_TIMEOUT}.
+     *            or {@link #OFF_BECAUSE_OF_TIMEOUT}.
+     * @param cameraGestureTriggered whether the camera gesture was triggered between
+     *                               {@link #onStartedGoingToSleep} and this method; if it's been
+     *                               triggered, we shouldn't lock the device.
      */
-    void onFinishedGoingToSleep(int reason);
+    void onFinishedGoingToSleep(int reason, boolean cameraGestureTriggered);
 
     /**
      * Called when the device has started waking up.
      */
     void onStartedWakingUp();
+
+    /**
+     * Called when the device has finished waking up.
+     */
+    void onFinishedWakingUp();
 
     /**
      * Called when the device screen is turning on.
@@ -70,13 +79,21 @@ oneway interface IKeyguardService {
     void onScreenTurnedOn();
 
     /**
+     * Called when the screen starts turning off.
+     */
+    void onScreenTurningOff();
+
+    /**
      * Called when the screen has turned off.
      */
     void onScreenTurnedOff();
 
+    @UnsupportedAppUsage
     void setKeyguardEnabled(boolean enabled);
     void onSystemReady();
+    @UnsupportedAppUsage
     void doKeyguardTimeout(in Bundle options);
+    void setSwitchingUser(boolean switching);
     void setCurrentUser(int userId);
     void onBootCompleted();
 
@@ -90,8 +107,8 @@ oneway interface IKeyguardService {
     void startKeyguardExitAnimation(long startTime, long fadeoutDuration);
 
     /**
-     * Notifies the Keyguard that the activity that was starting has now been drawn and it's safe
-     * to start the keyguard dismiss sequence.
+     * Notifies the Keyguard that the power key was pressed while locked and launched Home rather
+     * than putting the device to sleep or waking up.
      */
-    void onActivityDrawn();
+    void onShortPowerPressedGoHome();
 }

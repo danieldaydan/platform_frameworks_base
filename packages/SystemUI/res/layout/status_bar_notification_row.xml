@@ -15,7 +15,8 @@
     limitations under the License.
 -->
 
-<com.android.systemui.statusbar.ExpandableNotificationRow
+<!-- extends FrameLayout -->
+<com.android.systemui.statusbar.notification.row.ExpandableNotificationRow
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
@@ -23,21 +24,25 @@
     android:clickable="true"
     >
 
-    <com.android.systemui.statusbar.NotificationBackgroundView
+    <!-- Menu displayed behind notification added here programmatically -->
+
+    <com.android.systemui.statusbar.notification.row.NotificationBackgroundView
         android:id="@+id/backgroundNormal"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <com.android.systemui.statusbar.NotificationBackgroundView
+    <com.android.systemui.statusbar.notification.row.NotificationBackgroundView
         android:id="@+id/backgroundDimmed"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <com.android.systemui.statusbar.NotificationContentView android:id="@+id/expanded"
+    <com.android.systemui.statusbar.notification.row.NotificationContentView
+        android:id="@+id/expanded"
        android:layout_width="match_parent"
        android:layout_height="wrap_content" />
 
-    <com.android.systemui.statusbar.NotificationContentView android:id="@+id/expandedPublic"
+    <com.android.systemui.statusbar.notification.row.NotificationContentView
+        android:id="@+id/expandedPublic"
         android:layout_width="match_parent"
         android:layout_height="wrap_content" />
 
@@ -61,19 +66,16 @@
         />
 
     <ViewStub
-        android:layout="@layout/notification_expand_button"
-        android:id="@+id/more_button_stub"
-        android:inflatedId="@+id/notification_more_button_container"
-        android:layout_width="match_parent"
-        android:layout_height="@dimen/notification_bottom_decor_height"
-        />
-
-    <ViewStub
         android:layout="@layout/notification_guts"
         android:id="@+id/notification_guts_stub"
         android:inflatedId="@+id/notification_guts"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_height="wrap_content"
         />
 
-</com.android.systemui.statusbar.ExpandableNotificationRow>
+    <com.android.systemui.statusbar.notification.FakeShadowView
+        android:id="@+id/fake_shadow"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</com.android.systemui.statusbar.notification.row.ExpandableNotificationRow>

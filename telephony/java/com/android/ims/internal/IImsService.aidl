@@ -18,13 +18,14 @@ package com.android.ims.internal;
 
 import android.app.PendingIntent;
 
-import com.android.ims.ImsCallProfile;
-import com.android.ims.internal.IImsRegistrationListener;
+import android.telephony.ims.ImsCallProfile;
 import com.android.ims.internal.IImsCallSession;
 import com.android.ims.internal.IImsCallSessionListener;
-import com.android.ims.internal.IImsEcbm;
-import com.android.ims.internal.IImsUt;
 import com.android.ims.internal.IImsConfig;
+import com.android.ims.internal.IImsEcbm;
+import com.android.ims.internal.IImsMultiEndpoint;
+import com.android.ims.internal.IImsRegistrationListener;
+import com.android.ims.internal.IImsUt;
 
 import android.os.Message;
 
@@ -37,7 +38,18 @@ interface IImsService {
     void close(int serviceId);
     boolean isConnected(int serviceId, int serviceType, int callType);
     boolean isOpened(int serviceId);
+
+    /**
+     * Replace existing registration listener
+     *
+     */
     void setRegistrationListener(int serviceId, in IImsRegistrationListener listener);
+
+    /**
+     * Add new registration listener
+     */
+    void addRegistrationListener(int phoneId, int serviceClass,
+            in IImsRegistrationListener listener);
 
     ImsCallProfile createCallProfile(int serviceId, int serviceType, int callType);
 
@@ -75,4 +87,9 @@ interface IImsService {
      * Used to set current TTY Mode.
      */
     void setUiTTYMode(int serviceId, int uiTtyMode, in Message onComplete);
+
+    /**
+     * MultiEndpoint interface for DEP.
+     */
+    IImsMultiEndpoint getMultiEndpointInterface(int serviceId);
 }

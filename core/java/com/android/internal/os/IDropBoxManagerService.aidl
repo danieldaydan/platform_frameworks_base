@@ -17,7 +17,6 @@
 package com.android.internal.os;
 
 import android.os.DropBoxManager;
-import android.os.ParcelFileDescriptor;
 
 /**
  * "Backend" interface used by {@link android.os.DropBoxManager} to talk to the
@@ -38,5 +37,6 @@ interface IDropBoxManagerService {
     boolean isTagEnabled(String tag);
 
     /** @see DropBoxManager#getNextEntry */
-    DropBoxManager.Entry getNextEntry(String tag, long millis);
+    @UnsupportedAppUsage
+    DropBoxManager.Entry getNextEntry(String tag, long millis, String packageName);
 }

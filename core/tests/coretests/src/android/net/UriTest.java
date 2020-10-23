@@ -18,11 +18,15 @@ package android.net;
 
 import android.content.ContentUris;
 import android.os.Parcel;
-import android.test.suitebuilder.annotation.SmallTest;
+
+import androidx.test.filters.SmallTest;
 
 import junit.framework.TestCase;
 
 import java.io.File;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -181,12 +185,22 @@ public class UriTest extends TestCase {
 
         uri = Uri.parse("http://bob%40lee%3ajr@local%68ost:4%32");
         assertEquals("bob@lee:jr", uri.getUserInfo());
-        assertEquals("localhost", uri.getHost());
-        assertEquals(42, uri.getPort());
+        assertEquals("localhost:42", uri.getHost());
 
         uri = Uri.parse("http://localhost");
         assertEquals("localhost", uri.getHost());
         assertEquals(-1, uri.getPort());
+
+        uri = Uri.parse("http://a:a@example.com:a@example2.com/path");
+        assertEquals("a:a@example.com:a@example2.com", uri.getAuthority());
+        assertEquals("example2.com", uri.getHost());
+        assertEquals(-1, uri.getPort());
+        assertEquals("/path", uri.getPath());
+
+        uri = Uri.parse("http://a.foo.com\\.example.com/path");
+        assertEquals("a.foo.com", uri.getHost());
+        assertEquals(-1, uri.getPort());
+        assertEquals("\\.example.com/path", uri.getPath());
     }
 
     @SmallTest
@@ -803,6 +817,63 @@ public class UriTest extends TestCase {
                 Uri.parse("content://com.example/path%20path/")));
         assertFalse(Uri.parse("content://com.example/path/path").isPathPrefixMatch(
                 Uri.parse("content://com.example/path%2Fpath")));
+    }
+
+
+    /**
+     * Check that calling Part(String, String) with inconsistent Strings does not lead
+     * to the Part's encoded vs. decoded values being inconsistent.
+     */
+    public void testPart_consistentEncodedVsDecoded() throws Exception {
+        Object authority = createPart(Class.forName("android.net.Uri$Part"), "a.com", "b.com");
+        Object path = createPart(Class.forName("android.net.Uri$PathPart"), "/foo/a", "/foo/b");
+        Uri uri = makeHierarchicalUri(authority, path);
+        // In these cases, decoding/encoding the encoded/decoded representation yields the same
+        // String, so we can just assert equality.
+        // assertEquals(uri.getPath(), uri.getEncodedPath());
+        assertEquals(uri.getAuthority(), uri.getEncodedAuthority());
+
+        // When both encoded and decoded strings are given, the encoded one is preferred.
+        assertEquals("a.com", uri.getAuthority());
+        assertEquals("/foo/a", uri.getPath());
+    }
+
+    private Object createPart(Class partClass, String encoded, String decoded) throws Exception {
+        Constructor partConstructor = partClass.getDeclaredConstructor(String.class, String.class);
+        partConstructor.setAccessible(true);
+        return partConstructor.newInstance(encoded, decoded);
+    }
+
+    private static Uri makeHierarchicalUri(Object authority, Object path) throws Exception {
+        Class hierarchicalUriClass = Class.forName("android.net.Uri$HierarchicalUri");
+        Constructor hierarchicalUriConstructor = hierarchicalUriClass.getDeclaredConstructors()[0];
+        hierarchicalUriConstructor.setAccessible(true);
+        return (Uri) hierarchicalUriConstructor.newInstance("https", authority, path, null, null);
+    }
+
+    /** Attempting to unparcel a legacy parcel format of Uri.{,Path}Part should fail. */
+    public void testUnparcelLegacyPart_fails() throws Exception {
+        assertUnparcelLegacyPart_fails(Class.forName("android.net.Uri$Part"));
+        assertUnparcelLegacyPart_fails(Class.forName("android.net.Uri$PathPart"));
+    }
+
+    private static void assertUnparcelLegacyPart_fails(Class partClass) throws Exception {
+        Parcel parcel = Parcel.obtain();
+        parcel.writeInt(0 /* BOTH */);
+        parcel.writeString("encoded");
+        parcel.writeString("decoded");
+        parcel.setDataPosition(0);
+
+        Method readFromMethod = partClass.getDeclaredMethod("readFrom", Parcel.class);
+        readFromMethod.setAccessible(true);
+        try {
+            readFromMethod.invoke(null, parcel);
+            fail();
+        } catch (InvocationTargetException expected) {
+            Throwable targetException = expected.getTargetException();
+            // Check that the exception was thrown for the correct reason.
+            assertEquals("Unknown representation: 0", targetException.getMessage());
+        }
     }
 
     public void testToSafeString() {

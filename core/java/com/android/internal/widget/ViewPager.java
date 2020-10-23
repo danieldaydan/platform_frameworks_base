@@ -17,6 +17,8 @@
 package com.android.internal.widget;
 
 import android.annotation.DrawableRes;
+import android.annotation.NonNull;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
@@ -30,6 +32,7 @@ import android.os.Parcelable;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.util.MathUtils;
+import android.view.AbsSavedState;
 import android.view.FocusFinder;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -44,6 +47,7 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.view.animation.Interpolator;
+import android.view.inspector.InspectableProperty;
 import android.widget.EdgeEffect;
 import android.widget.Scroller;
 
@@ -54,34 +58,7 @@ import java.util.Collections;
 import java.util.Comparator;
 
 /**
- * Layout manager that allows the user to flip left and right
- * through pages of data.  You supply an implementation of a
- * {@link android.support.v4.view.PagerAdapter} to generate the pages that the view shows.
- *
- * <p>Note this class is currently under early design and
- * development.  The API will likely change in later updates of
- * the compatibility library, requiring changes to the source code
- * of apps when they are compiled against the newer version.</p>
- *
- * <p>ViewPager is most often used in conjunction with {@link android.app.Fragment},
- * which is a convenient way to supply and manage the lifecycle of each page.
- * There are standard adapters implemented for using fragments with the ViewPager,
- * which cover the most common use cases.  These are
- * {@link android.support.v4.app.FragmentPagerAdapter} and
- * {@link android.support.v4.app.FragmentStatePagerAdapter}; each of these
- * classes have simple code showing how to build a full user interface
- * with them.
- *
- * <p>For more information about how to use ViewPager, read <a
- * href="{@docRoot}training/implementing-navigation/lateral.html">Creating Swipe Views with
- * Tabs</a>.</p>
- *
- * <p>Below is a more complicated example of ViewPager, using it in conjunction
- * with {@link android.app.ActionBar} tabs.  You can find other examples of using
- * ViewPager in the API 4+ Support Demos and API 13+ Support Demos sample code.
- *
- * {@sample development/samples/Support13Demos/src/com/example/android/supportv13/app/ActionBarTabsPager.java
- *      complete}
+ * Framework copy of the support-v4 ViewPager class.
  */
 public class ViewPager extends ViewGroup {
     private static final String TAG = "ViewPager";
@@ -268,6 +245,7 @@ public class ViewPager extends ViewGroup {
          * @param positionOffset Value from [0, 1) indicating the offset from the page at position.
          * @param positionOffsetPixels Value in pixels indicating the offset from position.
          */
+        @UnsupportedAppUsage
         public void onPageScrolled(int position, float positionOffset, int positionOffsetPixels);
 
         /**
@@ -276,6 +254,7 @@ public class ViewPager extends ViewGroup {
          *
          * @param position Position index of the new selected page.
          */
+        @UnsupportedAppUsage
         public void onPageSelected(int position);
 
         /**
@@ -288,6 +267,7 @@ public class ViewPager extends ViewGroup {
          * @see com.android.internal.widget.ViewPager#SCROLL_STATE_DRAGGING
          * @see com.android.internal.widget.ViewPager#SCROLL_STATE_SETTLING
          */
+        @UnsupportedAppUsage
         public void onPageScrollStateChanged(int state);
     }
 
@@ -508,6 +488,7 @@ public class ViewPager extends ViewGroup {
         setCurrentItemInternal(item, smoothScroll, false);
     }
 
+    @UnsupportedAppUsage
     public int getCurrentItem() {
         return mCurItem;
     }
@@ -746,16 +727,17 @@ public class ViewPager extends ViewGroup {
     }
 
     @Override
-    protected boolean verifyDrawable(Drawable who) {
+    protected boolean verifyDrawable(@NonNull Drawable who) {
         return super.verifyDrawable(who) || who == mMarginDrawable;
     }
 
     @Override
     protected void drawableStateChanged() {
         super.drawableStateChanged();
-        final Drawable d = mMarginDrawable;
-        if (d != null && d.isStateful()) {
-            d.setState(getDrawableState());
+        final Drawable marginDrawable = mMarginDrawable;
+        if (marginDrawable != null && marginDrawable.isStateful()
+                && marginDrawable.setState(getDrawableState())) {
+            invalidateDrawable(marginDrawable);
         }
     }
 
@@ -1094,7 +1076,16 @@ public class ViewPager extends ViewGroup {
                     View child = getChildAt(i);
                     ii = infoForChild(child);
                     if (ii != null && ii.position == mCurItem) {
-                        if (child.requestFocus(focusDirection)) {
+                        final Rect focusRect;
+                        if (currentFocused == null) {
+                            focusRect = null;
+                        } else {
+                            focusRect = mTempRect;
+                            currentFocused.getFocusedRect(mTempRect);
+                            offsetDescendantRectToMyCoords(currentFocused, mTempRect);
+                            offsetRectIntoDescendantCoords(child, mTempRect);
+                        }
+                        if (child.requestFocus(focusDirection, focusRect)) {
                             break;
                         }
                     }
@@ -1214,16 +1205,12 @@ public class ViewPager extends ViewGroup {
      * state, in which case it should implement a subclass of this which
      * contains that state.
      */
-    public static class SavedState extends BaseSavedState {
+    public static class SavedState extends AbsSavedState {
         int position;
         Parcelable adapterState;
         ClassLoader loader;
 
-        public SavedState(Parcel source) {
-            super(source);
-        }
-
-        public SavedState(Parcelable superState) {
+        public SavedState(@NonNull Parcelable superState) {
             super(superState);
         }
 
@@ -1241,10 +1228,15 @@ public class ViewPager extends ViewGroup {
                     + " position=" + position + "}";
         }
 
-        public static final Creator<SavedState> CREATOR = new Creator<SavedState>() {
+        public static final Creator<SavedState> CREATOR = new ClassLoaderCreator<SavedState>() {
+            @Override
+            public SavedState createFromParcel(Parcel in, ClassLoader loader) {
+                return new SavedState(in, loader);
+            }
+
             @Override
             public SavedState createFromParcel(Parcel in) {
-                return new SavedState(in);
+                return new SavedState(in, null);
             }
             @Override
             public SavedState[] newArray(int size) {
@@ -1253,7 +1245,7 @@ public class ViewPager extends ViewGroup {
         };
 
         SavedState(Parcel in, ClassLoader loader) {
-            super(in);
+            super(in, loader);
             if (loader == null) {
                 loader = getClass().getClassLoader();
             }
@@ -1318,6 +1310,11 @@ public class ViewPager extends ViewGroup {
                 child.setDrawingCacheEnabled(false);
             }
         }
+    }
+
+    public Object getCurrent() {
+        final ItemInfo itemInfo = infoForPosition(getCurrentItem());
+        return itemInfo == null ? null : itemInfo.object;
     }
 
     @Override
@@ -1846,7 +1843,7 @@ public class ViewPager extends ViewGroup {
             case MotionEvent.ACTION_MOVE: {
                 /*
                  * mIsBeingDragged == false, otherwise the shortcut would have caught it. Check
-                 * whether the user has moved far enough from his original down touch.
+                 * whether the user has moved far enough from their original down touch.
                  */
 
                 /*
@@ -2788,6 +2785,9 @@ public class ViewPager extends ViewGroup {
          * Where to position the view page within the overall ViewPager
          * container; constants are defined in {@link android.view.Gravity}.
          */
+        @InspectableProperty(
+                name = "layout_gravity",
+                valueType = InspectableProperty.ValueType.GRAVITY)
         public int gravity;
 
         /**

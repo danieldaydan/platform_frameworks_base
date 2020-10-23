@@ -41,9 +41,11 @@ import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.util.Log;
 
 import com.android.internal.content.PackageMonitor;
+import com.android.internal.util.DumpUtils;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.internal.util.XmlUtils;
 import com.android.server.SystemService;
@@ -71,6 +73,13 @@ public class MidiService extends IMidiManager.Stub {
             mMidiService = new MidiService(getContext());
             publishBinderService(Context.MIDI_SERVICE, mMidiService);
         }
+
+        @Override
+        public void onUnlockUser(int userHandle) {
+            if (userHandle == UserHandle.USER_SYSTEM) {
+                mMidiService.onUnlockUser();
+            }
+        }
     }
 
     private static final String TAG = "MidiService";
@@ -97,7 +106,7 @@ public class MidiService extends IMidiManager.Stub {
     private final PackageManager mPackageManager;
 
     // UID of BluetoothMidiService
-    private final int mBluetoothServiceUid;
+    private int mBluetoothServiceUid;
 
     // PackageMonitor for listening to package changes
     private final PackageMonitor mPackageMonitor = new PackageMonitor() {
@@ -126,8 +135,8 @@ public class MidiService extends IMidiManager.Stub {
         // This client's PID
         private final int mPid;
         // List of all receivers for this client
-        private final ArrayList<IMidiDeviceListener> mListeners
-                = new ArrayList<IMidiDeviceListener>();
+        private final HashMap<IBinder, IMidiDeviceListener> mListeners
+                = new HashMap<IBinder, IMidiDeviceListener>();
         // List of all device connections for this client
         private final HashMap<IBinder, DeviceConnection> mDeviceConnections
                 = new HashMap<IBinder, DeviceConnection>();
@@ -143,11 +152,13 @@ public class MidiService extends IMidiManager.Stub {
         }
 
         public void addListener(IMidiDeviceListener listener) {
-            mListeners.add(listener);
+            // Use asBinder() so that we can match it in removeListener().
+            // The listener proxy objects themselves do not match.
+            mListeners.put(listener.asBinder(), listener);
         }
 
         public void removeListener(IMidiDeviceListener listener) {
-            mListeners.remove(listener);
+            mListeners.remove(listener.asBinder());
             if (mListeners.size() == 0 && mDeviceConnections.size() == 0) {
                 close();
             }
@@ -184,7 +195,7 @@ public class MidiService extends IMidiManager.Stub {
 
             MidiDeviceInfo deviceInfo = device.getDeviceInfo();
             try {
-                for (IMidiDeviceListener listener : mListeners) {
+                for (IMidiDeviceListener listener : mListeners.values()) {
                     listener.onDeviceAdded(deviceInfo);
                 }
             } catch (RemoteException e) {
@@ -198,7 +209,7 @@ public class MidiService extends IMidiManager.Stub {
 
             MidiDeviceInfo deviceInfo = device.getDeviceInfo();
             try {
-                for (IMidiDeviceListener listener : mListeners) {
+                for (IMidiDeviceListener listener : mListeners.values()) {
                     listener.onDeviceRemoved(deviceInfo);
                 }
             } catch (RemoteException e) {
@@ -211,7 +222,7 @@ public class MidiService extends IMidiManager.Stub {
             if (!device.isUidAllowed(mUid)) return;
 
             try {
-                for (IMidiDeviceListener listener : mListeners) {
+                for (IMidiDeviceListener listener : mListeners.values()) {
                     listener.onDeviceStatusChanged(status);
                 }
             } catch (RemoteException e) {
@@ -314,9 +325,6 @@ public class MidiService extends IMidiManager.Stub {
                 }
                 IBinder binder = server.asBinder();
                 try {
-                    if (mDeviceInfo == null) {
-                        mDeviceInfo = server.getDeviceInfo();
-                    }
                     binder.linkToDeath(this, 0);
                     mServer = server;
                 } catch (RemoteException e) {
@@ -555,7 +563,12 @@ public class MidiService extends IMidiManager.Stub {
     public MidiService(Context context) {
         mContext = context;
         mPackageManager = context.getPackageManager();
-        mPackageMonitor.register(context, null, true);
+
+        mBluetoothServiceUid = -1;
+    }
+
+    private void onUnlockUser() {
+        mPackageMonitor.register(mContext, null, true);
 
         Intent intent = new Intent(MidiDeviceService.SERVICE_INTERFACE);
         List<ResolveInfo> resolveInfos = mPackageManager.queryIntentServices(intent,
@@ -581,7 +594,7 @@ public class MidiService extends IMidiManager.Stub {
         } else {
             mBluetoothServiceUid = -1;
         }
-   }
+    }
 
     @Override
     public void registerListener(IBinder token, IMidiDeviceListener listener) {
@@ -996,7 +1009,7 @@ public class MidiService extends IMidiManager.Stub {
 
     @Override
     public void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
-        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DUMP, TAG);
+        if (!DumpUtils.checkDumpPermission(mContext, TAG, writer)) return;
         final IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
 
         pw.println("MIDI Manager State:");

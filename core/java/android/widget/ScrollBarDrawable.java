@@ -16,11 +16,18 @@
 
 package android.widget;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
+import android.os.Build;
+import android.view.View;
+
+import com.android.internal.widget.ScrollBarUtils;
 
 /**
  * This is only used by View for displaying its scroll bars. It should probably
@@ -32,6 +39,7 @@ import android.graphics.drawable.Drawable;
 public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
     private Drawable mVerticalTrack;
     private Drawable mHorizontalTrack;
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 123768422)
     private Drawable mVerticalThumb;
     private Drawable mHorizontalThumb;
 
@@ -51,6 +59,10 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
 
     private ColorFilter mColorFilter;
     private boolean mHasSetColorFilter;
+
+    @UnsupportedAppUsage
+    public ScrollBarDrawable() {
+    }
 
     /**
      * Indicate whether the horizontal scrollbar track should always be drawn
@@ -126,7 +138,7 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
         }
 
         final Rect r = getBounds();
-        if (canvas.quickReject(r.left, r.top, r.right, r.bottom, Canvas.EdgeType.AA)) {
+        if (canvas.quickReject(r.left, r.top, r.right, r.bottom)) {
             return;
         }
 
@@ -135,23 +147,15 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
         }
 
         if (drawThumb) {
-            final int size = vertical ? r.height() : r.width();
+            final int scrollBarLength = vertical ? r.height() : r.width();
             final int thickness = vertical ? r.width() : r.height();
-            final int minLength = thickness * 2;
+            final int thumbLength =
+                    ScrollBarUtils.getThumbLength(scrollBarLength, thickness, extent, range);
+            final int thumbOffset =
+                    ScrollBarUtils.getThumbOffset(scrollBarLength, thumbLength, extent, range,
+                            mOffset);
 
-            // Avoid the tiny thumb.
-            int length = Math.round((float) size * extent / range);
-            if (length < minLength) {
-                length = minLength;
-            }
-
-            // Avoid the too-big thumb.
-            int offset = Math.round((float) (size - length) * mOffset / (range - extent));
-            if (offset > size - length) {
-                offset = size - length;
-            }
-
-            drawThumb(canvas, r, offset, length, vertical);
+            drawThumb(canvas, r, thumbOffset, thumbLength, vertical);
         }
     }
 
@@ -229,6 +233,10 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
         }
     }
 
+    /**
+     * @see android.view.View#setVerticalThumbDrawable(Drawable)
+     */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P)
     public void setVerticalThumbDrawable(Drawable thumb) {
         if (mVerticalThumb != null) {
             mVerticalThumb.setCallback(null);
@@ -238,6 +246,37 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
         mVerticalThumb = thumb;
     }
 
+    /**
+     * @see View#getVerticalTrackDrawable()
+     */
+    public @Nullable Drawable getVerticalTrackDrawable() {
+        return mVerticalTrack;
+    }
+
+    /**
+     * @see View#getVerticalThumbDrawable()
+     */
+    public @Nullable Drawable getVerticalThumbDrawable() {
+        return mVerticalThumb;
+    }
+
+    /**
+     * @see View#getHorizontalTrackDrawable()
+     */
+    public @Nullable Drawable getHorizontalTrackDrawable() {
+        return mHorizontalTrack;
+    }
+
+    /**
+     * @see View#getHorizontalThumbDrawable()
+     */
+    public @Nullable Drawable getHorizontalThumbDrawable() {
+        return mHorizontalThumb;
+    }
+
+    /**
+     * @see android.view.View#setVerticalTrackDrawable(Drawable)
+     */
     public void setVerticalTrackDrawable(Drawable track) {
         if (mVerticalTrack != null) {
             mVerticalTrack.setCallback(null);
@@ -247,6 +286,10 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
         mVerticalTrack = track;
     }
 
+    /**
+     * @see android.view.View#setHorizontalThumbDrawable(Drawable)
+     */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P)
     public void setHorizontalThumbDrawable(Drawable thumb) {
         if (mHorizontalThumb != null) {
             mHorizontalThumb.setCallback(null);
@@ -368,17 +411,17 @@ public class ScrollBarDrawable extends Drawable implements Drawable.Callback {
     }
 
     @Override
-    public void invalidateDrawable(Drawable who) {
+    public void invalidateDrawable(@NonNull Drawable who) {
         invalidateSelf();
     }
 
     @Override
-    public void scheduleDrawable(Drawable who, Runnable what, long when) {
+    public void scheduleDrawable(@NonNull Drawable who, @NonNull Runnable what, long when) {
         scheduleSelf(what, when);
     }
 
     @Override
-    public void unscheduleDrawable(Drawable who, Runnable what) {
+    public void unscheduleDrawable(@NonNull Drawable who, @NonNull Runnable what) {
         unscheduleSelf(what);
     }
 

@@ -18,25 +18,26 @@ package android.security.net.config;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageManager;
 import android.util.Log;
 import android.util.Pair;
+
 import java.util.Set;
 
 /** @hide */
 public class ManifestConfigSource implements ConfigSource {
-    public static final String META_DATA_NETWORK_SECURITY_CONFIG =
-            "android.security.net.config";
     private static final boolean DBG = true;
     private static final String LOG_TAG = "NetworkSecurityConfig";
 
     private final Object mLock = new Object();
     private final Context mContext;
+    private final ApplicationInfo mApplicationInfo;
 
     private ConfigSource mConfigSource;
 
     public ManifestConfigSource(Context context) {
         mContext = context;
+        // Cache the info because ApplicationInfo is mutable and apps do modify it :(
+        mApplicationInfo = new ApplicationInfo(context.getApplicationInfo());
     }
 
     @Override
@@ -54,34 +55,28 @@ public class ManifestConfigSource implements ConfigSource {
             if (mConfigSource != null) {
                 return mConfigSource;
             }
-            ApplicationInfo info;
-            try {
-                info = mContext.getPackageManager().getApplicationInfo(mContext.getPackageName(),
-                        PackageManager.GET_META_DATA);
-            } catch (PackageManager.NameNotFoundException e) {
-                throw new RuntimeException("Failed to look up ApplicationInfo", e);
-            }
-            int configResourceId = 0;
-            if (info != null && info.metaData != null) {
-                configResourceId = info.metaData.getInt(META_DATA_NETWORK_SECURITY_CONFIG);
-            }
-
+            int configResource = mApplicationInfo.networkSecurityConfigRes;
             ConfigSource source;
-            if (configResourceId != 0) {
-                boolean debugBuild = (info.flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            if (configResource != 0) {
+                boolean debugBuild =
+                        (mApplicationInfo.flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
                 if (DBG) {
                     Log.d(LOG_TAG, "Using Network Security Config from resource "
-                            + mContext.getResources().getResourceEntryName(configResourceId)
+                            + mContext.getResources()
+                                .getResourceEntryName(configResource)
                             + " debugBuild: " + debugBuild);
                 }
-                source = new XmlConfigSource(mContext, configResourceId, debugBuild);
+                source = new XmlConfigSource(mContext, configResource, mApplicationInfo);
             } else {
                 if (DBG) {
                     Log.d(LOG_TAG, "No Network Security Config specified, using platform default");
                 }
+                // the legacy FLAG_USES_CLEARTEXT_TRAFFIC is not supported for Ephemeral apps, they
+                // should use the network security config.
                 boolean usesCleartextTraffic =
-                        (info.flags & ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC) != 0;
-                source = new DefaultConfigSource(usesCleartextTraffic);
+                        (mApplicationInfo.flags & ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC) != 0
+                        && !mApplicationInfo.isInstantApp();
+                source = new DefaultConfigSource(usesCleartextTraffic, mApplicationInfo);
             }
             mConfigSource = source;
             return mConfigSource;
@@ -92,11 +87,11 @@ public class ManifestConfigSource implements ConfigSource {
 
         private final NetworkSecurityConfig mDefaultConfig;
 
-        public DefaultConfigSource(boolean usesCleartextTraffic) {
-            mDefaultConfig = NetworkSecurityConfig.getDefaultBuilder()
+        DefaultConfigSource(boolean usesCleartextTraffic, ApplicationInfo info) {
+            mDefaultConfig = NetworkSecurityConfig.getDefaultBuilder(info)
                     .setCleartextTrafficPermitted(usesCleartextTraffic)
                     .build();
-       }
+        }
 
         @Override
         public NetworkSecurityConfig getDefaultConfig() {

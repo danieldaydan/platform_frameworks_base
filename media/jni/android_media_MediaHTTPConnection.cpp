@@ -27,7 +27,7 @@
 
 #include "android_runtime/AndroidRuntime.h"
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 
 namespace android {
 
@@ -148,7 +148,7 @@ static jint android_media_MediaHTTPConnection_native_readAt(
                 byteArrayObj,
                 0,
                 n,
-                (jbyte *)conn->getIMemory()->pointer());
+                (jbyte *)conn->getIMemory()->unsecurePointer());
     }
 
     return n;

@@ -20,7 +20,7 @@
 #include <utils/Log.h>
 
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 #include "core_jni_helpers.h"
 #include <android_runtime/android_graphics_SurfaceTexture.h>
 #include <android_runtime/android_view_Surface.h>
@@ -77,6 +77,10 @@ public:
     virtual void postData(int32_t msgType, const sp<IMemory>& dataPtr,
                           camera_frame_metadata_t *metadata);
     virtual void postDataTimestamp(nsecs_t timestamp, int32_t msgType, const sp<IMemory>& dataPtr);
+    virtual void postRecordingFrameHandleTimestamp(nsecs_t timestamp, native_handle_t* handle);
+    virtual void postRecordingFrameHandleTimestampBatch(
+            const std::vector<nsecs_t>& timestamps,
+            const std::vector<native_handle_t*>& handles);
     void postMetadata(JNIEnv *env, int32_t msgType, camera_frame_metadata_t *metadata);
     void addCallbackBuffer(JNIEnv *env, jbyteArray cbb, int msgType);
     void setCallbackMode(JNIEnv *env, bool installed, bool manualMode);
@@ -252,6 +256,10 @@ void JNICameraContext::copyAndPost(JNIEnv* env, const sp<IMemory>& dataPtr, int 
         ssize_t offset;
         size_t size;
         sp<IMemoryHeap> heap = dataPtr->getMemory(&offset, &size);
+        if (heap == NULL) {
+            ALOGV("copyAndPost: skipping null memory callback!");
+            return;
+        }
         ALOGV("copyAndPost: off=%zd, size=%zu", offset, size);
         uint8_t *heapBase = (uint8_t*)heap->base();
 
@@ -347,6 +355,34 @@ void JNICameraContext::postDataTimestamp(nsecs_t timestamp, int32_t msgType, con
 {
     // TODO: plumb up to Java. For now, just drop the timestamp
     postData(msgType, dataPtr, NULL);
+}
+
+void JNICameraContext::postRecordingFrameHandleTimestamp(nsecs_t, native_handle_t* handle) {
+    // Video buffers are not needed at app layer so just return the video buffers here.
+    // This may be called when stagefright just releases camera but there are still outstanding
+    // video buffers.
+    if (mCamera != nullptr) {
+        mCamera->releaseRecordingFrameHandle(handle);
+    } else {
+        native_handle_close(handle);
+        native_handle_delete(handle);
+    }
+}
+
+void JNICameraContext::postRecordingFrameHandleTimestampBatch(
+        const std::vector<nsecs_t>&,
+        const std::vector<native_handle_t*>& handles) {
+    // Video buffers are not needed at app layer so just return the video buffers here.
+    // This may be called when stagefright just releases camera but there are still outstanding
+    // video buffers.
+    if (mCamera != nullptr) {
+        mCamera->releaseRecordingFrameHandleBatch(handles);
+    } else {
+        for (auto& handle : handles) {
+            native_handle_close(handle);
+            native_handle_delete(handle);
+        }
+    }
 }
 
 void JNICameraContext::postMetadata(JNIEnv *env, int32_t msgType, camera_frame_metadata_t *metadata)
@@ -534,7 +570,7 @@ static jint android_hardware_Camera_native_setup(JNIEnv *env, jobject thiz,
     if (halVersion == CAMERA_HAL_API_VERSION_NORMAL_CONNECT) {
         // Default path: hal version is don't care, do normal camera connect.
         camera = Camera::connect(cameraId, clientName,
-                Camera::USE_CALLING_UID);
+                Camera::USE_CALLING_UID, Camera::USE_CALLING_PID);
     } else {
         jint status = Camera::connectLegacy(cameraId, halVersion, clientName,
                 Camera::USE_CALLING_UID, camera);
@@ -567,6 +603,46 @@ static jint android_hardware_Camera_native_setup(JNIEnv *env, jobject thiz,
 
     // save context in opaque field
     env->SetLongField(thiz, fields.context, (jlong)context.get());
+
+    // Update default display orientation in case the sensor is reverse-landscape
+    CameraInfo cameraInfo;
+    status_t rc = Camera::getCameraInfo(cameraId, &cameraInfo);
+    if (rc != NO_ERROR) {
+        ALOGE("%s: getCameraInfo error: %d", __FUNCTION__, rc);
+        return rc;
+    }
+    int defaultOrientation = 0;
+    switch (cameraInfo.orientation) {
+        case 0:
+            break;
+        case 90:
+            if (cameraInfo.facing == CAMERA_FACING_FRONT) {
+                defaultOrientation = 180;
+            }
+            break;
+        case 180:
+            defaultOrientation = 180;
+            break;
+        case 270:
+            if (cameraInfo.facing != CAMERA_FACING_FRONT) {
+                defaultOrientation = 180;
+            }
+            break;
+        default:
+            ALOGE("Unexpected camera orientation %d!", cameraInfo.orientation);
+            break;
+    }
+    if (defaultOrientation != 0) {
+        ALOGV("Setting default display orientation to %d", defaultOrientation);
+        rc = camera->sendCommand(CAMERA_CMD_SET_DISPLAY_ORIENTATION,
+                defaultOrientation, 0);
+        if (rc != NO_ERROR) {
+            ALOGE("Unable to update default orientation: %s (%d)",
+                    strerror(-rc), rc);
+            return rc;
+        }
+    }
+
     return NO_ERROR;
 }
 
@@ -947,6 +1023,41 @@ static void android_hardware_Camera_enableFocusMoveCallback(JNIEnv *env, jobject
     }
 }
 
+static void android_hardware_Camera_setAudioRestriction(
+        JNIEnv *env, jobject thiz, jint mode)
+{
+    ALOGV("setAudioRestriction");
+    sp<Camera> camera = get_native_camera(env, thiz, NULL);
+    if (camera == 0) {
+        jniThrowRuntimeException(env, "camera has been disconnected");
+        return;
+    }
+
+    int32_t ret = camera->setAudioRestriction(mode);
+    if (ret < 0) {
+        jniThrowRuntimeException(env, "Illegal argument or low-level eror");
+        return;
+    }
+}
+
+static int32_t android_hardware_Camera_getAudioRestriction(
+        JNIEnv *env, jobject thiz)
+{
+    ALOGV("getAudioRestriction");
+    sp<Camera> camera = get_native_camera(env, thiz, NULL);
+    if (camera == 0) {
+        jniThrowRuntimeException(env, "camera has been disconnected");
+        return -1;
+    }
+
+    int32_t ret = camera->getGlobalAudioRestriction();
+    if (ret < 0) {
+        jniThrowRuntimeException(env, "Illegal argument or low-level eror");
+        return -1;
+    }
+    return ret;
+}
+
 //-------------------------------------------------
 
 static const JNINativeMethod camMethods[] = {
@@ -1031,6 +1142,12 @@ static const JNINativeMethod camMethods[] = {
   { "enableFocusMoveCallback",
     "(I)V",
     (void *)android_hardware_Camera_enableFocusMoveCallback},
+  { "setAudioRestriction",
+    "(I)V",
+    (void *)android_hardware_Camera_setAudioRestriction},
+  { "getAudioRestriction",
+    "()I",
+    (void *)android_hardware_Camera_getAudioRestriction},
 };
 
 struct field {

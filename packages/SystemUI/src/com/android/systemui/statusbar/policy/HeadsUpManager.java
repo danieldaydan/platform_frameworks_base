@@ -16,305 +16,182 @@
 
 package com.android.systemui.statusbar.policy;
 
+import static com.android.systemui.statusbar.notification.row.NotificationRowContentBinder.FLAG_CONTENT_VIEW_HEADS_UP;
+
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.content.Context;
 import android.content.res.Resources;
 import android.database.ContentObserver;
-import android.os.Handler;
-import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.ArrayMap;
 import android.util.Log;
-import android.util.Pools;
-import android.view.View;
-import android.view.ViewTreeObserver;
-import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityManager;
 
 import com.android.internal.logging.MetricsLogger;
+import com.android.systemui.Dependency;
 import com.android.systemui.R;
-import com.android.systemui.statusbar.ExpandableNotificationRow;
-import com.android.systemui.statusbar.NotificationData;
-import com.android.systemui.statusbar.phone.PhoneStatusBar;
+import com.android.systemui.statusbar.AlertingNotificationManager;
+import com.android.systemui.statusbar.notification.collection.NotificationEntry;
+import com.android.systemui.statusbar.notification.row.NotificationRowContentBinder.InflationFlag;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Stack;
-import java.util.TreeSet;
 
 /**
  * A manager which handles heads up notifications which is a special mode where
  * they simply peek from the top of the screen.
  */
-public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsListener {
+public abstract class HeadsUpManager extends AlertingNotificationManager {
     private static final String TAG = "HeadsUpManager";
-    private static final boolean DEBUG = false;
     private static final String SETTING_HEADS_UP_SNOOZE_LENGTH_MS = "heads_up_snooze_length_ms";
-    private static final int TAG_CLICKED_NOTIFICATION = R.id.is_clicked_heads_up_tag;
 
-    private final int mHeadsUpNotificationDecay;
-    private final int mMinimumDisplayTime;
+    protected final HashSet<OnHeadsUpChangedListener> mListeners = new HashSet<>();
 
-    private final int mTouchAcceptanceDelay;
+    protected final Context mContext;
+
+    protected int mTouchAcceptanceDelay;
+    protected int mSnoozeLengthMs;
+    protected boolean mHasPinnedNotification;
+    protected int mUser;
+
     private final ArrayMap<String, Long> mSnoozedPackages;
-    private final HashSet<OnHeadsUpChangedListener> mListeners = new HashSet<>();
-    private final int mDefaultSnoozeLengthMs;
-    private final Handler mHandler = new Handler();
-    private final Pools.Pool<HeadsUpEntry> mEntryPool = new Pools.Pool<HeadsUpEntry>() {
+    private final AccessibilityManagerWrapper mAccessibilityMgr;
 
-        private Stack<HeadsUpEntry> mPoolObjects = new Stack<>();
-
-        @Override
-        public HeadsUpEntry acquire() {
-            if (!mPoolObjects.isEmpty()) {
-                return mPoolObjects.pop();
-            }
-            return new HeadsUpEntry();
-        }
-
-        @Override
-        public boolean release(HeadsUpEntry instance) {
-            instance.reset();
-            mPoolObjects.push(instance);
-            return true;
-        }
-    };
-
-    private final View mStatusBarWindowView;
-    private final int mStatusBarHeight;
-    private final int mNotificationsTopPadding;
-    private final Context mContext;
-    private PhoneStatusBar mBar;
-    private int mSnoozeLengthMs;
-    private ContentObserver mSettingsObserver;
-    private HashMap<String, HeadsUpEntry> mHeadsUpEntries = new HashMap<>();
-    private TreeSet<HeadsUpEntry> mSortedEntries = new TreeSet<>();
-    private HashSet<String> mSwipedOutKeys = new HashSet<>();
-    private int mUser;
-    private Clock mClock;
-    private boolean mReleaseOnExpandFinish;
-    private boolean mTrackingHeadsUp;
-    private HashSet<NotificationData.Entry> mEntriesToRemoveAfterExpand = new HashSet<>();
-    private boolean mIsExpanded;
-    private boolean mHasPinnedNotification;
-    private int[] mTmpTwoArray = new int[2];
-    private boolean mHeadsUpGoingAway;
-    private boolean mWaitingOnCollapseWhenGoingAway;
-    private boolean mIsObserving;
-
-    public HeadsUpManager(final Context context, View statusBarWindowView) {
+    public HeadsUpManager(@NonNull final Context context) {
         mContext = context;
-        Resources resources = mContext.getResources();
+        mAccessibilityMgr = Dependency.get(AccessibilityManagerWrapper.class);
+        Resources resources = context.getResources();
+        mMinimumDisplayTime = resources.getInteger(R.integer.heads_up_notification_minimum_time);
+        mAutoDismissNotificationDecay = resources.getInteger(R.integer.heads_up_notification_decay);
         mTouchAcceptanceDelay = resources.getInteger(R.integer.touch_acceptance_delay);
         mSnoozedPackages = new ArrayMap<>();
-        mDefaultSnoozeLengthMs = resources.getInteger(R.integer.heads_up_default_snooze_length_ms);
-        mSnoozeLengthMs = mDefaultSnoozeLengthMs;
-        mMinimumDisplayTime = resources.getInteger(R.integer.heads_up_notification_minimum_time);
-        mHeadsUpNotificationDecay = resources.getInteger(R.integer.heads_up_notification_decay);
-        mClock = new Clock();
+        int defaultSnoozeLengthMs =
+                resources.getInteger(R.integer.heads_up_default_snooze_length_ms);
 
         mSnoozeLengthMs = Settings.Global.getInt(context.getContentResolver(),
-                SETTING_HEADS_UP_SNOOZE_LENGTH_MS, mDefaultSnoozeLengthMs);
-        mSettingsObserver = new ContentObserver(mHandler) {
+                SETTING_HEADS_UP_SNOOZE_LENGTH_MS, defaultSnoozeLengthMs);
+        ContentObserver settingsObserver = new ContentObserver(mHandler) {
             @Override
             public void onChange(boolean selfChange) {
                 final int packageSnoozeLengthMs = Settings.Global.getInt(
                         context.getContentResolver(), SETTING_HEADS_UP_SNOOZE_LENGTH_MS, -1);
                 if (packageSnoozeLengthMs > -1 && packageSnoozeLengthMs != mSnoozeLengthMs) {
                     mSnoozeLengthMs = packageSnoozeLengthMs;
-                    if (DEBUG) Log.v(TAG, "mSnoozeLengthMs = " + mSnoozeLengthMs);
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "mSnoozeLengthMs = " + mSnoozeLengthMs);
+                    }
                 }
             }
         };
         context.getContentResolver().registerContentObserver(
                 Settings.Global.getUriFor(SETTING_HEADS_UP_SNOOZE_LENGTH_MS), false,
-                mSettingsObserver);
-        mStatusBarWindowView = statusBarWindowView;
-        mStatusBarHeight = resources.getDimensionPixelSize(
-                com.android.internal.R.dimen.status_bar_height);
-        mNotificationsTopPadding = context.getResources()
-                .getDimensionPixelSize(R.dimen.notifications_top_padding);
+                settingsObserver);
     }
 
-    private void updateTouchableRegionListener() {
-        boolean shouldObserve = mHasPinnedNotification || mHeadsUpGoingAway
-                || mWaitingOnCollapseWhenGoingAway;
-        if (shouldObserve == mIsObserving) {
-            return;
-        }
-        if (shouldObserve) {
-            mStatusBarWindowView.getViewTreeObserver().addOnComputeInternalInsetsListener(this);
-            mStatusBarWindowView.requestLayout();
-        } else {
-            mStatusBarWindowView.getViewTreeObserver().removeOnComputeInternalInsetsListener(this);
-        }
-        mIsObserving = shouldObserve;
-    }
-
-    public void setBar(PhoneStatusBar bar) {
-        mBar = bar;
-    }
-
-    public void addListener(OnHeadsUpChangedListener listener) {
+    /**
+     * Adds an OnHeadUpChangedListener to observe events.
+     */
+    public void addListener(@NonNull OnHeadsUpChangedListener listener) {
         mListeners.add(listener);
     }
 
-    public PhoneStatusBar getBar() {
-        return mBar;
+    /**
+     * Removes the OnHeadUpChangedListener from the observer list.
+     */
+    public void removeListener(@NonNull OnHeadsUpChangedListener listener) {
+        mListeners.remove(listener);
     }
 
-    /**
-     * Called when posting a new notification to the heads up.
-     */
-    public void showNotification(NotificationData.Entry headsUp) {
-        if (DEBUG) Log.v(TAG, "showNotification");
-        addHeadsUpEntry(headsUp);
-        updateNotification(headsUp, true);
-        headsUp.setInterruption();
-    }
-
-    /**
-     * Called when updating or posting a notification to the heads up.
-     */
-    public void updateNotification(NotificationData.Entry headsUp, boolean alert) {
-        if (DEBUG) Log.v(TAG, "updateNotification");
-
-        headsUp.row.setChildrenExpanded(false /* expanded */, false /* animated */);
-        headsUp.row.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
-
-        if (alert) {
-            HeadsUpEntry headsUpEntry = mHeadsUpEntries.get(headsUp.key);
-            headsUpEntry.updateEntry();
-            setEntryPinned(headsUpEntry, shouldHeadsUpBecomePinned(headsUp));
+    public void updateNotification(@NonNull String key, boolean alert) {
+        super.updateNotification(key, alert);
+        AlertEntry alertEntry = getHeadsUpEntry(key);
+        if (alert && alertEntry != null) {
+            setEntryPinned((HeadsUpEntry) alertEntry, shouldHeadsUpBecomePinned(alertEntry.mEntry));
         }
     }
 
-    private void addHeadsUpEntry(NotificationData.Entry entry) {
-        HeadsUpEntry headsUpEntry = mEntryPool.acquire();
+    protected boolean shouldHeadsUpBecomePinned(@NonNull NotificationEntry entry) {
+        return hasFullScreenIntent(entry);
+    }
 
-        // This will also add the entry to the sortedList
-        headsUpEntry.setEntry(entry);
-        mHeadsUpEntries.put(entry.key, headsUpEntry);
-        entry.row.setHeadsUp(true);
-        setEntryPinned(headsUpEntry, shouldHeadsUpBecomePinned(entry));
-        for (OnHeadsUpChangedListener listener : mListeners) {
-            listener.onHeadsUpStateChanged(entry, true);
+    protected boolean hasFullScreenIntent(@NonNull NotificationEntry entry) {
+        return entry.getSbn().getNotification().fullScreenIntent != null;
+    }
+
+    protected void setEntryPinned(
+            @NonNull HeadsUpManager.HeadsUpEntry headsUpEntry, boolean isPinned) {
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "setEntryPinned: " + isPinned);
         }
-        entry.row.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
-    }
-
-    private boolean shouldHeadsUpBecomePinned(NotificationData.Entry entry) {
-        return !mIsExpanded || hasFullScreenIntent(entry);
-    }
-
-    private boolean hasFullScreenIntent(NotificationData.Entry entry) {
-        return entry.notification.getNotification().fullScreenIntent != null;
-    }
-
-    private void setEntryPinned(HeadsUpEntry headsUpEntry, boolean isPinned) {
-        ExpandableNotificationRow row = headsUpEntry.entry.row;
-        if (row.isPinned() != isPinned) {
-            row.setPinned(isPinned);
+        NotificationEntry entry = headsUpEntry.mEntry;
+        if (entry.isRowPinned() != isPinned) {
+            entry.setRowPinned(isPinned);
             updatePinnedMode();
             for (OnHeadsUpChangedListener listener : mListeners) {
                 if (isPinned) {
-                    listener.onHeadsUpPinned(row);
+                    listener.onHeadsUpPinned(entry);
                 } else {
-                    listener.onHeadsUpUnPinned(row);
+                    listener.onHeadsUpUnPinned(entry);
                 }
             }
         }
     }
 
-    private void removeHeadsUpEntry(NotificationData.Entry entry) {
-        HeadsUpEntry remove = mHeadsUpEntries.remove(entry.key);
-        mSortedEntries.remove(remove);
-        entry.row.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
-        entry.row.setHeadsUp(false);
-        setEntryPinned(remove, false /* isPinned */);
+    public @InflationFlag int getContentFlag() {
+        return FLAG_CONTENT_VIEW_HEADS_UP;
+    }
+
+    @Override
+    protected void onAlertEntryAdded(AlertEntry alertEntry) {
+        NotificationEntry entry = alertEntry.mEntry;
+        entry.setHeadsUp(true);
+        setEntryPinned((HeadsUpEntry) alertEntry, shouldHeadsUpBecomePinned(entry));
+        for (OnHeadsUpChangedListener listener : mListeners) {
+            listener.onHeadsUpStateChanged(entry, true);
+        }
+    }
+
+    @Override
+    protected void onAlertEntryRemoved(AlertEntry alertEntry) {
+        NotificationEntry entry = alertEntry.mEntry;
+        entry.setHeadsUp(false);
+        setEntryPinned((HeadsUpEntry) alertEntry, false /* isPinned */);
         for (OnHeadsUpChangedListener listener : mListeners) {
             listener.onHeadsUpStateChanged(entry, false);
         }
-        mEntryPool.release(remove);
     }
 
-    private void updatePinnedMode() {
+    protected void updatePinnedMode() {
         boolean hasPinnedNotification = hasPinnedNotificationInternal();
         if (hasPinnedNotification == mHasPinnedNotification) {
             return;
+        }
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+            Log.v(TAG, "Pinned mode changed: " + mHasPinnedNotification + " -> " +
+                       hasPinnedNotification);
         }
         mHasPinnedNotification = hasPinnedNotification;
         if (mHasPinnedNotification) {
             MetricsLogger.count(mContext, "note_peek", 1);
         }
-        updateTouchableRegionListener();
         for (OnHeadsUpChangedListener listener : mListeners) {
             listener.onHeadsUpPinnedModeChanged(hasPinnedNotification);
         }
     }
 
     /**
-     * React to the removal of the notification in the heads up.
-     *
-     * @return true if the notification was removed and false if it still needs to be kept around
-     * for a bit since it wasn't shown long enough
+     * Returns if the given notification is snoozed or not.
      */
-    public boolean removeNotification(String key) {
-        if (DEBUG) Log.v(TAG, "remove");
-        if (wasShownLongEnough(key)) {
-            releaseImmediately(key);
-            return true;
-        } else {
-            getHeadsUpEntry(key).removeAsSoonAsPossible();
-            return false;
-        }
-    }
-
-    private boolean wasShownLongEnough(String key) {
-        HeadsUpEntry headsUpEntry = getHeadsUpEntry(key);
-        HeadsUpEntry topEntry = getTopEntry();
-        if (mSwipedOutKeys.contains(key)) {
-            // We always instantly dismiss views being manually swiped out.
-            mSwipedOutKeys.remove(key);
-            return true;
-        }
-        if (headsUpEntry != topEntry) {
-            return true;
-        }
-        return headsUpEntry.wasShownLongEnough();
-    }
-
-    public boolean isHeadsUp(String key) {
-        return mHeadsUpEntries.containsKey(key);
-    }
-
-    /**
-     * Push any current Heads Up notification down into the shade.
-     */
-    public void releaseAllImmediately() {
-        if (DEBUG) Log.v(TAG, "releaseAllImmediately");
-        ArrayList<String> keys = new ArrayList<>(mHeadsUpEntries.keySet());
-        for (String key : keys) {
-            releaseImmediately(key);
-        }
-    }
-
-    public void releaseImmediately(String key) {
-        HeadsUpEntry headsUpEntry = getHeadsUpEntry(key);
-        if (headsUpEntry == null) {
-            return;
-        }
-        NotificationData.Entry shadeEntry = headsUpEntry.entry;
-        removeHeadsUpEntry(shadeEntry);
-    }
-
-    public boolean isSnoozed(String packageName) {
+    public boolean isSnoozed(@NonNull String packageName) {
         final String key = snoozeKey(packageName, mUser);
         Long snoozedUntil = mSnoozedPackages.get(key);
         if (snoozedUntil != null) {
-            if (snoozedUntil > SystemClock.elapsedRealtime()) {
-                if (DEBUG) Log.v(TAG, key + " snoozed");
+            if (snoozedUntil > mClock.currentTimeMillis()) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, key + " snoozed");
+                }
                 return true;
             }
             mSnoozedPackages.remove(packageName);
@@ -322,92 +199,71 @@ public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsL
         return false;
     }
 
+    /**
+     * Snoozes all current Heads Up Notifications.
+     */
     public void snooze() {
-        for (String key : mHeadsUpEntries.keySet()) {
-            HeadsUpEntry entry = mHeadsUpEntries.get(key);
-            String packageName = entry.entry.notification.getPackageName();
+        for (String key : mAlertEntries.keySet()) {
+            AlertEntry entry = getHeadsUpEntry(key);
+            String packageName = entry.mEntry.getSbn().getPackageName();
             mSnoozedPackages.put(snoozeKey(packageName, mUser),
-                    SystemClock.elapsedRealtime() + mSnoozeLengthMs);
+                    mClock.currentTimeMillis() + mSnoozeLengthMs);
         }
-        mReleaseOnExpandFinish = true;
     }
 
-    private static String snoozeKey(String packageName, int user) {
+    @NonNull
+    private static String snoozeKey(@NonNull String packageName, int user) {
         return user + "," + packageName;
     }
 
-    private HeadsUpEntry getHeadsUpEntry(String key) {
-        return mHeadsUpEntries.get(key);
-    }
-
-    public NotificationData.Entry getEntry(String key) {
-        return mHeadsUpEntries.get(key).entry;
-    }
-
-    public TreeSet<HeadsUpEntry> getSortedEntries() {
-        return mSortedEntries;
-    }
-
-    public HeadsUpEntry getTopEntry() {
-        return mSortedEntries.isEmpty() ? null : mSortedEntries.first();
+    @Nullable
+    protected HeadsUpEntry getHeadsUpEntry(@NonNull String key) {
+        return (HeadsUpEntry) mAlertEntries.get(key);
     }
 
     /**
-     * Decides whether a click is invalid for a notification, i.e it has not been shown long enough
-     * that a user might have consciously clicked on it.
-     *
-     * @param key the key of the touched notification
-     * @return whether the touch is invalid and should be discarded
+     * Returns the top Heads Up Notification, which appears to show at first.
      */
-    public boolean shouldSwallowClick(String key) {
-        HeadsUpEntry entry = mHeadsUpEntries.get(key);
-        if (entry != null && mClock.currentTimeMillis() < entry.postTime) {
-            return true;
-        }
-        return false;
+    @Nullable
+    public NotificationEntry getTopEntry() {
+        HeadsUpEntry topEntry = getTopHeadsUpEntry();
+        return (topEntry != null) ? topEntry.mEntry : null;
     }
 
-    public void onComputeInternalInsets(ViewTreeObserver.InternalInsetsInfo info) {
-        if (mIsExpanded) {
-            // The touchable region is always the full area when expanded
-            return;
+    @Nullable
+    protected HeadsUpEntry getTopHeadsUpEntry() {
+        if (mAlertEntries.isEmpty()) {
+            return null;
         }
-        if (mHasPinnedNotification) {
-            int minX = Integer.MAX_VALUE;
-            int maxX = 0;
-            int minY = Integer.MAX_VALUE;
-            int maxY = 0;
-            for (HeadsUpEntry entry : mSortedEntries) {
-                ExpandableNotificationRow row = entry.entry.row;
-                if (row.isPinned()) {
-                    row.getLocationOnScreen(mTmpTwoArray);
-                    minX = Math.min(minX, mTmpTwoArray[0]);
-                    minY = Math.min(minY, 0);
-                    maxX = Math.max(maxX, mTmpTwoArray[0] + row.getWidth());
-                    maxY = Math.max(maxY, row.getHeadsUpHeight());
-                }
+        HeadsUpEntry topEntry = null;
+        for (AlertEntry entry: mAlertEntries.values()) {
+            if (topEntry == null || entry.compareTo(topEntry) < 0) {
+                topEntry = (HeadsUpEntry) entry;
             }
-
-            info.setTouchableInsets(ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION);
-            info.touchableRegion.set(minX, minY, maxX, maxY + mNotificationsTopPadding);
-        } else if (mHeadsUpGoingAway || mWaitingOnCollapseWhenGoingAway) {
-            info.setTouchableInsets(ViewTreeObserver.InternalInsetsInfo.TOUCHABLE_INSETS_REGION);
-            info.touchableRegion.set(0, 0, mStatusBarWindowView.getWidth(), mStatusBarHeight);
         }
+        return topEntry;
     }
 
+    /**
+     * Sets the current user.
+     */
     public void setUser(int user) {
         mUser = user;
     }
 
-    public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+    public void dump(@NonNull FileDescriptor fd, @NonNull PrintWriter pw, @NonNull String[] args) {
         pw.println("HeadsUpManager state:");
+        dumpInternal(fd, pw, args);
+    }
+
+    protected void dumpInternal(
+            @NonNull FileDescriptor fd, @NonNull PrintWriter pw, @NonNull String[] args) {
         pw.print("  mTouchAcceptanceDelay="); pw.println(mTouchAcceptanceDelay);
         pw.print("  mSnoozeLengthMs="); pw.println(mSnoozeLengthMs);
-        pw.print("  now="); pw.println(SystemClock.elapsedRealtime());
+        pw.print("  now="); pw.println(mClock.currentTimeMillis());
         pw.print("  mUser="); pw.println(mUser);
-        for (HeadsUpEntry entry: mSortedEntries) {
-            pw.print("  HeadsUpEntry="); pw.println(entry.entry);
+        for (AlertEntry entry: mAlertEntries.values()) {
+            pw.print("  HeadsUpEntry="); pw.println(entry.mEntry);
         }
         int N = mSnoozedPackages.size();
         pw.println("  snoozed packages: " + N);
@@ -417,14 +273,17 @@ public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsL
         }
     }
 
+    /**
+     * Returns if there are any pinned Heads Up Notifications or not.
+     */
     public boolean hasPinnedHeadsUp() {
         return mHasPinnedNotification;
     }
 
     private boolean hasPinnedNotificationInternal() {
-        for (String key : mHeadsUpEntries.keySet()) {
-            HeadsUpEntry entry = mHeadsUpEntries.get(key);
-            if (entry.entry.row.isPinned()) {
+        for (String key : mAlertEntries.keySet()) {
+            AlertEntry entry = getHeadsUpEntry(key);
+            if (entry.mEntry.isRowPinned()) {
                 return true;
             }
         }
@@ -432,55 +291,33 @@ public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsL
     }
 
     /**
-     * Notifies that a notification was swiped out and will be removed.
-     *
-     * @param key the notification key
+     * Unpins all pinned Heads Up Notifications.
+     * @param userUnPinned The unpinned action is trigger by user real operation.
      */
-    public void addSwipedOutNotification(String key) {
-        mSwipedOutKeys.add(key);
-    }
-
-    public void unpinAll() {
-        for (String key : mHeadsUpEntries.keySet()) {
-            HeadsUpEntry entry = mHeadsUpEntries.get(key);
+    public void unpinAll(boolean userUnPinned) {
+        for (String key : mAlertEntries.keySet()) {
+            HeadsUpEntry entry = getHeadsUpEntry(key);
             setEntryPinned(entry, false /* isPinned */);
-        }
-    }
+            // maybe it got un sticky
+            entry.updateEntry(false /* updatePostTime */);
 
-    public void onExpandingFinished() {
-        if (mReleaseOnExpandFinish) {
-            releaseAllImmediately();
-            mReleaseOnExpandFinish = false;
-        } else {
-            for (NotificationData.Entry entry : mEntriesToRemoveAfterExpand) {
-                if (isHeadsUp(entry.key)) {
-                    // Maybe the heads-up was removed already
-                    removeHeadsUpEntry(entry);
+            // when the user unpinned all of HUNs by moving one HUN, all of HUNs should not stay
+            // on the screen.
+            if (userUnPinned && entry.mEntry != null) {
+                if (entry.mEntry.mustStayOnScreen()) {
+                    entry.mEntry.setHeadsUpIsVisible();
                 }
             }
         }
-        mEntriesToRemoveAfterExpand.clear();
     }
 
-    public void setTrackingHeadsUp(boolean trackingHeadsUp) {
-        mTrackingHeadsUp = trackingHeadsUp;
-    }
-
-    public void setIsExpanded(boolean isExpanded) {
-        if (isExpanded != mIsExpanded) {
-            mIsExpanded = isExpanded;
-            if (isExpanded) {
-                // make sure our state is sane
-                mWaitingOnCollapseWhenGoingAway = false;
-                mHeadsUpGoingAway = false;
-                updateTouchableRegionListener();
-            }
-        }
-    }
-
-    public int getTopHeadsUpHeight() {
-        HeadsUpEntry topEntry = getTopEntry();
-        return topEntry != null ? topEntry.entry.row.getHeadsUpHeight() : 0;
+    /**
+     * Returns the value of the tracking-heads-up flag. See the doc of {@code setTrackingHeadsUp} as
+     * well.
+     */
+    public boolean isTrackingHeadsUp() {
+        // Might be implemented in subclass.
+        return false;
     }
 
     /**
@@ -489,9 +326,9 @@ public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsL
      * @return -1 if the first argument should be ranked higher than the second, 1 if the second
      * one should be ranked higher and 0 if they are equal.
      */
-    public int compare(NotificationData.Entry a, NotificationData.Entry b) {
-        HeadsUpEntry aEntry = getHeadsUpEntry(a.key);
-        HeadsUpEntry bEntry = getHeadsUpEntry(b.key);
+    public int compare(@NonNull NotificationEntry a, @NonNull NotificationEntry b) {
+        AlertEntry aEntry = getHeadsUpEntry(a.getKey());
+        AlertEntry bEntry = getHeadsUpEntry(b.getKey());
         if (aEntry == null || bEntry == null) {
             return aEntry == null ? 1 : -1;
         }
@@ -499,158 +336,103 @@ public class HeadsUpManager implements ViewTreeObserver.OnComputeInternalInsetsL
     }
 
     /**
-     * Set that we are exiting the headsUp pinned mode, but some notifications might still be
-     * animating out. This is used to keep the touchable regions in a sane state.
+     * Set an entry to be expanded and therefore stick in the heads up area if it's pinned
+     * until it's collapsed again.
      */
-    public void setHeadsUpGoingAway(boolean headsUpGoingAway) {
-        if (headsUpGoingAway != mHeadsUpGoingAway) {
-            mHeadsUpGoingAway = headsUpGoingAway;
-            if (!headsUpGoingAway) {
-                waitForStatusBarLayout();
-            }
-            updateTouchableRegionListener();
+    public void setExpanded(@NonNull NotificationEntry entry, boolean expanded) {
+        HeadsUpEntry headsUpEntry = getHeadsUpEntry(entry.getKey());
+        if (headsUpEntry != null && entry.isRowPinned()) {
+            headsUpEntry.setExpanded(expanded);
         }
     }
 
-    /**
-     * We need to wait on the whole panel to collapse, before we can remove the touchable region
-     * listener.
-     */
-    private void waitForStatusBarLayout() {
-        mWaitingOnCollapseWhenGoingAway = true;
-        mStatusBarWindowView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
-            @Override
-            public void onLayoutChange(View v, int left, int top, int right, int bottom,
-                    int oldLeft,
-                    int oldTop, int oldRight, int oldBottom) {
-                if (mStatusBarWindowView.getHeight() <= mStatusBarHeight) {
-                    mStatusBarWindowView.removeOnLayoutChangeListener(this);
-                    mWaitingOnCollapseWhenGoingAway = false;
-                    updateTouchableRegionListener();
-                }
-            }
-        });
+    @NonNull
+    @Override
+    protected HeadsUpEntry createAlertEntry() {
+        return new HeadsUpEntry();
     }
 
-    public static void setIsClickedNotification(View child, boolean clicked) {
-        child.setTag(TAG_CLICKED_NOTIFICATION, clicked ? true : null);
+    public void onDensityOrFontScaleChanged() {
     }
 
-    public static boolean isClickedHeadsUpNotification(View child) {
-        Boolean clicked = (Boolean) child.getTag(TAG_CLICKED_NOTIFICATION);
-        return clicked != null && clicked;
+    public boolean isEntryAutoHeadsUpped(String key) {
+        return false;
     }
 
     /**
      * This represents a notification and how long it is in a heads up mode. It also manages its
      * lifecycle automatically when created.
      */
-    public class HeadsUpEntry implements Comparable<HeadsUpEntry> {
-        public NotificationData.Entry entry;
-        public long postTime;
-        public long earliestRemovaltime;
-        private Runnable mRemoveHeadsUpRunnable;
+    protected class HeadsUpEntry extends AlertEntry {
+        public boolean remoteInputActive;
+        protected boolean expanded;
 
-        public void setEntry(final NotificationData.Entry entry) {
-            this.entry = entry;
-
-            // The actual post time will be just after the heads-up really slided in
-            postTime = mClock.currentTimeMillis() + mTouchAcceptanceDelay;
-            mRemoveHeadsUpRunnable = new Runnable() {
-                @Override
-                public void run() {
-                    if (!mTrackingHeadsUp) {
-                        removeHeadsUpEntry(entry);
-                    } else {
-                        mEntriesToRemoveAfterExpand.add(entry);
-                    }
-                }
-            };
-            updateEntry();
-        }
-
-        public void updateEntry() {
-            mSortedEntries.remove(HeadsUpEntry.this);
-            long currentTime = mClock.currentTimeMillis();
-            earliestRemovaltime = currentTime + mMinimumDisplayTime;
-            postTime = Math.max(postTime, currentTime);
-            removeAutoRemovalCallbacks();
-            if (mEntriesToRemoveAfterExpand.contains(entry)) {
-                mEntriesToRemoveAfterExpand.remove(entry);
-            }
-            if (!hasFullScreenIntent(entry)) {
-                long finishTime = postTime + mHeadsUpNotificationDecay;
-                long removeDelay = Math.max(finishTime - currentTime, mMinimumDisplayTime);
-                mHandler.postDelayed(mRemoveHeadsUpRunnable, removeDelay);
-            }
-            mSortedEntries.add(HeadsUpEntry.this);
+        @Override
+        public boolean isSticky() {
+            return (mEntry.isRowPinned() && expanded)
+                    || remoteInputActive || hasFullScreenIntent(mEntry);
         }
 
         @Override
-        public int compareTo(HeadsUpEntry o) {
-            boolean selfFullscreen = hasFullScreenIntent(entry);
-            boolean otherFullscreen = hasFullScreenIntent(o.entry);
+        public int compareTo(@NonNull AlertEntry alertEntry) {
+            HeadsUpEntry headsUpEntry = (HeadsUpEntry) alertEntry;
+            boolean isPinned = mEntry.isRowPinned();
+            boolean otherPinned = headsUpEntry.mEntry.isRowPinned();
+            if (isPinned && !otherPinned) {
+                return -1;
+            } else if (!isPinned && otherPinned) {
+                return 1;
+            }
+            boolean selfFullscreen = hasFullScreenIntent(mEntry);
+            boolean otherFullscreen = hasFullScreenIntent(headsUpEntry.mEntry);
             if (selfFullscreen && !otherFullscreen) {
                 return -1;
             } else if (!selfFullscreen && otherFullscreen) {
                 return 1;
             }
-            return postTime < o.postTime ? 1
-                    : postTime == o.postTime ? entry.key.compareTo(o.entry.key)
-                            : -1;
+
+            if (remoteInputActive && !headsUpEntry.remoteInputActive) {
+                return -1;
+            } else if (!remoteInputActive && headsUpEntry.remoteInputActive) {
+                return 1;
+            }
+
+            return super.compareTo(headsUpEntry);
         }
 
-        public void removeAutoRemovalCallbacks() {
-            mHandler.removeCallbacks(mRemoveHeadsUpRunnable);
+        public void setExpanded(boolean expanded) {
+            this.expanded = expanded;
         }
 
-        public boolean wasShownLongEnough() {
-            return earliestRemovaltime < mClock.currentTimeMillis();
-        }
-
-        public void removeAsSoonAsPossible() {
-            removeAutoRemovalCallbacks();
-            mHandler.postDelayed(mRemoveHeadsUpRunnable,
-                    earliestRemovaltime - mClock.currentTimeMillis());
-        }
-
+        @Override
         public void reset() {
-            removeAutoRemovalCallbacks();
-            entry = null;
-            mRemoveHeadsUpRunnable = null;
+            super.reset();
+            expanded = false;
+            remoteInputActive = false;
         }
-    }
 
-    public static class Clock {
-        public long currentTimeMillis() {
-            return SystemClock.elapsedRealtime();
+        @Override
+        protected long calculatePostTime() {
+            // The actual post time will be just after the heads-up really slided in
+            return super.calculatePostTime() + mTouchAcceptanceDelay;
         }
-    }
 
-    public interface OnHeadsUpChangedListener {
-        /**
-         * The state whether there exist pinned heads-ups or not changed.
-         *
-         * @param inPinnedMode whether there are any pinned heads-ups
-         */
-        void onHeadsUpPinnedModeChanged(boolean inPinnedMode);
+        @Override
+        protected long calculateFinishTime() {
+            return mPostTime + getRecommendedHeadsUpTimeoutMs(mAutoDismissNotificationDecay);
+        }
 
         /**
-         * A notification was just pinned to the top.
+         * Get user-preferred or default timeout duration. The larger one will be returned.
+         * @return milliseconds before auto-dismiss
+         * @param requestedTimeout
          */
-        void onHeadsUpPinned(ExpandableNotificationRow headsUp);
-
-        /**
-         * A notification was just unpinned from the top.
-         */
-        void onHeadsUpUnPinned(ExpandableNotificationRow headsUp);
-
-        /**
-         * A notification just became a heads up or turned back to its normal state.
-         *
-         * @param entry the entry of the changed notification
-         * @param isHeadsUp whether the notification is now a headsUp notification
-         */
-        void onHeadsUpStateChanged(NotificationData.Entry entry, boolean isHeadsUp);
+        protected int getRecommendedHeadsUpTimeoutMs(int requestedTimeout) {
+            return mAccessibilityMgr.getRecommendedTimeoutMillis(
+                    requestedTimeout,
+                    AccessibilityManager.FLAG_CONTENT_CONTROLS
+                            | AccessibilityManager.FLAG_CONTENT_ICONS
+                            | AccessibilityManager.FLAG_CONTENT_TEXT);
+        }
     }
 }

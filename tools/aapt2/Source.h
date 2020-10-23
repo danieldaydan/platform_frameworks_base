@@ -19,72 +19,72 @@
 
 #include <ostream>
 #include <string>
-#include <tuple>
+
+#include "android-base/stringprintf.h"
+#include "androidfw/StringPiece.h"
+
+#include "util/Maybe.h"
 
 namespace aapt {
 
-struct SourceLineColumn;
-struct SourceLine;
-
-/**
- * Represents a file on disk. Used for logging and
- * showing errors.
- */
+// Represents a file on disk. Used for logging and showing errors.
 struct Source {
-    std::string path;
+  std::string path;
+  Maybe<size_t> line;
+  Maybe<std::string> archive;
 
-    inline SourceLine line(size_t line) const;
-};
+  Source() = default;
 
-/**
- * Represents a file on disk and a line number in that file.
- * Used for logging and showing errors.
- */
-struct SourceLine {
-    std::string path;
-    size_t line;
+  inline Source(const android::StringPiece& path) : path(path.to_string()) {  // NOLINT(implicit)
+  }
 
-    inline SourceLineColumn column(size_t column) const;
-};
+  inline Source(const android::StringPiece& path, const android::StringPiece& archive)
+      : path(path.to_string()), archive(archive.to_string()) {}
 
-/**
- * Represents a file on disk and a line:column number in that file.
- * Used for logging and showing errors.
- */
-struct SourceLineColumn {
-    std::string path;
-    size_t line;
-    size_t column;
+  inline Source(const android::StringPiece& path, size_t line)
+      : path(path.to_string()), line(line) {}
+
+  inline Source WithLine(size_t line) const {
+    return Source(path, line);
+  }
+
+  std::string to_string() const {
+    std::string s = path;
+    if (archive) {
+      s = ::android::base::StringPrintf("%s@%s", archive.value().c_str(), s.c_str());
+    }
+    if (line) {
+      s = ::android::base::StringPrintf("%s:%zd", s.c_str(), line.value());
+    }
+    return s;
+  }
 };
 
 //
 // Implementations
 //
 
-SourceLine Source::line(size_t line) const {
-    return SourceLine{ path, line };
-}
-
-SourceLineColumn SourceLine::column(size_t column) const {
-    return SourceLineColumn{ path, line, column };
-}
-
 inline ::std::ostream& operator<<(::std::ostream& out, const Source& source) {
-    return out << source.path;
+  return out << source.to_string();
 }
 
-inline ::std::ostream& operator<<(::std::ostream& out, const SourceLine& source) {
-    return out << source.path << ":" << source.line;
+inline bool operator==(const Source& lhs, const Source& rhs) {
+  return lhs.path == rhs.path && lhs.line == rhs.line;
 }
 
-inline ::std::ostream& operator<<(::std::ostream& out, const SourceLineColumn& source) {
-    return out << source.path << ":" << source.line << ":" << source.column;
+inline bool operator<(const Source& lhs, const Source& rhs) {
+  int cmp = lhs.path.compare(rhs.path);
+  if (cmp < 0) return true;
+  if (cmp > 0) return false;
+  if (lhs.line) {
+    if (rhs.line) {
+      return lhs.line.value() < rhs.line.value();
+    }
+    return false;
+  }
+  return bool(rhs.line);
 }
 
-inline bool operator<(const SourceLine& lhs, const SourceLine& rhs) {
-    return std::tie(lhs.path, lhs.line) < std::tie(rhs.path, rhs.line);
-}
+}  // namespace aapt
 
-} // namespace aapt
-
-#endif // AAPT_SOURCE_H
+#endif  // AAPT_SOURCE_H

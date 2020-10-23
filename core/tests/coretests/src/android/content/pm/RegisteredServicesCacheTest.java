@@ -25,6 +25,8 @@ import android.test.AndroidTestCase;
 import android.util.AttributeSet;
 import android.util.SparseArray;
 
+import androidx.test.filters.LargeTest;
+
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
 import org.xmlpull.v1.XmlSerializer;
@@ -43,6 +45,7 @@ import java.util.Set;
 /**
  * Tests for {@link android.content.pm.RegisteredServicesCache}
  */
+@LargeTest
 public class RegisteredServicesCacheTest extends AndroidTestCase {
     private static final int U0 = 0;
     private static final int U1 = 1;
@@ -188,7 +191,10 @@ public class RegisteredServicesCacheTest extends AndroidTestCase {
 
     private static RegisteredServicesCache.ServiceInfo<TestServiceType> newServiceInfo(
             TestServiceType type, int uid) {
-        return new RegisteredServicesCache.ServiceInfo<>(type, null, uid);
+        final ComponentInfo info = new ComponentInfo();
+        info.applicationInfo = new ApplicationInfo();
+        info.applicationInfo.uid = uid;
+        return new RegisteredServicesCache.ServiceInfo<>(type, info, null);
     }
 
     private void assertNotEmptyFileCreated(TestServicesCache cache, int userId) {

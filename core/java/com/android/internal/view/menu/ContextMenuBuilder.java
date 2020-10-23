@@ -16,6 +16,7 @@
 
 package com.android.internal.view.menu;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.graphics.drawable.Drawable;
 import android.os.IBinder;
@@ -34,11 +35,12 @@ import android.view.View;
  * <p>
  * To use this class, instantiate it via {@link #ContextMenuBuilder(Context)},
  * and optionally populate it with any of your custom items.  Finally,
- * call {@link #show(View, IBinder)} which will populate the menu
+ * call {@link #showDialog(View, IBinder)} which will populate the menu
  * with a view's context menu items and show the context menu.
  */
 public class ContextMenuBuilder extends MenuBuilder implements ContextMenu {
     
+    @UnsupportedAppUsage
     public ContextMenuBuilder(Context context) {
         super(context);
     }
@@ -74,7 +76,7 @@ public class ContextMenuBuilder extends MenuBuilder implements ContextMenu {
      * @return If the context menu was shown, the {@link MenuDialogHelper} for
      *         dismissing it. Otherwise, null.
      */
-    public MenuDialogHelper show(View originalView, IBinder token) {
+    public MenuDialogHelper showDialog(View originalView, IBinder token) {
         if (originalView != null) {
             // Let relevant views and their populate context listeners populate
             // the context menu
@@ -93,4 +95,29 @@ public class ContextMenuBuilder extends MenuBuilder implements ContextMenu {
         return null;
     }
     
+    public MenuPopupHelper showPopup(Context context, View originalView, float x, float y) {
+        if (originalView != null) {
+            // Let relevant views and their populate context listeners populate
+            // the context menu
+            originalView.createContextMenu(this);
+        }
+
+        if (getVisibleItems().size() > 0) {
+            EventLog.writeEvent(50001, 1);
+
+            int location[] = new int[2];
+            originalView.getLocationOnScreen(location);
+
+            final MenuPopupHelper helper = new MenuPopupHelper(
+                    context,
+                    this,
+                    originalView,
+                    false /* overflowOnly */,
+                    com.android.internal.R.attr.contextPopupMenuStyle);
+            helper.show(Math.round(x), Math.round(y));
+            return helper;
+        }
+
+        return null;
+    }
 }

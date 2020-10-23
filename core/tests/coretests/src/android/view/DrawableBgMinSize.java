@@ -16,12 +16,9 @@
 
 package android.view;
 
-import com.android.frameworks.coretests.R;
-
 import android.app.Activity;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
-import android.view.View;
 import android.view.View.OnClickListener;
 import android.widget.AbsoluteLayout;
 import android.widget.Button;
@@ -29,6 +26,8 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
+
+import com.android.frameworks.coretests.R;
 
 /**
  * Views should obey their background {@link Drawable}'s minimum size
@@ -58,14 +57,14 @@ public class DrawableBgMinSize extends Activity implements OnClickListener {
         mBackgroundDrawable = getResources().getDrawable(R.drawable.drawable_background);
         mBigBackgroundDrawable = getResources().getDrawable(R.drawable.big_drawable_background);
  
-        mChangeBackgroundsButton = (Button) findViewById(R.id.change_backgrounds);
+        mChangeBackgroundsButton = findViewById(R.id.change_backgrounds);
         mChangeBackgroundsButton.setOnClickListener(this);
         
-        mTextView = (TextView) findViewById(R.id.text_view);
-        mLinearLayout = (LinearLayout) findViewById(R.id.linear_layout);
-        mRelativeLayout = (RelativeLayout) findViewById(R.id.relative_layout);
-        mFrameLayout = (FrameLayout) findViewById(R.id.frame_layout);
-        mAbsoluteLayout = (AbsoluteLayout) findViewById(R.id.absolute_layout);
+        mTextView = findViewById(R.id.text_view);
+        mLinearLayout = findViewById(R.id.linear_layout);
+        mRelativeLayout = findViewById(R.id.relative_layout);
+        mFrameLayout = findViewById(R.id.frame_layout);
+        mAbsoluteLayout = findViewById(R.id.absolute_layout);
 
         changeBackgrounds(mBackgroundDrawable);
     }

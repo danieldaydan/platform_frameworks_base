@@ -15,118 +15,212 @@
  */
 #include "DeferredLayerUpdater.h"
 
-#include "OpenGLRenderer.h"
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
-#include "LayerRenderer.h"
+// TODO: Use public SurfaceTexture APIs once available and include public NDK header file instead.
+#include <surfacetexture/surface_texture_platform.h>
+#include "AutoBackendTextureRelease.h"
+#include "Matrix.h"
+#include "Properties.h"
+#include "renderstate/RenderState.h"
 #include "renderthread/EglManager.h"
-#include "renderthread/RenderTask.h"
+#include "renderthread/RenderThread.h"
+#include "renderthread/VulkanManager.h"
+
+using namespace android::uirenderer::renderthread;
 
 namespace android {
 namespace uirenderer {
 
-DeferredLayerUpdater::DeferredLayerUpdater(renderthread::RenderThread& thread, Layer* layer)
-        : mSurfaceTexture(nullptr)
+DeferredLayerUpdater::DeferredLayerUpdater(RenderState& renderState)
+        : mRenderState(renderState)
+        , mBlend(false)
+        , mSurfaceTexture(nullptr, [](ASurfaceTexture*) {})
         , mTransform(nullptr)
-        , mNeedsGLContextAttach(false)
+        , mGLContextAttached(false)
         , mUpdateTexImage(false)
-        , mLayer(layer)
-        , mCaches(Caches::getInstance())
-        , mRenderThread(thread) {
-    mWidth = mLayer->layer.getWidth();
-    mHeight = mLayer->layer.getHeight();
-    mBlend = mLayer->isBlend();
-    mColorFilter = SkSafeRef(mLayer->getColorFilter());
-    mAlpha = mLayer->getAlpha();
-    mMode = mLayer->getMode();
+        , mLayer(nullptr) {
+    renderState.registerContextCallback(this);
 }
 
 DeferredLayerUpdater::~DeferredLayerUpdater() {
-    SkSafeUnref(mColorFilter);
     setTransform(nullptr);
+    mRenderState.removeContextCallback(this);
+    destroyLayer();
+}
+
+void DeferredLayerUpdater::setSurfaceTexture(AutoTextureRelease&& consumer) {
+    mSurfaceTexture = std::move(consumer);
+
+    GLenum target = ASurfaceTexture_getCurrentTextureTarget(mSurfaceTexture.get());
+    LOG_ALWAYS_FATAL_IF(target != GL_TEXTURE_2D && target != GL_TEXTURE_EXTERNAL_OES,
+                        "set unsupported SurfaceTexture with target %x", target);
+}
+
+void DeferredLayerUpdater::onContextDestroyed() {
+    destroyLayer();
+}
+
+void DeferredLayerUpdater::destroyLayer() {
+    if (!mLayer) {
+        return;
+    }
+
+    if (mSurfaceTexture.get() && mGLContextAttached) {
+        ASurfaceTexture_releaseConsumerOwnership(mSurfaceTexture.get());
+        mGLContextAttached = false;
+    }
+
     mLayer->postDecStrong();
+
     mLayer = nullptr;
+
+    mImageSlots.clear();
 }
 
 void DeferredLayerUpdater::setPaint(const SkPaint* paint) {
-    OpenGLRenderer::getAlphaAndModeDirect(paint, &mAlpha, &mMode);
-    SkColorFilter* colorFilter = (paint) ? paint->getColorFilter() : nullptr;
-    SkRefCnt_SafeAssign(mColorFilter, colorFilter);
+    mAlpha = PaintUtils::getAlphaDirect(paint);
+    mMode = PaintUtils::getBlendModeDirect(paint);
+    if (paint) {
+        mColorFilter = paint->refColorFilter();
+    } else {
+        mColorFilter.reset();
+    }
 }
 
-bool DeferredLayerUpdater::apply() {
-    bool success = true;
-    // These properties are applied the same to both layer types
+static status_t createReleaseFence(bool useFenceSync, EGLSyncKHR* eglFence, EGLDisplay* display,
+                                   int* releaseFence, void* handle) {
+    *display = EGL_NO_DISPLAY;
+    RenderState* renderState = (RenderState*)handle;
+    status_t err;
+    if (Properties::getRenderPipelineType() == RenderPipelineType::SkiaGL) {
+        EglManager& eglManager = renderState->getRenderThread().eglManager();
+        *display = eglManager.eglDisplay();
+        err = eglManager.createReleaseFence(useFenceSync, eglFence, releaseFence);
+    } else {
+        err = renderState->getRenderThread().vulkanManager().createReleaseFence(
+                releaseFence, renderState->getRenderThread().getGrContext());
+    }
+    return err;
+}
+
+static status_t fenceWait(int fence, void* handle) {
+    // Wait on the producer fence for the buffer to be ready.
+    status_t err;
+    RenderState* renderState = (RenderState*)handle;
+    if (Properties::getRenderPipelineType() == RenderPipelineType::SkiaGL) {
+        err = renderState->getRenderThread().eglManager().fenceWait(fence);
+    } else {
+        err = renderState->getRenderThread().vulkanManager().fenceWait(
+                fence, renderState->getRenderThread().getGrContext());
+    }
+    return err;
+}
+
+void DeferredLayerUpdater::apply() {
+    if (!mLayer) {
+        mLayer = new Layer(mRenderState, mColorFilter, mAlpha, mMode);
+    }
+
     mLayer->setColorFilter(mColorFilter);
     mLayer->setAlpha(mAlpha, mMode);
 
     if (mSurfaceTexture.get()) {
-        if (mNeedsGLContextAttach) {
-            mNeedsGLContextAttach = false;
-            mSurfaceTexture->attachToContext(mLayer->getTextureId());
+        if (!mGLContextAttached) {
+            mGLContextAttached = true;
+            mUpdateTexImage = true;
+            ASurfaceTexture_takeConsumerOwnership(mSurfaceTexture.get());
         }
         if (mUpdateTexImage) {
             mUpdateTexImage = false;
-            doUpdateTexImage();
+            float transformMatrix[16];
+            android_dataspace dataspace;
+            int slot;
+            bool newContent = false;
+            // Note: ASurfaceTexture_dequeueBuffer discards all but the last frame. This
+            // is necessary if the SurfaceTexture queue is in synchronous mode, and we
+            // cannot tell which mode it is in.
+            AHardwareBuffer* hardwareBuffer = ASurfaceTexture_dequeueBuffer(
+                    mSurfaceTexture.get(), &slot, &dataspace, transformMatrix, &newContent,
+                    createReleaseFence, fenceWait, &mRenderState);
+
+            if (hardwareBuffer) {
+                sk_sp<SkImage> layerImage = mImageSlots[slot].createIfNeeded(
+                        hardwareBuffer, dataspace, newContent,
+                        mRenderState.getRenderThread().getGrContext());
+                // unref to match the ref added by ASurfaceTexture_dequeueBuffer. eglCreateImageKHR
+                // (invoked by createIfNeeded) will add a ref to the AHardwareBuffer.
+                AHardwareBuffer_release(hardwareBuffer);
+                if (layerImage.get()) {
+                    SkMatrix textureTransform;
+                    mat4(transformMatrix).copyTo(textureTransform);
+                    // force filtration if buffer size != layer size
+                    bool forceFilter =
+                            mWidth != layerImage->width() || mHeight != layerImage->height();
+                    updateLayer(forceFilter, textureTransform, layerImage);
+                }
+            }
         }
+
         if (mTransform) {
-            mLayer->getTransform().load(*mTransform);
+            mLayer->getTransform() = *mTransform;
             setTransform(nullptr);
         }
     }
-    return success;
 }
 
-void DeferredLayerUpdater::doUpdateTexImage() {
-    if (mSurfaceTexture->updateTexImage() == NO_ERROR) {
-        float transform[16];
-
-        int64_t frameNumber = mSurfaceTexture->getFrameNumber();
-        // If the GLConsumer queue is in synchronous mode, need to discard all
-        // but latest frame, using the frame number to tell when we no longer
-        // have newer frames to target. Since we can't tell which mode it is in,
-        // do this unconditionally.
-        int dropCounter = 0;
-        while (mSurfaceTexture->updateTexImage() == NO_ERROR) {
-            int64_t newFrameNumber = mSurfaceTexture->getFrameNumber();
-            if (newFrameNumber == frameNumber) break;
-            frameNumber = newFrameNumber;
-            dropCounter++;
-        }
-
-        bool forceFilter = false;
-        sp<GraphicBuffer> buffer = mSurfaceTexture->getCurrentBuffer();
-        if (buffer != nullptr) {
-            // force filtration if buffer size != layer size
-            forceFilter = mWidth != static_cast<int>(buffer->getWidth())
-                    || mHeight != static_cast<int>(buffer->getHeight());
-        }
-
-        #if DEBUG_RENDERER
-        if (dropCounter > 0) {
-            RENDERER_LOGD("Dropped %d frames on texture layer update", dropCounter);
-        }
-        #endif
-        mSurfaceTexture->getTransformMatrix(transform);
-        GLenum renderTarget = mSurfaceTexture->getCurrentTextureTarget();
-
-        LOG_ALWAYS_FATAL_IF(renderTarget != GL_TEXTURE_2D && renderTarget != GL_TEXTURE_EXTERNAL_OES,
-                "doUpdateTexImage target %x, 2d %x, EXT %x",
-                renderTarget, GL_TEXTURE_2D, GL_TEXTURE_EXTERNAL_OES);
-        LayerRenderer::updateTextureLayer(mLayer, mWidth, mHeight,
-                !mBlend, forceFilter, renderTarget, transform);
-    }
+void DeferredLayerUpdater::updateLayer(bool forceFilter, const SkMatrix& textureTransform,
+                                       const sk_sp<SkImage>& layerImage) {
+    mLayer->setBlend(mBlend);
+    mLayer->setForceFilter(forceFilter);
+    mLayer->setSize(mWidth, mHeight);
+    mLayer->getTexTransform() = textureTransform;
+    mLayer->setImage(layerImage);
 }
 
 void DeferredLayerUpdater::detachSurfaceTexture() {
     if (mSurfaceTexture.get()) {
-        status_t err = mSurfaceTexture->detachFromContext();
-        if (err != 0) {
-            // TODO: Elevate to fatal exception
-            ALOGE("Failed to detach SurfaceTexture from context %d", err);
-        }
+        destroyLayer();
         mSurfaceTexture = nullptr;
-        mLayer->clearTexture();
     }
+}
+
+sk_sp<SkImage> DeferredLayerUpdater::ImageSlot::createIfNeeded(AHardwareBuffer* buffer,
+                                                               android_dataspace dataspace,
+                                                               bool forceCreate,
+                                                               GrContext* context) {
+    if (!mTextureRelease || !mTextureRelease->getImage().get() || dataspace != mDataspace ||
+        forceCreate || mBuffer != buffer) {
+        if (buffer != mBuffer) {
+            clear();
+        }
+
+        if (!buffer) {
+            return nullptr;
+        }
+
+        if (!mTextureRelease) {
+            mTextureRelease = new AutoBackendTextureRelease(context, buffer);
+        } else {
+            mTextureRelease->newBufferContent(context);
+        }
+
+        mDataspace = dataspace;
+        mBuffer = buffer;
+        mTextureRelease->makeImage(buffer, dataspace, context);
+    }
+    return mTextureRelease ? mTextureRelease->getImage() : nullptr;
+}
+
+void DeferredLayerUpdater::ImageSlot::clear() {
+    if (mTextureRelease) {
+        // The following unref counteracts the initial mUsageCount of 1, set by default initializer.
+        mTextureRelease->unref(true);
+        mTextureRelease = nullptr;
+    }
+
+    mBuffer = nullptr;
 }
 
 } /* namespace uirenderer */

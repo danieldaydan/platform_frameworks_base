@@ -19,29 +19,32 @@
     <!-- thickness (width) of the navigation bar on phones that require it -->
     <dimen name="navigation_bar_size">@*android:dimen/navigation_bar_width</dimen>
 
-    <!-- Recent Applications parameters -->
-    <!-- How far the thumbnail for a recent app appears from left edge -->
-    <dimen name="status_bar_recents_thumbnail_left_margin">0dp</dimen>
-    <!-- How far the thumbnail for a recent app appears from top edge -->
-    <dimen name="status_bar_recents_thumbnail_top_margin">28dp</dimen>
-    <!-- Padding for text descriptions -->
-    <dimen name="status_bar_recents_text_description_padding">8dp</dimen>
-    <!-- Width of application label text -->
-    <dimen name="status_bar_recents_app_label_width">156dip</dimen>
-    <!-- Left margin of application label text -->
-    <dimen name="status_bar_recents_app_label_left_margin">12dip</dimen>
-    <!-- Margin between recents container and glow on the right -->
-    <dimen name="status_bar_recents_right_glow_margin">0dip</dimen>
-    <!-- Padding between recents items -->
-    <dimen name="status_bar_recents_item_padding">2dip</dimen>
-    <!-- Where to place the app icon over the thumbnail -->
-    <dimen name="status_bar_recents_app_icon_left_margin">8dp</dimen>
-    <dimen name="status_bar_recents_app_icon_top_margin">8dp</dimen>
+    <dimen name="docked_divider_handle_width">2dp</dimen>
+    <dimen name="docked_divider_handle_height">16dp</dimen>
 
-    <!-- The side padding for the task stack as a percentage of the width. -->
-    <item name="recents_stack_width_padding_percentage" format="float" type="dimen">0.26</item>
+    <dimen name="brightness_mirror_height">40dp</dimen>
 
-    <!-- Standard notification width + gravity -->
-    <dimen name="notification_panel_width">@dimen/standard_notification_panel_width</dimen>
-    <integer name="notification_panel_layout_gravity">@integer/standard_notification_panel_layout_gravity</integer>
+    <dimen name="qs_tile_margin_top">8dp</dimen>
+    <dimen name="qs_tile_margin_vertical">0dp</dimen>
+
+    <dimen name="battery_detail_graph_space_top">9dp</dimen>
+    <dimen name="battery_detail_graph_space_bottom">9dp</dimen>
+
+    <integer name="quick_settings_num_columns">4</integer>
+    <dimen name="qs_detail_margin_top">0dp</dimen>
+
+    <dimen name="volume_tool_tip_right_margin">136dp</dimen>
+    <dimen name="volume_tool_tip_top_margin">12dp</dimen>
+
+    <!-- Padding between status bar and bubbles when displayed in expanded state, smaller
+         value in landscape since we have limited vertical space-->
+    <dimen name="bubble_padding_top">4dp</dimen>
+
+    <dimen name="controls_activity_view_top_offset">25dp</dimen>
+
+    <dimen name="biometric_dialog_button_negative_max_width">140dp</dimen>
+    <dimen name="biometric_dialog_button_positive_max_width">116dp</dimen>
+
+    <dimen name="global_actions_power_dialog_item_height">130dp</dimen>
+    <dimen name="global_actions_power_dialog_item_bottom_margin">35dp</dimen>
 </resources>

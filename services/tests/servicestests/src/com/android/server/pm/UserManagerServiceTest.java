@@ -16,19 +16,29 @@
 
 package com.android.server.pm;
 
+import android.content.pm.UserInfo;
 import android.os.Bundle;
 import android.os.FileUtils;
 import android.os.Parcelable;
+import android.os.UserHandle;
+import android.os.UserManager;
+import android.support.test.uiautomator.UiDevice;
 import android.test.AndroidTestCase;
+import android.test.suitebuilder.annotation.SmallTest;
+import android.text.TextUtils;
 import android.util.AtomicFile;
+
+import androidx.test.InstrumentationRegistry;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 
+@SmallTest
 public class UserManagerServiceTest extends AndroidTestCase {
     private static String[] STRING_ARRAY = new String[] {"<tag", "<![CDATA["};
     private File restrictionsFile;
+    private int tempUserId = UserHandle.USER_NULL;
 
     @Override
     protected void setUp() throws Exception {
@@ -40,19 +50,40 @@ public class UserManagerServiceTest extends AndroidTestCase {
     @Override
     protected void tearDown() throws Exception {
         restrictionsFile.delete();
+        if (tempUserId != UserHandle.USER_NULL) {
+            UserManager.get(mContext).removeUser(tempUserId);
+        }
         super.tearDown();
     }
 
     public void testWriteReadApplicationRestrictions() throws IOException {
         AtomicFile atomicFile = new AtomicFile(restrictionsFile);
         Bundle bundle = createBundle();
-        UserManagerService.writeApplicationRestrictionsLocked(bundle, atomicFile);
+        UserManagerService.writeApplicationRestrictionsLAr(bundle, atomicFile);
         assertTrue(atomicFile.getBaseFile().exists());
         String s = FileUtils.readTextFile(restrictionsFile, 10000, "");
         System.out.println("restrictionsFile: " + s);
-        bundle = UserManagerService.readApplicationRestrictionsLocked(atomicFile);
+        bundle = UserManagerService.readApplicationRestrictionsLAr(atomicFile);
         System.out.println("readApplicationRestrictionsLocked bundle: " + bundle);
         assertBundle(bundle);
+    }
+
+    public void testAddUserWithAccount() {
+        UserManager um = UserManager.get(mContext);
+        UserInfo user = um.createUser("Test User", 0);
+        assertNotNull(user);
+        tempUserId = user.id;
+        String accountName = "Test Account";
+        um.setUserAccount(tempUserId, accountName);
+        assertEquals(accountName, um.getUserAccount(tempUserId));
+    }
+
+    public void testUserSystemPackageWhitelist() throws Exception {
+        String cmd = "cmd user report-system-user-package-whitelist-problems --critical-only";
+        final String result = runShellCommand(cmd);
+        if (!TextUtils.isEmpty(result)) {
+            fail("Command '" + cmd + " reported errors:\n" + result);
+        }
     }
 
     private Bundle createBundle() {
@@ -99,4 +130,8 @@ public class UserManagerServiceTest extends AndroidTestCase {
         assertEquals(1, childBundle.getInt("bundle_int"));
     }
 
+    private static String runShellCommand(String cmd) throws Exception {
+        return UiDevice.getInstance(InstrumentationRegistry.getInstrumentation())
+                .executeShellCommand(cmd);
+    }
 }

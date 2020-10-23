@@ -250,7 +250,8 @@ abstract class AndroidKeyStoreCipherSpiBase extends CipherSpi implements KeyStor
                 purpose,
                 true, // permit aborting this operation if keystore runs out of resources
                 keymasterInputArgs,
-                additionalEntropy);
+                additionalEntropy,
+                mKey.getUid());
         if (opResult == null) {
             throw new KeyStoreConnectException();
         }
@@ -298,7 +299,7 @@ abstract class AndroidKeyStoreCipherSpiBase extends CipherSpi implements KeyStor
             KeyStore keyStore, IBinder operationToken) {
         return new KeyStoreCryptoOperationChunkedStreamer(
                 new KeyStoreCryptoOperationChunkedStreamer.MainDataStream(
-                        keyStore, operationToken));
+                        keyStore, operationToken), 0);
     }
 
     /**
@@ -306,7 +307,7 @@ abstract class AndroidKeyStoreCipherSpiBase extends CipherSpi implements KeyStor
      *
      * <p>This implementation returns {@code null}.
      *
-     * @returns stream or {@code null} if AAD is not supported by this cipher.
+     * @return stream or {@code null} if AAD is not supported by this cipher.
      */
     @Nullable
     protected KeyStoreCryptoOperationStreamer createAdditionalAuthenticationDataStreamer(

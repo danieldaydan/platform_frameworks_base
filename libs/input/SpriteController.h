@@ -22,7 +22,7 @@
 
 #include <gui/SurfaceComposerClient.h>
 
-#include <SkBitmap.h>
+#include "SpriteIcon.h"
 
 namespace android {
 
@@ -48,35 +48,6 @@ struct SpriteTransformationMatrix {
 
     inline bool operator!= (const SpriteTransformationMatrix& other) {
         return !(*this == other);
-    }
-};
-
-/*
- * Icon that a sprite displays, including its hotspot.
- */
-struct SpriteIcon {
-    inline SpriteIcon() : hotSpotX(0), hotSpotY(0) { }
-    inline SpriteIcon(const SkBitmap& bitmap, float hotSpotX, float hotSpotY) :
-            bitmap(bitmap), hotSpotX(hotSpotX), hotSpotY(hotSpotY) { }
-
-    SkBitmap bitmap;
-    float hotSpotX;
-    float hotSpotY;
-
-    inline SpriteIcon copy() const {
-        SkBitmap bitmapCopy;
-        bitmap.copyTo(&bitmapCopy, kN32_SkColorType);
-        return SpriteIcon(bitmapCopy, hotSpotX, hotSpotY);
-    }
-
-    inline void reset() {
-        bitmap.reset();
-        hotSpotX = 0;
-        hotSpotY = 0;
-    }
-
-    inline bool isValid() const {
-        return !bitmap.isNull() && !bitmap.empty();
     }
 };
 
@@ -122,6 +93,9 @@ public:
 
     /* Sets the sprite transformation matrix. */
     virtual void setTransformationMatrix(const SpriteTransformationMatrix& matrix) = 0;
+
+    /* Sets the id of the display where the sprite should be shown. */
+    virtual void setDisplayId(int32_t displayId) = 0;
 };
 
 /*
@@ -143,15 +117,15 @@ public:
     SpriteController(const sp<Looper>& looper, int32_t overlayLayer);
 
     /* Creates a new sprite, initially invisible. */
-    sp<Sprite> createSprite();
+    virtual sp<Sprite> createSprite();
 
     /* Opens or closes a transaction to perform a batch of sprite updates as part of
      * a single operation such as setPosition and setAlpha.  It is not necessary to
      * open a transaction when updating a single property.
      * Calls to openTransaction() nest and must be matched by an equal number
      * of calls to closeTransaction(). */
-    void openTransaction();
-    void closeTransaction();
+    virtual void openTransaction();
+    virtual void closeTransaction();
 
 private:
     enum {
@@ -167,17 +141,19 @@ private:
         DIRTY_LAYER = 1 << 4,
         DIRTY_VISIBILITY = 1 << 5,
         DIRTY_HOTSPOT = 1 << 6,
+        DIRTY_DISPLAY_ID = 1 << 7,
+        DIRTY_ICON_STYLE = 1 << 8,
     };
 
     /* Describes the state of a sprite.
      * This structure is designed so that it can be copied during updates so that
      * surfaces can be resized and redrawn without blocking the client by holding a lock
      * on the sprites for a long time.
-     * Note that the SkBitmap holds a reference to a shared (and immutable) pixel ref. */
+     * Note that the SpriteIcon holds a reference to a shared (and immutable) bitmap. */
     struct SpriteState {
         inline SpriteState() :
                 dirty(0), visible(false),
-                positionX(0), positionY(0), layer(0), alpha(1.0f),
+                positionX(0), positionY(0), layer(0), alpha(1.0f), displayId(ADISPLAY_ID_DEFAULT),
                 surfaceWidth(0), surfaceHeight(0), surfaceDrawn(false), surfaceVisible(false) {
         }
 
@@ -190,6 +166,7 @@ private:
         int32_t layer;
         float alpha;
         SpriteTransformationMatrix transformationMatrix;
+        int32_t displayId;
 
         sp<SurfaceControl> surfaceControl;
         int32_t surfaceWidth;
@@ -214,7 +191,7 @@ private:
         virtual ~SpriteImpl();
 
     public:
-        SpriteImpl(const sp<SpriteController> controller);
+        explicit SpriteImpl(const sp<SpriteController> controller);
 
         virtual void setIcon(const SpriteIcon& icon);
         virtual void setVisible(bool visible);
@@ -222,6 +199,7 @@ private:
         virtual void setLayer(int32_t layer);
         virtual void setAlpha(float alpha);
         virtual void setTransformationMatrix(const SpriteTransformationMatrix& matrix);
+        virtual void setDisplayId(int32_t displayId);
 
         inline const SpriteState& getStateLocked() const {
             return mLocked.state;

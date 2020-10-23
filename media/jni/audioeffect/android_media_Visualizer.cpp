@@ -20,24 +20,24 @@
 #define LOG_TAG "visualizers-JNI"
 
 #include <utils/Log.h>
-#include <nativehelper/jni.h>
+#include <jni.h>
 #include <nativehelper/JNIHelp.h>
 #include <android_runtime/AndroidRuntime.h>
 #include <utils/threads.h>
-#include "media/Visualizer.h"
+#include "Visualizer.h"
 
-#include <ScopedUtfChars.h>
+#include <nativehelper/ScopedUtfChars.h>
 
 using namespace android;
 
 #define VISUALIZER_SUCCESS                      0
-#define VISUALIZER_ERROR                       -1
-#define VISUALIZER_ERROR_ALREADY_EXISTS        -2
-#define VISUALIZER_ERROR_NO_INIT               -3
-#define VISUALIZER_ERROR_BAD_VALUE             -4
-#define VISUALIZER_ERROR_INVALID_OPERATION     -5
-#define VISUALIZER_ERROR_NO_MEMORY             -6
-#define VISUALIZER_ERROR_DEAD_OBJECT           -7
+#define VISUALIZER_ERROR                       (-1)
+#define VISUALIZER_ERROR_ALREADY_EXISTS        (-2)
+#define VISUALIZER_ERROR_NO_INIT               (-3)
+#define VISUALIZER_ERROR_BAD_VALUE             (-4)
+#define VISUALIZER_ERROR_INVALID_OPERATION     (-5)
+#define VISUALIZER_ERROR_NO_MEMORY             (-6)
+#define VISUALIZER_ERROR_DEAD_OBJECT           (-7)
 
 #define NATIVE_EVENT_PCM_CAPTURE                0
 #define NATIVE_EVENT_FFT_CAPTURE                1
@@ -196,7 +196,6 @@ static void captureCallback(void* user,
                 callbackInfo->visualizer_ref,
                 NATIVE_EVENT_PCM_CAPTURE,
                 samplingrate,
-                0,
                 jArray);
         }
     }
@@ -217,7 +216,6 @@ static void captureCallback(void* user,
                 callbackInfo->visualizer_ref,
                 NATIVE_EVENT_FFT_CAPTURE,
                 samplingrate,
-                0,
                 jArray);
         }
     }
@@ -286,7 +284,7 @@ android_media_visualizer_native_init(JNIEnv *env)
     // Get the postEvent method
     fields.midPostNativeEvent = env->GetStaticMethodID(
             fields.clazzEffect,
-            "postEventFromNative", "(Ljava/lang/Object;IIILjava/lang/Object;)V");
+            "postEventFromNative", "(Ljava/lang/Object;II[B)V");
     if (fields.midPostNativeEvent == NULL) {
         ALOGE("Can't find Visualizer.%s", "postEventFromNative");
         return;
@@ -343,7 +341,7 @@ static void android_media_visualizer_effect_callback(int32_t event,
             fields.midPostNativeEvent,
             callbackInfo->visualizer_ref,
             NATIVE_EVENT_SERVER_DIED,
-            0, 0, NULL);
+            0, NULL);
     }
 }
 
@@ -384,15 +382,15 @@ android_media_visualizer_native_setup(JNIEnv *env, jobject thiz, jobject weak_th
     }
 
     // create the native Visualizer object
-    lpVisualizer = new Visualizer(String16(opPackageNameStr.c_str()),
-                                  0,
-                                  android_media_visualizer_effect_callback,
-                                  lpJniStorage,
-                                  sessionId);
+    lpVisualizer = new Visualizer(String16(opPackageNameStr.c_str()));
     if (lpVisualizer == 0) {
         ALOGE("Error creating Visualizer");
         goto setup_failure;
     }
+    lpVisualizer->set(0,
+                      android_media_visualizer_effect_callback,
+                      lpJniStorage,
+                      (audio_session_t) sessionId);
 
     lStatus = translateError(lpVisualizer->initCheck());
     if (lStatus != VISUALIZER_SUCCESS && lStatus != VISUALIZER_ERROR_ALREADY_EXISTS) {
@@ -435,11 +433,13 @@ setup_failure:
 
 // ----------------------------------------------------------------------------
 static void android_media_visualizer_native_release(JNIEnv *env,  jobject thiz) {
-    sp<Visualizer> lpVisualizer = setVisualizer(env, thiz, 0);
-    if (lpVisualizer == 0) {
-        return;
+    { //limit scope so that lpVisualizer is deleted before JNI storage data.
+        sp<Visualizer> lpVisualizer = setVisualizer(env, thiz, 0);
+        if (lpVisualizer == 0) {
+            return;
+        }
+        lpVisualizer->release();
     }
-
     // delete the JNI data
     VisualizerJniStorage* lpJniStorage =
         (VisualizerJniStorage *)env->GetLongField(thiz, fields.fidJniData);

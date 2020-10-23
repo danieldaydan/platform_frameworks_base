@@ -54,11 +54,19 @@ import java.lang.reflect.Modifier;
  * <p>For more information about using loaders, read the
  * <a href="{@docRoot}guide/topics/fundamentals/loaders.html">Loaders</a> developer guide.</p>
  * </div>
+ *
+ * @deprecated Use the <a href="{@docRoot}tools/extras/support-library.html">Support Library</a>
+ *      {@link android.support.v4.app.LoaderManager}
  */
+@Deprecated
 public abstract class LoaderManager {
     /**
      * Callback interface for a client to interact with the manager.
+     *
+     * @deprecated Use the <a href="{@docRoot}tools/extras/support-library.html">
+     *      Support Library</a> {@link android.support.v4.app.LoaderManager.LoaderCallbacks}
      */
+    @Deprecated
     public interface LoaderCallbacks<D> {
         /**
          * Instantiate and return a new Loader for the given ID.
@@ -195,6 +203,9 @@ public abstract class LoaderManager {
     public static void enableDebugLogging(boolean enabled) {
         LoaderManagerImpl.DEBUG = enabled;
     }
+
+    /** @hide for internal testing only */
+    public FragmentHostCallback getFragmentHostCallback() { return null; }
 }
 
 class LoaderManagerImpl extends LoaderManager {
@@ -318,7 +329,7 @@ class LoaderManagerImpl extends LoaderManager {
             if (mStarted) {
                 if (mReportNextStart) {
                     mReportNextStart = false;
-                    if (mHaveData) {
+                    if (mHaveData && !mRetaining) {
                         callOnLoadFinished(mLoader, mData);
                     }
                 }
@@ -339,13 +350,16 @@ class LoaderManagerImpl extends LoaderManager {
             }
         }
 
-        void cancel() {
+        boolean cancel() {
             if (DEBUG) Log.v(TAG, "  Canceling: " + this);
             if (mStarted && mLoader != null && mListenerRegistered) {
-                if (!mLoader.cancelLoad()) {
+                final boolean cancelLoadResult = mLoader.cancelLoad();
+                if (!cancelLoadResult) {
                     onLoadCanceled(mLoader);
                 }
+                return cancelLoadResult;
             }
+            return false;
         }
 
         void destroy() {
@@ -539,6 +553,10 @@ class LoaderManagerImpl extends LoaderManager {
     void updateHostController(FragmentHostCallback host) {
         mHost = host;
     }
+
+    public FragmentHostCallback getFragmentHostCallback() {
+        return mHost;
+    }
     
     private LoaderInfo createLoader(int id, Bundle args,
             LoaderManager.LoaderCallbacks<Object> callback) {
@@ -667,20 +685,21 @@ class LoaderManagerImpl extends LoaderManager {
                     mInactiveLoaders.put(id, info);
                 } else {
                     // We already have an inactive loader for this ID that we are
-                    // waiting for!  What to do, what to do...
-                    if (!info.mStarted) {
-                        // The current Loader has not been started...  we thus
-                        // have no reason to keep it around, so bam, slam,
-                        // thank-you-ma'am.
+                    // waiting for! Try to cancel; if this returns true then the task is still
+                    // running and we have more work to do.
+                    if (!info.cancel()) {
+                        // The current Loader has not been started or was successfully canceled,
+                        // we thus have no reason to keep it around. Remove it and a new
+                        // LoaderInfo will be created below.
                         if (DEBUG) Log.v(TAG, "  Current loader is stopped; replacing");
                         mLoaders.put(id, null);
                         info.destroy();
                     } else {
                         // Now we have three active loaders... we'll queue
                         // up this request to be processed once one of the other loaders
-                        // finishes or is canceled.
-                        if (DEBUG) Log.v(TAG, "  Current loader is running; attempting to cancel");
-                        info.cancel();
+                        // finishes.
+                        if (DEBUG) Log.v(TAG,
+                                "  Current loader is running; configuring pending loader");
                         if (info.mPendingLoader != null) {
                             if (DEBUG) Log.v(TAG, "  Removing pending loader: " + info.mPendingLoader);
                             info.mPendingLoader.destroy();
@@ -841,6 +860,7 @@ class LoaderManagerImpl extends LoaderManager {
             mInactiveLoaders.valueAt(i).destroy();
         }
         mInactiveLoaders.clear();
+        mHost = null;
     }
 
     @Override

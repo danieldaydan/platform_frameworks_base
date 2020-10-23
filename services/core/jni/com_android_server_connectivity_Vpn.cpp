@@ -17,27 +17,28 @@
 #define LOG_NDEBUG 0
 
 #define LOG_TAG "VpnJni"
-#include <cutils/log.h>
-#include "netutils/ifc.h"
 
-#include <stdio.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <linux/route.h>
 #include <linux/ipv6_route.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <log/log.h>
+
+#include "netutils/ifc.h"
 
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 
 namespace android
 {
@@ -51,12 +52,12 @@ static inline in_addr_t *as_in_addr(sockaddr *sa) {
 
 //------------------------------------------------------------------------------
 
-#define SYSTEM_ERROR -1
-#define BAD_ARGUMENT -2
+#define SYSTEM_ERROR (-1)
+#define BAD_ARGUMENT (-2)
 
 static int create_interface(int mtu)
 {
-    int tun = open("/dev/tun", O_RDWR | O_NONBLOCK);
+    int tun = open("/dev/tun", O_RDWR | O_NONBLOCK | O_CLOEXEC);
 
     ifreq ifr4;
     memset(&ifr4, 0, sizeof(ifr4));

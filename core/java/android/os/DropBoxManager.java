@@ -16,6 +16,18 @@
 
 package android.os;
 
+import static android.Manifest.permission.PACKAGE_USAGE_STATS;
+import static android.Manifest.permission.READ_LOGS;
+
+import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
+import android.annotation.SdkConstant;
+import android.annotation.SdkConstant.SdkConstantType;
+import android.annotation.SystemService;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.Context;
+import android.util.Log;
+
 import com.android.internal.os.IDropBoxManagerService;
 
 import java.io.ByteArrayInputStream;
@@ -31,15 +43,15 @@ import java.util.zip.GZIPInputStream;
  * enqueued data exceeds the maximum size.  You can think of this as a
  * persistent, system-wide, blob-oriented "logcat".
  *
- * <p>You can obtain an instance of this class by calling
- * {@link android.content.Context#getSystemService}
- * with {@link android.content.Context#DROPBOX_SERVICE}.
- *
  * <p>DropBoxManager entries are not sent anywhere directly, but other system
  * services and debugging tools may scan and upload entries for processing.
  */
+@SystemService(Context.DROPBOX_SERVICE)
 public class DropBoxManager {
     private static final String TAG = "DropBoxManager";
+
+    private final Context mContext;
+    @UnsupportedAppUsage
     private final IDropBoxManagerService mService;
 
     /** Flag value: Entry's content was deleted to save space. */
@@ -57,11 +69,13 @@ public class DropBoxManager {
     /**
      * Broadcast Action: This is broadcast when a new entry is added in the dropbox.
      * You must hold the {@link android.Manifest.permission#READ_LOGS} permission
-     * in order to receive this broadcast.
+     * in order to receive this broadcast. This broadcast can be rate limited for low priority
+     * entries
      *
      * <p class="note">This is a protected intent that can only be sent
      * by the system.
      */
+    @SdkConstant(SdkConstantType.BROADCAST_INTENT_ACTION)
     public static final String ACTION_DROPBOX_ENTRY_ADDED =
         "android.intent.action.DROPBOX_ENTRY_ADDED";
 
@@ -77,6 +91,13 @@ public class DropBoxManager {
      * when the entry was created.
      */
     public static final String EXTRA_TIME = "time";
+
+    /**
+     * Extra for {@link android.os.DropBoxManager#ACTION_DROPBOX_ENTRY_ADDED}:
+     * integer value containing number of broadcasts dropped due to rate limiting on
+     * this {@link android.os.DropBoxManager#EXTRA_TAG}
+     */
+    public static final String EXTRA_DROPPED_COUNT = "android.os.extra.DROPPED_COUNT";
 
     /**
      * A single entry retrieved from the drop box.
@@ -216,7 +237,7 @@ public class DropBoxManager {
             return (mFlags & IS_GZIPPED) != 0 ? new GZIPInputStream(is) : is;
         }
 
-        public static final Parcelable.Creator<Entry> CREATOR = new Parcelable.Creator() {
+        public static final @android.annotation.NonNull Parcelable.Creator<Entry> CREATOR = new Parcelable.Creator() {
             public Entry[] newArray(int size) { return new Entry[size]; }
             public Entry createFromParcel(Parcel in) {
                 String tag = in.readString();
@@ -249,14 +270,20 @@ public class DropBoxManager {
     }
 
     /** {@hide} */
-    public DropBoxManager(IDropBoxManagerService service) { mService = service; }
+    public DropBoxManager(Context context, IDropBoxManagerService service) {
+        mContext = context;
+        mService = service;
+    }
 
     /**
-     * Create a dummy instance for testing.  All methods will fail unless
+     * Create an instance for testing. All methods will fail unless
      * overridden with an appropriate mock implementation.  To obtain a
      * functional instance, use {@link android.content.Context#getSystemService}.
      */
-    protected DropBoxManager() { mService = null; }
+    protected DropBoxManager() {
+        mContext = null;
+        mService = null;
+    }
 
     /**
      * Stores human-readable text.  The data may be discarded eventually (or even
@@ -267,7 +294,16 @@ public class DropBoxManager {
      * @param data value to store
      */
     public void addText(String tag, String data) {
-        try { mService.add(new Entry(tag, 0, data)); } catch (RemoteException e) {}
+        try {
+            mService.add(new Entry(tag, 0, data));
+        } catch (RemoteException e) {
+            if (e instanceof TransactionTooLargeException
+                    && mContext.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N) {
+                Log.e(TAG, "App sent too much data, so it was ignored", e);
+                return;
+            }
+            throw e.rethrowFromSystemServer();
+        }
     }
 
     /**
@@ -279,7 +315,16 @@ public class DropBoxManager {
      */
     public void addData(String tag, byte[] data, int flags) {
         if (data == null) throw new NullPointerException("data == null");
-        try { mService.add(new Entry(tag, 0, data, flags)); } catch (RemoteException e) {}
+        try {
+            mService.add(new Entry(tag, 0, data, flags));
+        } catch (RemoteException e) {
+            if (e instanceof TransactionTooLargeException
+                    && mContext.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N) {
+                Log.e(TAG, "App sent too much data, so it was ignored", e);
+                return;
+            }
+            throw e.rethrowFromSystemServer();
+        }
     }
 
     /**
@@ -297,7 +342,7 @@ public class DropBoxManager {
         try {
             mService.add(entry);
         } catch (RemoteException e) {
-            // ignore
+            throw e.rethrowFromSystemServer();
         } finally {
             entry.close();
         }
@@ -312,20 +357,35 @@ public class DropBoxManager {
      * @return whether events with that tag would be accepted
      */
     public boolean isTagEnabled(String tag) {
-        try { return mService.isTagEnabled(tag); } catch (RemoteException e) { return false; }
+        try {
+            return mService.isTagEnabled(tag);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
     }
 
     /**
      * Gets the next entry from the drop box <em>after</em> the specified time.
-     * Requires <code>android.permission.READ_LOGS</code>.  You must always call
-     * {@link Entry#close()} on the return value!
+     * You must always call {@link Entry#close()} on the return value!
      *
      * @param tag of entry to look for, null for all tags
      * @param msec time of the last entry seen
      * @return the next entry, or null if there are no more entries
      */
-    public Entry getNextEntry(String tag, long msec) {
-        try { return mService.getNextEntry(tag, msec); } catch (RemoteException e) { return null; }
+    @RequiresPermission(allOf = { READ_LOGS, PACKAGE_USAGE_STATS })
+    public @Nullable Entry getNextEntry(String tag, long msec) {
+        try {
+            return mService.getNextEntry(tag, msec, mContext.getOpPackageName());
+        } catch (SecurityException e) {
+            if (mContext.getApplicationInfo().targetSdkVersion >= Build.VERSION_CODES.P) {
+                throw e;
+            } else {
+                Log.w(TAG, e.getMessage());
+                return null;
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
     }
 
     // TODO: It may be useful to have some sort of notification mechanism

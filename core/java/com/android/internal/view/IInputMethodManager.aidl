@@ -17,10 +17,10 @@
 package com.android.internal.view;
 
 import android.os.ResultReceiver;
-import android.text.style.SuggestionSpan;
 import android.view.inputmethod.InputMethodInfo;
 import android.view.inputmethod.InputMethodSubtype;
 import android.view.inputmethod.EditorInfo;
+
 import com.android.internal.view.InputBindResult;
 import com.android.internal.view.IInputContext;
 import com.android.internal.view.IInputMethodClient;
@@ -28,55 +28,53 @@ import com.android.internal.view.IInputMethodClient;
 /**
  * Public interface to the global input method manager, used by all client
  * applications.
- * You need to update BridgeIInputMethodManager.java as well when changing
- * this file.
  */
 interface IInputMethodManager {
+    void addClient(in IInputMethodClient client, in IInputContext inputContext,
+            int untrustedDisplayId);
+
     // TODO: Use ParceledListSlice instead
-    List<InputMethodInfo> getInputMethodList();
+    List<InputMethodInfo> getInputMethodList(int userId);
     // TODO: Use ParceledListSlice instead
-    List<InputMethodInfo> getEnabledInputMethodList();
+    List<InputMethodInfo> getEnabledInputMethodList(int userId);
     List<InputMethodSubtype> getEnabledInputMethodSubtypeList(in String imiId,
             boolean allowsImplicitlySelectedSubtypes);
     InputMethodSubtype getLastInputMethodSubtype();
-    // TODO: We should change the return type from List to List<Parcelable>
-    // Currently there is a bug that aidl doesn't accept List<Parcelable>
-    List getShortcutInputMethodsAndSubtypes();
-    void addClient(in IInputMethodClient client,
-            in IInputContext inputContext, int uid, int pid);
-    void removeClient(in IInputMethodClient client);
-            
-    InputBindResult startInput(in IInputMethodClient client,
-            IInputContext inputContext, in EditorInfo attribute, int controlFlags);
-    void finishInput(in IInputMethodClient client);
-    boolean showSoftInput(in IInputMethodClient client, int flags,
+
+    boolean showSoftInput(in IInputMethodClient client, IBinder windowToken, int flags,
             in ResultReceiver resultReceiver);
-    boolean hideSoftInput(in IInputMethodClient client, int flags,
+    boolean hideSoftInput(in IInputMethodClient client, IBinder windowToken, int flags,
             in ResultReceiver resultReceiver);
-    // Report that a window has gained focus.  If 'attribute' is non-null,
-    // this will also do a startInput.
-    InputBindResult windowGainedFocus(in IInputMethodClient client, in IBinder windowToken,
-            int controlFlags, int softInputMode, int windowFlags,
-            in EditorInfo attribute, IInputContext inputContext);
+    // If windowToken is null, this just does startInput().  Otherwise this reports that a window
+    // has gained focus, and if 'attribute' is non-null then also does startInput.
+    // @NonNull
+    InputBindResult startInputOrWindowGainedFocus(
+            /* @StartInputReason */ int startInputReason,
+            in IInputMethodClient client, in IBinder windowToken,
+            /* @StartInputFlags */ int startInputFlags,
+            /* @android.view.WindowManager.LayoutParams.SoftInputModeFlags */ int softInputMode,
+            int windowFlags, in EditorInfo attribute, IInputContext inputContext,
+            /* @InputConnectionInspector.MissingMethodFlags */ int missingMethodFlags,
+            int unverifiedTargetSdkVersion);
 
     void showInputMethodPickerFromClient(in IInputMethodClient client,
             int auxiliarySubtypeMode);
+    void showInputMethodPickerFromSystem(in IInputMethodClient client, int auxiliarySubtypeMode,
+            int displayId);
     void showInputMethodAndSubtypeEnablerFromClient(in IInputMethodClient client, String topId);
-    void setInputMethod(in IBinder token, String id);
-    void setInputMethodAndSubtype(in IBinder token, String id, in InputMethodSubtype subtype);
-    void hideMySoftInput(in IBinder token, int flags);
-    void showMySoftInput(in IBinder token, int flags);
-    void updateStatusIcon(in IBinder token, String packageName, int iconId);
-    void setImeWindowStatus(in IBinder token, int vis, int backDisposition);
-    void registerSuggestionSpansForNotification(in SuggestionSpan[] spans);
-    boolean notifySuggestionPicked(in SuggestionSpan span, String originalString, int index);
+    boolean isInputMethodPickerShownForTest();
     InputMethodSubtype getCurrentInputMethodSubtype();
-    boolean setCurrentInputMethodSubtype(in InputMethodSubtype subtype);
-    boolean switchToLastInputMethod(in IBinder token);
-    boolean switchToNextInputMethod(in IBinder token, boolean onlyCurrentIme);
-    boolean shouldOfferSwitchingToNextInputMethod(in IBinder token);
-    boolean setInputMethodEnabled(String id, boolean enabled);
     void setAdditionalInputMethodSubtypes(String id, in InputMethodSubtype[] subtypes);
+    // This is kept due to @UnsupportedAppUsage.
+    // TODO(Bug 113914148): Consider removing this.
     int getInputMethodWindowVisibleHeight();
-    oneway void notifyUserAction(int sequenceNumber);
+
+    void reportActivityView(in IInputMethodClient parentClient, int childDisplayId,
+            in float[] matrixValues);
+
+    oneway void reportPerceptible(in IBinder windowToken, boolean perceptible);
+    /** Remove the IME surface. Requires INTERNAL_SYSTEM_WINDOW permission. */
+    void removeImeSurface();
+    /** Remove the IME surface. Requires passing the currently focused window. */
+    void removeImeSurfaceFromWindow(in IBinder windowToken);
 }

@@ -16,6 +16,8 @@
 package android.view;
 
 import android.animation.LayoutTransition;
+import android.annotation.NonNull;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Rect;
@@ -54,30 +56,36 @@ public class ViewOverlay {
      * of the overlay
      * @return
      */
+    @UnsupportedAppUsage
     ViewGroup getOverlayView() {
         return mOverlayViewGroup;
     }
 
     /**
-     * Adds a Drawable to the overlay. The bounds of the drawable should be relative to
+     * Adds a {@link Drawable} to the overlay. The bounds of the drawable should be relative to
      * the host view. Any drawable added to the overlay should be removed when it is no longer
-     * needed or no longer visible.
+     * needed or no longer visible. Adding an already existing {@link Drawable}
+     * is a no-op. Passing <code>null</code> parameter will result in an
+     * {@link IllegalArgumentException} being thrown.
      *
-     * @param drawable The Drawable to be added to the overlay. This drawable will be
-     * drawn when the view redraws its overlay.
+     * @param drawable The {@link Drawable} to be added to the overlay. This drawable will be
+     * drawn when the view redraws its overlay. {@link Drawable}s will be drawn in the order that
+     * they were added.
      * @see #remove(Drawable)
      */
-    public void add(Drawable drawable) {
+    public void add(@NonNull Drawable drawable) {
         mOverlayViewGroup.add(drawable);
     }
 
     /**
-     * Removes the specified Drawable from the overlay.
+     * Removes the specified {@link Drawable} from the overlay. Removing a {@link Drawable} that was
+     * not added with {@link #add(Drawable)} is a no-op. Passing <code>null</code> parameter will
+     * result in an {@link IllegalArgumentException} being thrown.
      *
-     * @param drawable The Drawable to be removed from the overlay.
+     * @param drawable The {@link Drawable} to be removed from the overlay.
      * @see #add(Drawable)
      */
-    public void remove(Drawable drawable) {
+    public void remove(@NonNull Drawable drawable) {
         mOverlayViewGroup.remove(drawable);
     }
 
@@ -88,6 +96,7 @@ public class ViewOverlay {
         mOverlayViewGroup.clear();
     }
 
+    @UnsupportedAppUsage
     boolean isEmpty() {
         return mOverlayViewGroup.isEmpty();
     }
@@ -119,7 +128,7 @@ public class ViewOverlay {
          * The View for which this is an overlay. Invalidations of the overlay are redirected to
          * this host view.
          */
-        View mHostView;
+        final View mHostView;
 
         /**
          * The set of drawables to draw when the overlay is rendered.
@@ -137,10 +146,12 @@ public class ViewOverlay {
             mRenderNode.setLeftTopRightBottom(0, 0, mRight, mBottom);
         }
 
-        public void add(Drawable drawable) {
+        public void add(@NonNull Drawable drawable) {
+            if (drawable == null) {
+                throw new IllegalArgumentException("drawable must be non-null");
+            }
             if (mDrawables == null) {
-
-                mDrawables = new ArrayList<Drawable>();
+                mDrawables = new ArrayList<>();
             }
             if (!mDrawables.contains(drawable)) {
                 // Make each drawable unique in the overlay; can't add it more than once
@@ -150,7 +161,10 @@ public class ViewOverlay {
             }
         }
 
-        public void remove(Drawable drawable) {
+        public void remove(@NonNull Drawable drawable) {
+            if (drawable == null) {
+                throw new IllegalArgumentException("drawable must be non-null");
+            }
             if (mDrawables != null) {
                 mDrawables.remove(drawable);
                 invalidate(drawable.getBounds());
@@ -159,11 +173,15 @@ public class ViewOverlay {
         }
 
         @Override
-        protected boolean verifyDrawable(Drawable who) {
+        protected boolean verifyDrawable(@NonNull Drawable who) {
             return super.verifyDrawable(who) || (mDrawables != null && mDrawables.contains(who));
         }
 
-        public void add(View child) {
+        public void add(@NonNull View child) {
+            if (child == null) {
+                throw new IllegalArgumentException("view must be non-null");
+            }
+
             if (child.getParent() instanceof ViewGroup) {
                 ViewGroup parent = (ViewGroup) child.getParent();
                 if (parent != mHostView && parent.getParent() != null &&
@@ -190,13 +208,20 @@ public class ViewOverlay {
             super.addView(child);
         }
 
-        public void remove(View view) {
+        public void remove(@NonNull View view) {
+            if (view == null) {
+                throw new IllegalArgumentException("view must be non-null");
+            }
+
             super.removeView(view);
         }
 
         public void clear() {
             removeAllViews();
             if (mDrawables != null) {
+                for (Drawable drawable : mDrawables) {
+                    drawable.setCallback(null);
+                }
                 mDrawables.clear();
             }
         }
@@ -210,13 +235,25 @@ public class ViewOverlay {
         }
 
         @Override
-        public void invalidateDrawable(Drawable drawable) {
+        public void invalidateDrawable(@NonNull Drawable drawable) {
             invalidate(drawable.getBounds());
         }
 
         @Override
         protected void dispatchDraw(Canvas canvas) {
+            /*
+             * The OverlayViewGroup doesn't draw with a DisplayList, because
+             * draw(Canvas, View, long) is never called on it. This is fine, since it doesn't need
+             * RenderNode/DisplayList features, and can just draw into the owner's Canvas.
+             *
+             * This means that we need to insert reorder barriers manually though, so that children
+             * of the OverlayViewGroup can cast shadows and Z reorder with each other.
+             */
+            canvas.insertReorderBarrier();
+
             super.dispatchDraw(canvas);
+
+            canvas.insertInorderBarrier();
             final int numDrawables = (mDrawables == null) ? 0 : mDrawables.size();
             for (int i = 0; i < numDrawables; ++i) {
                 mDrawables.get(i).draw(canvas);
@@ -261,8 +298,9 @@ public class ViewOverlay {
             }
         }
 
+        /** @hide */
         @Override
-        void invalidate(boolean invalidateCache) {
+        public void invalidate(boolean invalidateCache) {
             super.invalidate(invalidateCache);
             if (mHostView != null) {
                 mHostView.invalidate(invalidateCache);
@@ -293,34 +331,22 @@ public class ViewOverlay {
             }
         }
 
-        /**
-         * @hide
-         */
         @Override
-        public void damageChild(View child, final Rect dirty) {
+        public void onDescendantInvalidated(@NonNull View child, @NonNull View target) {
             if (mHostView != null) {
-                // Note: This is not a "fast" invalidation. Would be nice to instead invalidate
-                // using DisplayList properties and a dirty rect instead of causing a real
-                // invalidation of the host view
-                int left = child.mLeft;
-                int top = child.mTop;
-                if (!child.getMatrix().isIdentity()) {
-                    child.transformRect(dirty);
-                }
-                dirty.offset(left, top);
-                mHostView.invalidate(dirty);
-            }
-        }
+                if (mHostView instanceof ViewGroup) {
+                    // Propagate invalidate through the host...
+                    ((ViewGroup) mHostView).onDescendantInvalidated(mHostView, target);
 
-        /**
-         * @hide
-         */
-        @Override
-        protected ViewParent damageChildInParent(int left, int top, Rect dirty) {
-            if (mHostView instanceof ViewGroup) {
-                return ((ViewGroup) mHostView).damageChildInParent(left, top, dirty);
+                    // ...and also this view, since it will hold the descendant, and must later
+                    // propagate the calls to update display lists if dirty
+                    super.onDescendantInvalidated(child, target);
+                } else {
+                    // Can't use onDescendantInvalidated because host isn't a ViewGroup - fall back
+                    // to invalidating.
+                    invalidate();
+                }
             }
-            return null;
         }
 
         @Override

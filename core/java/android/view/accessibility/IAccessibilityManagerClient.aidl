@@ -25,4 +25,8 @@ package android.view.accessibility;
 oneway interface IAccessibilityManagerClient {
 
     void setState(int stateFlags);
+
+    void notifyServicesStateChanged(long updatedUiTimeout);
+
+    void setRelevantEventTypes(int eventTypes);
 }

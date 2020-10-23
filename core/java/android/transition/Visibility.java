@@ -16,16 +16,21 @@
 
 package android.transition;
 
-import com.android.internal.R;
-
 import android.animation.Animator;
 import android.animation.Animator.AnimatorListener;
 import android.animation.Animator.AnimatorPauseListener;
+import android.annotation.IntDef;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.util.AttributeSet;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewGroupOverlay;
+
+import com.android.internal.R;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 /**
  * This transition tracks changes to the visibility of target views in the
@@ -45,6 +50,16 @@ public abstract class Visibility extends Transition {
     static final String PROPNAME_VISIBILITY = "android:visibility:visibility";
     private static final String PROPNAME_PARENT = "android:visibility:parent";
     private static final String PROPNAME_SCREEN_LOCATION = "android:visibility:screenLocation";
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(flag = true, value = {
+            MODE_IN,
+            MODE_OUT,
+            Fade.IN,
+            Fade.OUT
+    })
+    @interface VisibilityMode {}
 
     /**
      * Mode used in {@link #setMode(int)} to make the transition
@@ -75,9 +90,7 @@ public abstract class Visibility extends Transition {
     }
 
     private int mMode = MODE_IN | MODE_OUT;
-
-    private int mForcedStartVisibility = -1;
-    private int mForcedEndVisibility = -1;
+    private boolean mSuppressLayout = true;
 
     public Visibility() {}
 
@@ -92,6 +105,15 @@ public abstract class Visibility extends Transition {
     }
 
     /**
+     * This tells the Visibility transition to suppress layout during the transition and release
+     * the suppression after the transition.
+     * @hide
+     */
+    public void setSuppressLayout(boolean suppress) {
+        this.mSuppressLayout = suppress;
+    }
+
+    /**
      * Changes the transition to support appearing and/or disappearing Views, depending
      * on <code>mode</code>.
      *
@@ -99,7 +121,7 @@ public abstract class Visibility extends Transition {
      *             {@link #MODE_IN} and {@link #MODE_OUT}.
      * @attr ref android.R.styleable#VisibilityTransition_transitionVisibilityMode
      */
-    public void setMode(int mode) {
+    public void setMode(@VisibilityMode int mode) {
         if ((mode & ~(MODE_IN | MODE_OUT)) != 0) {
             throw new IllegalArgumentException("Only MODE_IN and MODE_OUT flags are allowed");
         }
@@ -113,6 +135,7 @@ public abstract class Visibility extends Transition {
      *         {@link #MODE_IN} and {@link #MODE_OUT}.
      * @attr ref android.R.styleable#VisibilityTransition_transitionVisibilityMode
      */
+    @VisibilityMode
     public int getMode() {
         return mMode;
     }
@@ -122,13 +145,8 @@ public abstract class Visibility extends Transition {
         return sTransitionProperties;
     }
 
-    private void captureValues(TransitionValues transitionValues, int forcedVisibility) {
-        int visibility;
-        if (forcedVisibility != -1) {
-            visibility = forcedVisibility;
-        } else {
-            visibility = transitionValues.view.getVisibility();
-        }
+    private void captureValues(TransitionValues transitionValues) {
+        int visibility = transitionValues.view.getVisibility();
         transitionValues.values.put(PROPNAME_VISIBILITY, visibility);
         transitionValues.values.put(PROPNAME_PARENT, transitionValues.view.getParent());
         int[] loc = new int[2];
@@ -138,22 +156,12 @@ public abstract class Visibility extends Transition {
 
     @Override
     public void captureStartValues(TransitionValues transitionValues) {
-        captureValues(transitionValues, mForcedStartVisibility);
+        captureValues(transitionValues);
     }
 
     @Override
     public void captureEndValues(TransitionValues transitionValues) {
-        captureValues(transitionValues, mForcedEndVisibility);
-    }
-
-    /** @hide */
-    @Override
-    public void forceVisibility(int visibility, boolean isStartValue) {
-        if (isStartValue) {
-            mForcedStartVisibility = visibility;
-        } else {
-            mForcedEndVisibility = visibility;
-        }
+        captureValues(transitionValues);
     }
 
     /**
@@ -288,12 +296,6 @@ public abstract class Visibility extends Transition {
                 return null;
             }
         }
-        final boolean isForcedVisibility = mForcedStartVisibility != -1 ||
-                mForcedEndVisibility != -1;
-        if (isForcedVisibility) {
-            // Make sure that we reverse the effect of onDisappear's setTransitionAlpha(0)
-            endValues.view.setTransitionAlpha(1);
-        }
         return onAppear(sceneRoot, endValues.view, startValues, endValues);
     }
 
@@ -358,15 +360,49 @@ public abstract class Visibility extends Transition {
             return null;
         }
 
-        View startView = (startValues != null) ? startValues.view : null;
-        View endView = (endValues != null) ? endValues.view : null;
+        if (startValues == null) {
+            // startValues(and startView) will never be null for disappear transition.
+            return null;
+        }
+
+        final View startView = startValues.view;
+        final View endView = (endValues != null) ? endValues.view : null;
         View overlayView = null;
         View viewToKeep = null;
-        if (endView == null || endView.getParent() == null) {
-            if (endView != null) {
-                // endView was removed from its parent - add it to the overlay
-                overlayView = endView;
-            } else if (startView != null) {
+        boolean reusingOverlayView = false;
+
+        View savedOverlayView = (View) startView.getTag(R.id.transition_overlay_view_tag);
+        if (savedOverlayView != null) {
+            // we've already created overlay for the start view.
+            // it means that we are applying two visibility
+            // transitions for the same view
+            overlayView = savedOverlayView;
+            reusingOverlayView = true;
+        } else {
+            boolean needOverlayForStartView = false;
+
+            if (endView == null || endView.getParent() == null) {
+                if (endView != null) {
+                    // endView was removed from its parent - add it to the overlay
+                    overlayView = endView;
+                } else {
+                    needOverlayForStartView = true;
+                }
+            } else {
+                // visibility change
+                if (endVisibility == View.INVISIBLE) {
+                    viewToKeep = endView;
+                } else {
+                    // Becoming GONE
+                    if (startView == endView) {
+                        viewToKeep = endView;
+                    } else {
+                        needOverlayForStartView = true;
+                    }
+                }
+            }
+
+            if (needOverlayForStartView) {
                 // endView does not exist. Use startView only under certain
                 // conditions, because placing a view in an overlay necessitates
                 // it being removed from its current parent
@@ -383,75 +419,84 @@ public abstract class Visibility extends Transition {
                     if (!parentVisibilityInfo.visibilityChange) {
                         overlayView = TransitionUtils.copyViewImage(sceneRoot, startView,
                                 startParent);
-                    } else if (startParent.getParent() == null) {
+                    } else {
                         int id = startParent.getId();
-                        if (id != View.NO_ID && sceneRoot.findViewById(id) != null
-                                && mCanRemoveViews) {
+                        if (startParent.getParent() == null && id != View.NO_ID
+                                && sceneRoot.findViewById(id) != null && mCanRemoveViews) {
                             // no parent, but its parent is unparented  but the parent
                             // hierarchy has been replaced by a new hierarchy with the same id
                             // and it is safe to un-parent startView
                             overlayView = startView;
+                        } else {
+                            // TODO: Handle this case as well
                         }
                     }
                 }
             }
-        } else {
-            // visibility change
-            if (endVisibility == View.INVISIBLE) {
-                viewToKeep = endView;
-            } else {
-                // Becoming GONE
-                if (startView == endView) {
-                    viewToKeep = endView;
-                } else {
-                    overlayView = startView;
-                }
-            }
         }
-        final int finalVisibility = endVisibility;
-        final ViewGroup finalSceneRoot = sceneRoot;
 
         if (overlayView != null) {
             // TODO: Need to do this for general case of adding to overlay
-            int[] screenLoc = (int[]) startValues.values.get(PROPNAME_SCREEN_LOCATION);
-            int screenX = screenLoc[0];
-            int screenY = screenLoc[1];
-            int[] loc = new int[2];
-            sceneRoot.getLocationOnScreen(loc);
-            overlayView.offsetLeftAndRight((screenX - loc[0]) - overlayView.getLeft());
-            overlayView.offsetTopAndBottom((screenY - loc[1]) - overlayView.getTop());
-            sceneRoot.getOverlay().add(overlayView);
-            Animator animator = onDisappear(sceneRoot, overlayView, startValues, endValues);
-            if (animator == null) {
-                sceneRoot.getOverlay().remove(overlayView);
+            final ViewGroupOverlay overlay;
+            if (!reusingOverlayView) {
+                overlay = sceneRoot.getOverlay();
+                int[] screenLoc = (int[]) startValues.values.get(PROPNAME_SCREEN_LOCATION);
+                int screenX = screenLoc[0];
+                int screenY = screenLoc[1];
+                int[] loc = new int[2];
+                sceneRoot.getLocationOnScreen(loc);
+                overlayView.offsetLeftAndRight((screenX - loc[0]) - overlayView.getLeft());
+                overlayView.offsetTopAndBottom((screenY - loc[1]) - overlayView.getTop());
+                overlay.add(overlayView);
             } else {
-                final View finalOverlayView = overlayView;
-                addListener(new TransitionListenerAdapter() {
-                    @Override
-                    public void onTransitionEnd(Transition transition) {
-                        finalSceneRoot.getOverlay().remove(finalOverlayView);
-                    }
-                });
+                overlay = null;
+            }
+            Animator animator = onDisappear(sceneRoot, overlayView, startValues, endValues);
+            if (!reusingOverlayView) {
+                if (animator == null) {
+                    overlay.remove(overlayView);
+                } else {
+                    startView.setTagInternal(R.id.transition_overlay_view_tag, overlayView);
+                    final View finalOverlayView = overlayView;
+                    addListener(new TransitionListenerAdapter() {
+
+                        @Override
+                        public void onTransitionPause(Transition transition) {
+                            overlay.remove(finalOverlayView);
+                        }
+
+                        @Override
+                        public void onTransitionResume(Transition transition) {
+                            if (finalOverlayView.getParent() == null) {
+                                overlay.add(finalOverlayView);
+                            } else {
+                                cancel();
+                            }
+                        }
+
+                        @Override
+                        public void onTransitionEnd(Transition transition) {
+                            startView.setTagInternal(R.id.transition_overlay_view_tag, null);
+                            overlay.remove(finalOverlayView);
+                            transition.removeListener(this);
+                        }
+                    });
+                }
             }
             return animator;
         }
 
         if (viewToKeep != null) {
-            int originalVisibility = -1;
-            final boolean isForcedVisibility = mForcedStartVisibility != -1 ||
-                    mForcedEndVisibility != -1;
-            if (!isForcedVisibility) {
-                originalVisibility = viewToKeep.getVisibility();
-                viewToKeep.setTransitionVisibility(View.VISIBLE);
-            }
+            int originalVisibility = viewToKeep.getVisibility();
+            viewToKeep.setTransitionVisibility(View.VISIBLE);
             Animator animator = onDisappear(sceneRoot, viewToKeep, startValues, endValues);
             if (animator != null) {
                 DisappearListener disappearListener = new DisappearListener(viewToKeep,
-                        finalVisibility, isForcedVisibility);
+                        endVisibility, mSuppressLayout);
                 animator.addListener(disappearListener);
                 animator.addPauseListener(disappearListener);
                 addListener(disappearListener);
-            } else if (!isForcedVisibility) {
+            } else {
                 viewToKeep.setTransitionVisibility(originalVisibility);
             }
             return animator;
@@ -499,34 +544,33 @@ public abstract class Visibility extends Transition {
 
     private static class DisappearListener
             extends TransitionListenerAdapter implements AnimatorListener, AnimatorPauseListener {
-        private final boolean mIsForcedVisibility;
         private final View mView;
         private final int mFinalVisibility;
         private final ViewGroup mParent;
+        private final boolean mSuppressLayout;
 
         private boolean mLayoutSuppressed;
-        private boolean mFinalVisibilitySet = false;
         boolean mCanceled = false;
 
-        public DisappearListener(View view, int finalVisibility, boolean isForcedVisibility) {
+        public DisappearListener(View view, int finalVisibility, boolean suppressLayout) {
             this.mView = view;
-            this.mIsForcedVisibility = isForcedVisibility;
             this.mFinalVisibility = finalVisibility;
             this.mParent = (ViewGroup) view.getParent();
+            this.mSuppressLayout = suppressLayout;
             // Prevent a layout from including mView in its calculation.
             suppressLayout(true);
         }
 
         @Override
         public void onAnimationPause(Animator animation) {
-            if (!mCanceled && !mIsForcedVisibility) {
+            if (!mCanceled) {
                 mView.setTransitionVisibility(mFinalVisibility);
             }
         }
 
         @Override
         public void onAnimationResume(Animator animation) {
-            if (!mCanceled && !mIsForcedVisibility) {
+            if (!mCanceled) {
                 mView.setTransitionVisibility(View.VISIBLE);
             }
         }
@@ -552,6 +596,7 @@ public abstract class Visibility extends Transition {
         @Override
         public void onTransitionEnd(Transition transition) {
             hideViewWhenNotCanceled();
+            transition.removeListener(this);
         }
 
         @Override
@@ -566,15 +611,10 @@ public abstract class Visibility extends Transition {
 
         private void hideViewWhenNotCanceled() {
             if (!mCanceled) {
-                if (mIsForcedVisibility) {
-                    mView.setTransitionAlpha(0);
-                } else if (!mFinalVisibilitySet) {
-                    // Recreate the parent's display list in case it includes mView.
-                    mView.setTransitionVisibility(mFinalVisibility);
-                    if (mParent != null) {
-                        mParent.invalidate();
-                    }
-                    mFinalVisibilitySet = true;
+                // Recreate the parent's display list in case it includes mView.
+                mView.setTransitionVisibility(mFinalVisibility);
+                if (mParent != null) {
+                    mParent.invalidate();
                 }
             }
             // Layout is allowed now that the View is in its final state
@@ -582,7 +622,7 @@ public abstract class Visibility extends Transition {
         }
 
         private void suppressLayout(boolean suppress) {
-            if (mLayoutSuppressed != suppress && mParent != null && !mIsForcedVisibility) {
+            if (mSuppressLayout && mLayoutSuppressed != suppress && mParent != null) {
                 mLayoutSuppressed = suppress;
                 mParent.suppressLayout(suppress);
             }

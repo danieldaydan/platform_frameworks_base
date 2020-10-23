@@ -16,41 +16,35 @@
 
 package com.android.systemui.statusbar;
 
-import android.animation.Animator;
-import android.animation.AnimatorListenerAdapter;
-import android.animation.ValueAnimator;
+import static java.lang.Float.isNaN;
+
+import android.annotation.NonNull;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.PorterDuff;
+import android.graphics.PorterDuff.Mode;
+import android.graphics.PorterDuffColorFilter;
+import android.graphics.drawable.Drawable;
 import android.util.AttributeSet;
 import android.view.View;
-import android.view.animation.Interpolator;
+
+import androidx.core.graphics.ColorUtils;
+
+import com.android.internal.annotations.VisibleForTesting;
+import com.android.internal.colorextraction.ColorExtractor;
+import com.android.internal.colorextraction.drawable.ScrimDrawable;
 
 /**
  * A view which can draw a scrim
  */
-public class ScrimView extends View
-{
-    private int mScrimColor;
-    private boolean mIsEmpty = true;
-    private boolean mDrawAsSrc;
+public class ScrimView extends View {
+    private final ColorExtractor.GradientColors mColors;
     private float mViewAlpha = 1.0f;
-    private ValueAnimator mAlphaAnimator;
-    private ValueAnimator.AnimatorUpdateListener mAlphaUpdateListener
-            = new ValueAnimator.AnimatorUpdateListener() {
-        @Override
-        public void onAnimationUpdate(ValueAnimator animation) {
-            mViewAlpha = (float) animation.getAnimatedValue();
-            invalidate();
-        }
-    };
-    private AnimatorListenerAdapter mClearAnimatorListener = new AnimatorListenerAdapter() {
-        @Override
-        public void onAnimationEnd(Animator animation) {
-            mAlphaAnimator = null;
-        }
-    };
+    private Drawable mDrawable;
+    private PorterDuffColorFilter mColorFilter;
+    private int mTintColor;
+    private Runnable mChangeRunnable;
 
     public ScrimView(Context context) {
         this(context, null);
@@ -66,34 +60,112 @@ public class ScrimView extends View
 
     public ScrimView(Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
         super(context, attrs, defStyleAttr, defStyleRes);
+
+        mDrawable = new ScrimDrawable();
+        mDrawable.setCallback(this);
+        mColors = new ColorExtractor.GradientColors();
+        updateColorWithTint(false);
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
-        if (mDrawAsSrc || (!mIsEmpty && mViewAlpha > 0f)) {
-            PorterDuff.Mode mode = mDrawAsSrc ? PorterDuff.Mode.SRC : PorterDuff.Mode.SRC_OVER;
-            int color = mScrimColor;
-            color = Color.argb((int) (Color.alpha(color) * mViewAlpha), Color.red(color),
-                    Color.green(color), Color.blue(color));
-            canvas.drawColor(color, mode);
+        if (mDrawable.getAlpha() > 0) {
+            mDrawable.draw(canvas);
         }
     }
 
-    public void setDrawAsSrc(boolean asSrc) {
-        mDrawAsSrc = asSrc;
+    public void setDrawable(Drawable drawable) {
+        mDrawable = drawable;
+        mDrawable.setCallback(this);
+        mDrawable.setBounds(getLeft(), getTop(), getRight(), getBottom());
+        mDrawable.setAlpha((int) (255 * mViewAlpha));
         invalidate();
     }
 
-    public void setScrimColor(int color) {
-        if (color != mScrimColor) {
-            mIsEmpty = Color.alpha(color) == 0;
-            mScrimColor = color;
+    @Override
+    public void invalidateDrawable(@NonNull Drawable drawable) {
+        super.invalidateDrawable(drawable);
+        if (drawable == mDrawable) {
             invalidate();
         }
     }
 
-    public int getScrimColor() {
-        return mScrimColor;
+    @Override
+    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        super.onLayout(changed, left, top, right, bottom);
+        if (changed) {
+            mDrawable.setBounds(left, top, right, bottom);
+            invalidate();
+        }
+    }
+
+    public void setColors(@NonNull ColorExtractor.GradientColors colors) {
+        setColors(colors, false);
+    }
+
+    public void setColors(@NonNull ColorExtractor.GradientColors colors, boolean animated) {
+        if (colors == null) {
+            throw new IllegalArgumentException("Colors cannot be null");
+        }
+        if (mColors.equals(colors)) {
+            return;
+        }
+        mColors.set(colors);
+        updateColorWithTint(animated);
+    }
+
+    @VisibleForTesting
+    Drawable getDrawable() {
+        return mDrawable;
+    }
+
+    public ColorExtractor.GradientColors getColors() {
+        return mColors;
+    }
+
+    public void setTint(int color) {
+        setTint(color, false);
+    }
+
+    public void setTint(int color, boolean animated) {
+        if (mTintColor == color) {
+            return;
+        }
+        mTintColor = color;
+        updateColorWithTint(animated);
+    }
+
+    private void updateColorWithTint(boolean animated) {
+        if (mDrawable instanceof ScrimDrawable) {
+            // Optimization to blend colors and avoid a color filter
+            ScrimDrawable drawable = (ScrimDrawable) mDrawable;
+            float tintAmount = Color.alpha(mTintColor) / 255f;
+            int mainTinted = ColorUtils.blendARGB(mColors.getMainColor(), mTintColor,
+                    tintAmount);
+            drawable.setColor(mainTinted, animated);
+        } else {
+            boolean hasAlpha = Color.alpha(mTintColor) != 0;
+            if (hasAlpha) {
+                PorterDuff.Mode targetMode = mColorFilter == null ? Mode.SRC_OVER :
+                    mColorFilter.getMode();
+                if (mColorFilter == null || mColorFilter.getColor() != mTintColor) {
+                    mColorFilter = new PorterDuffColorFilter(mTintColor, targetMode);
+                }
+            } else {
+                mColorFilter = null;
+            }
+
+            mDrawable.setColorFilter(mColorFilter);
+            mDrawable.invalidateSelf();
+        }
+
+        if (mChangeRunnable != null) {
+            mChangeRunnable.run();
+        }
+    }
+
+    public int getTint() {
+        return mTintColor;
     }
 
     @Override
@@ -101,23 +173,37 @@ public class ScrimView extends View
         return false;
     }
 
+    /**
+     * It might look counterintuitive to have another method to set the alpha instead of
+     * only using {@link #setAlpha(float)}. In this case we're in a hardware layer
+     * optimizing blend modes, so it makes sense.
+     *
+     * @param alpha Gradient alpha from 0 to 1.
+     */
     public void setViewAlpha(float alpha) {
-        if (mAlphaAnimator != null) {
-            mAlphaAnimator.cancel();
+        if (isNaN(alpha)) {
+            throw new IllegalArgumentException("alpha cannot be NaN: " + alpha);
         }
-        mViewAlpha = alpha;
-        invalidate();
+        if (alpha != mViewAlpha) {
+            mViewAlpha = alpha;
+
+            mDrawable.setAlpha((int) (255 * alpha));
+            if (mChangeRunnable != null) {
+                mChangeRunnable.run();
+            }
+        }
     }
 
-    public void animateViewAlpha(float alpha, long durationOut, Interpolator interpolator) {
-        if (mAlphaAnimator != null) {
-            mAlphaAnimator.cancel();
-        }
-        mAlphaAnimator = ValueAnimator.ofFloat(mViewAlpha, alpha);
-        mAlphaAnimator.addUpdateListener(mAlphaUpdateListener);
-        mAlphaAnimator.addListener(mClearAnimatorListener);
-        mAlphaAnimator.setInterpolator(interpolator);
-        mAlphaAnimator.setDuration(durationOut);
-        mAlphaAnimator.start();
+    public float getViewAlpha() {
+        return mViewAlpha;
+    }
+
+    public void setChangeRunnable(Runnable changeRunnable) {
+        mChangeRunnable = changeRunnable;
+    }
+
+    @Override
+    protected boolean canReceivePointerEvents() {
+        return false;
     }
 }

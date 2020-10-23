@@ -39,7 +39,7 @@ using namespace android;
 class _ZipEntryRO {
 public:
     ZipEntry entry;
-    ZipString name;
+    std::string_view name;
     void *cookie;
 
     _ZipEntryRO() : cookie(NULL) {}
@@ -55,7 +55,9 @@ private:
 
 ZipFileRO::~ZipFileRO() {
     CloseArchive(mHandle);
-    free(mFileName);
+    if (mFileName != NULL) {
+        free(mFileName);
+    }
 }
 
 /*
@@ -76,13 +78,27 @@ ZipFileRO::~ZipFileRO() {
 }
 
 
+/* static */ ZipFileRO* ZipFileRO::openFd(int fd, const char* debugFileName,
+        bool assume_ownership)
+{
+    ZipArchiveHandle handle;
+    const int32_t error = OpenArchiveFd(fd, debugFileName, &handle, assume_ownership);
+    if (error) {
+        ALOGW("Error opening archive fd %d %s: %s", fd, debugFileName, ErrorCodeString(error));
+        CloseArchive(handle);
+        return NULL;
+    }
+
+    return new ZipFileRO(handle, strdup(debugFileName));
+}
+
 ZipEntryRO ZipFileRO::findEntryByName(const char* entryName) const
 {
     _ZipEntryRO* data = new _ZipEntryRO;
 
-    data->name = ZipString(entryName);
+    data->name = entryName;
 
-    const int32_t error = FindEntry(mHandle, data->name, &(data->entry));
+    const int32_t error = FindEntry(mHandle, entryName, &(data->entry));
     if (error) {
         delete data;
         return NULL;
@@ -133,13 +149,11 @@ bool ZipFileRO::startIteration(void** cookie) {
 bool ZipFileRO::startIteration(void** cookie, const char* prefix, const char* suffix)
 {
     _ZipEntryRO* ze = new _ZipEntryRO;
-    ZipString pe(prefix ? prefix : "");
-    ZipString se(suffix ? suffix : "");
     int32_t error = StartIteration(mHandle, &(ze->cookie),
-                                   prefix ? &pe : NULL,
-                                   suffix ? &se : NULL);
+                                   prefix ? prefix : "", suffix ? suffix : "");
     if (error) {
-        ALOGW("Could not start iteration over %s: %s", mFileName, ErrorCodeString(error));
+        ALOGW("Could not start iteration over %s: %s", mFileName != NULL ? mFileName : "<null>",
+                ErrorCodeString(error));
         delete ze;
         return false;
     }
@@ -154,7 +168,8 @@ ZipEntryRO ZipFileRO::nextEntry(void* cookie)
     int32_t error = Next(ze->cookie, &(ze->entry), &(ze->name));
     if (error) {
         if (error != -1) {
-            ALOGW("Error iteration over %s: %s", mFileName, ErrorCodeString(error));
+            ALOGW("Error iteration over %s: %s", mFileName != NULL ? mFileName : "<null>",
+                    ErrorCodeString(error));
         }
         return NULL;
     }
@@ -179,14 +194,14 @@ int ZipFileRO::getEntryFileName(ZipEntryRO entry, char* buffer, size_t bufLen)
     const
 {
     const _ZipEntryRO* zipEntry = reinterpret_cast<_ZipEntryRO*>(entry);
-    const uint16_t requiredSize = zipEntry->name.name_length + 1;
+    const uint16_t requiredSize = zipEntry->name.length() + 1;
 
     if (bufLen < requiredSize) {
         ALOGW("Buffer too short, requires %d bytes for entry name", requiredSize);
         return requiredSize;
     }
 
-    memcpy(buffer, zipEntry->name.name, requiredSize - 1);
+    memcpy(buffer, zipEntry->name.data(), requiredSize - 1);
     buffer[requiredSize - 1] = '\0';
 
     return 0;

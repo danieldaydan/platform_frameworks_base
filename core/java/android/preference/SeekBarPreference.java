@@ -16,6 +16,7 @@
 
 package android.preference;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.os.Parcel;
@@ -28,7 +29,14 @@ import android.widget.SeekBar.OnSeekBarChangeListener;
 
 /**
  * @hide
+ *
+ * @deprecated Use the <a href="{@docRoot}jetpack/androidx.html">AndroidX</a>
+ *      <a href="{@docRoot}reference/androidx/preference/package-summary.html">
+ *      Preference Library</a> for consistent behavior across all devices. For more information on
+ *      using the AndroidX Preference Library see
+ *      <a href="{@docRoot}guide/topics/ui/settings.html">Settings</a>.
  */
+@Deprecated
 public class SeekBarPreference extends Preference
         implements OnSeekBarChangeListener {
 
@@ -55,14 +63,17 @@ public class SeekBarPreference extends Preference
         setLayoutResource(layoutResId);
     }
 
+    @UnsupportedAppUsage
     public SeekBarPreference(Context context, AttributeSet attrs, int defStyleAttr) {
         this(context, attrs, defStyleAttr, 0);
     }
 
+    @UnsupportedAppUsage
     public SeekBarPreference(Context context, AttributeSet attrs) {
         this(context, attrs, com.android.internal.R.attr.seekBarPreferenceStyle);
     }
 
+    @UnsupportedAppUsage
     public SeekBarPreference(Context context) {
         this(context, null);
     }
@@ -79,11 +90,6 @@ public class SeekBarPreference extends Preference
     }
 
     @Override
-    public CharSequence getSummary() {
-        return null;
-    }
-
-    @Override
     protected void onSetInitialValue(boolean restoreValue, Object defaultValue) {
         setProgress(restoreValue ? getPersistedInt(mProgress)
                 : (Integer) defaultValue);
@@ -96,18 +102,15 @@ public class SeekBarPreference extends Preference
 
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
-        if (event.getAction() != KeyEvent.ACTION_UP) {
-            if (keyCode == KeyEvent.KEYCODE_PLUS
-                    || keyCode == KeyEvent.KEYCODE_EQUALS) {
-                setProgress(getProgress() + 1);
-                return true;
-            }
-            if (keyCode == KeyEvent.KEYCODE_MINUS) {
-                setProgress(getProgress() - 1);
-                return true;
-            }
+        if (event.getAction() != KeyEvent.ACTION_DOWN) {
+            return false;
         }
-        return false;
+
+        SeekBar seekBar = (SeekBar) v.findViewById(com.android.internal.R.id.seekbar);
+        if (seekBar == null) {
+            return false;
+        }
+        return seekBar.onKeyDown(keyCode, event);
     }
 
     public void setMax(int max) {
@@ -246,7 +249,7 @@ public class SeekBarPreference extends Preference
         }
 
         @SuppressWarnings("unused")
-        public static final Parcelable.Creator<SavedState> CREATOR =
+        public static final @android.annotation.NonNull Parcelable.Creator<SavedState> CREATOR =
                 new Parcelable.Creator<SavedState>() {
             public SavedState createFromParcel(Parcel in) {
                 return new SavedState(in);

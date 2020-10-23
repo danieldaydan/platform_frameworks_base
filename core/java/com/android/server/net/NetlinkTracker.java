@@ -16,6 +16,7 @@
 
 package com.android.server.net;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.RouteInfo;
@@ -79,6 +80,7 @@ public class NetlinkTracker extends BaseNetworkObserver {
 
     private static final boolean DBG = false;
 
+    @UnsupportedAppUsage
     public NetlinkTracker(String iface, Callback callback) {
         TAG = "NetlinkTracker/" + iface;
         mInterfaceName = iface;
@@ -98,6 +100,19 @@ public class NetlinkTracker extends BaseNetworkObserver {
     private void maybeLog(String operation, Object o) {
         if (DBG) {
             Log.d(TAG, operation + ": " + o.toString());
+        }
+    }
+
+    @Override
+    public void interfaceRemoved(String iface) {
+        maybeLog("interfaceRemoved", iface);
+        if (mInterfaceName.equals(iface)) {
+            // Our interface was removed. Clear our LinkProperties and tell our owner that they are
+            // now empty. Note that from the moment that the interface is removed, any further
+            // interface-specific messages (e.g., RTM_DELADDR) will not reach us, because the netd
+            // code that parses them will not be able to resolve the ifindex to an interface name.
+            clearLinkProperties();
+            mCallback.update();
         }
     }
 
@@ -174,10 +189,12 @@ public class NetlinkTracker extends BaseNetworkObserver {
     /**
      * Returns a copy of this object's LinkProperties.
      */
+    @UnsupportedAppUsage
     public synchronized LinkProperties getLinkProperties() {
         return new LinkProperties(mLinkProperties);
     }
 
+    @UnsupportedAppUsage
     public synchronized void clearLinkProperties() {
         // Clear the repository before clearing mLinkProperties. That way, if a clear() happens
         // while interfaceDnsServerInfo() is being called, we'll end up with no DNS servers in

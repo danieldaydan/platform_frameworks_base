@@ -16,10 +16,13 @@
 
 package android.widget;
 
+import android.annotation.NonNull;
 import android.annotation.Widget;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.AttributeSet;
 import android.util.Log;
@@ -74,6 +77,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     /**
      * Horizontal spacing between items.
      */
+    @UnsupportedAppUsage
     private int mSpacing = 0;
 
     /**
@@ -102,21 +106,25 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     /**
      * Helper for detecting touch gestures.
      */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private GestureDetector mGestureDetector;
 
     /**
      * The position of the item that received the user's down touch.
      */
+    @UnsupportedAppUsage
     private int mDownTouchPosition;
 
     /**
      * The view of the item that received the user's down touch.
      */
+    @UnsupportedAppUsage
     private View mDownTouchView;
     
     /**
      * Executes the delta scrolls from a fling or scroll movement. 
      */
+    @UnsupportedAppUsage
     private FlingRunnable mFlingRunnable = new FlingRunnable();
 
     /**
@@ -142,6 +150,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     /**
      * The currently selected item's child.
      */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private View mSelectedChild;
     
     /**
@@ -201,12 +210,11 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
 
     public Gallery(Context context, AttributeSet attrs, int defStyleAttr, int defStyleRes) {
         super(context, attrs, defStyleAttr, defStyleRes);
-        
-        mGestureDetector = new GestureDetector(context, this);
-        mGestureDetector.setIsLongpressEnabled(true);
 
         final TypedArray a = context.obtainStyledAttributes(
                 attrs, com.android.internal.R.styleable.Gallery, defStyleAttr, defStyleRes);
+        saveAttributeDataForStyleable(context, com.android.internal.R.styleable.Gallery,
+                attrs, a, defStyleAttr, defStyleRes);
 
         int index = a.getInt(com.android.internal.R.styleable.Gallery_gravity, -1);
         if (index >= 0) {
@@ -234,6 +242,16 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
         mGroupFlags |= FLAG_USE_CHILD_DRAWING_ORDER;
         
         mGroupFlags |= FLAG_SUPPORT_STATIC_TRANSFORMATIONS;
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+
+        if (mGestureDetector == null) {
+            mGestureDetector = new GestureDetector(getContext(), this);
+            mGestureDetector.setIsLongpressEnabled(true);
+        }
     }
 
     /**
@@ -372,6 +390,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
      * 
      * @param deltaX Change in X from the previous event.
      */
+    @UnsupportedAppUsage
     void trackMotionScroll(int deltaX) {
 
         if (getChildCount() == 0) {
@@ -464,6 +483,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     /**
      * @return The center of this Gallery.
      */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private int getCenterOfGallery() {
         return (getWidth() - mPaddingLeft - mPaddingRight) / 2 + mPaddingLeft;
     }
@@ -471,6 +491,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     /**
      * @return The center of the given view.
      */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private static int getCenterOfView(View view) {
         return view.getLeft() + view.getWidth() / 2;
     }
@@ -688,6 +709,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
         updateSelectedItemMetadata();
     }
 
+    @UnsupportedAppUsage
     private void fillToGalleryLeft() {
         if (mIsRtl) {
             fillToGalleryLeftRtl();
@@ -759,6 +781,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
         }
     }
     
+    @UnsupportedAppUsage
     private void fillToGalleryRight() {
         if (mIsRtl) {
             fillToGalleryRightRtl();
@@ -843,6 +866,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
      *        building from left to right)?
      * @return A view that has been added to the gallery
      */
+    @UnsupportedAppUsage
     private View makeAndAddView(int position, int offset, int x, boolean fromLeft) {
 
         View child;
@@ -1090,15 +1114,15 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
     }
     
     @Override
-    public void onLongPress(MotionEvent e) {
-        
+    public void onLongPress(@NonNull MotionEvent e) {
         if (mDownTouchPosition < 0) {
             return;
         }
         
         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-        long id = getItemIdAtPosition(mDownTouchPosition);
-        dispatchLongPress(mDownTouchView, mDownTouchPosition, id);
+
+        final long id = getItemIdAtPosition(mDownTouchPosition);
+        dispatchLongPress(mDownTouchView, mDownTouchPosition, id, e.getX(), e.getY(), true);
     }
 
     // Unused methods from GestureDetector.OnGestureListener below
@@ -1152,29 +1176,50 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
 
     @Override
     public boolean showContextMenuForChild(View originalView) {
+        if (isShowingContextMenuWithCoords()) {
+            return false;
+        }
+        return showContextMenuForChildInternal(originalView, 0, 0, false);
+    }
 
+    @Override
+    public boolean showContextMenuForChild(View originalView, float x, float y) {
+        return showContextMenuForChildInternal(originalView, x, y, true);
+    }
+
+    private boolean showContextMenuForChildInternal(View originalView, float x, float y,
+            boolean useOffsets) {
         final int longPressPosition = getPositionForView(originalView);
         if (longPressPosition < 0) {
             return false;
         }
         
         final long longPressId = mAdapter.getItemId(longPressPosition);
-        return dispatchLongPress(originalView, longPressPosition, longPressId);
+        return dispatchLongPress(originalView, longPressPosition, longPressId, x, y, useOffsets);
     }
 
     @Override
     public boolean showContextMenu() {
-        
+        return showContextMenuInternal(0, 0, false);
+    }
+
+    @Override
+    public boolean showContextMenu(float x, float y) {
+        return showContextMenuInternal(x, y, true);
+    }
+
+    private boolean showContextMenuInternal(float x, float y, boolean useOffsets) {
         if (isPressed() && mSelectedPosition >= 0) {
-            int index = mSelectedPosition - mFirstPosition;
-            View v = getChildAt(index);
-            return dispatchLongPress(v, mSelectedPosition, mSelectedRowId);
+            final int index = mSelectedPosition - mFirstPosition;
+            final View v = getChildAt(index);
+            return dispatchLongPress(v, mSelectedPosition, mSelectedRowId, x, y, useOffsets);
         }        
         
         return false;
     }
 
-    private boolean dispatchLongPress(View view, int position, long id) {
+    private boolean dispatchLongPress(View view, int position, long id, float x, float y,
+            boolean useOffsets) {
         boolean handled = false;
         
         if (mOnItemLongClickListener != null) {
@@ -1184,7 +1229,12 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
 
         if (!handled) {
             mContextMenuInfo = new AdapterContextMenuInfo(view, position, id);
-            handled = super.showContextMenuForChild(this);
+
+            if (useOffsets) {
+                handled = super.showContextMenuForChild(view, x, y);
+            } else {
+                handled = super.showContextMenuForChild(this);
+            }
         }
 
         if (handled) {
@@ -1255,6 +1305,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
         return super.onKeyUp(keyCode, event);
     }
     
+    @UnsupportedAppUsage
     boolean moveDirection(int direction) {
         direction = isLayoutRtl() ? -direction : direction;
         int targetPosition = mSelectedPosition + direction;
@@ -1434,6 +1485,7 @@ public class Gallery extends AbsSpinner implements GestureDetector.OnGestureList
             removeCallbacks(this);
         }
         
+        @UnsupportedAppUsage
         public void startUsingVelocity(int initialVelocity) {
             if (initialVelocity == 0) return;
             

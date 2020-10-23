@@ -14,19 +14,20 @@
  * limitations under the License.
  */
 
-
 package android.hardware;
 
+import android.annotation.SystemService;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
-import android.util.Log;
 
 import java.io.IOException;
 
 /**
  * @hide
  */
+@SystemService(Context.SERIAL_SERVICE)
 public class SerialManager {
     private static final String TAG = "SerialManager";
 
@@ -46,12 +47,12 @@ public class SerialManager {
      *
      * @return names of available serial ports
      */
+    @UnsupportedAppUsage
     public String[] getSerialPorts() {
         try {
             return mService.getSerialPorts();
         } catch (RemoteException e) {
-            Log.e(TAG, "RemoteException in getSerialPorts", e);
-            return null;
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -66,6 +67,7 @@ public class SerialManager {
      * @param speed at which to open the serial port
      * @return the serial port
      */
+    @UnsupportedAppUsage
     public SerialPort openSerialPort(String name, int speed) throws IOException {
         try {
             ParcelFileDescriptor pfd = mService.openSerialPort(name);
@@ -77,8 +79,7 @@ public class SerialManager {
                 throw new IOException("Could not open serial port " + name);
             }
         } catch (RemoteException e) {
-            Log.e(TAG, "exception in UsbManager.openDevice", e);
+            throw e.rethrowFromSystemServer();
         }
-        return null;
     }
 }

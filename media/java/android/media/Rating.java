@@ -16,9 +16,13 @@
 
 package android.media;
 
+import android.annotation.IntDef;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.util.Log;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 /**
  * A class to encapsulate rating information used as content metadata.
@@ -29,53 +33,68 @@ import android.util.Log;
  * through one of the factory methods.
  */
 public final class Rating implements Parcelable {
-    private final static String TAG = "Rating";
+    private static final String TAG = "Rating";
+
+    /**
+     * @hide
+     */
+    @IntDef({RATING_NONE, RATING_HEART, RATING_THUMB_UP_DOWN, RATING_3_STARS, RATING_4_STARS,
+            RATING_5_STARS, RATING_PERCENTAGE})
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface Style {}
+
+    /**
+     * @hide
+     */
+    @IntDef({RATING_3_STARS, RATING_4_STARS, RATING_5_STARS})
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface StarStyle {}
 
     /**
      * Indicates a rating style is not supported. A Rating will never have this
      * type, but can be used by other classes to indicate they do not support
      * Rating.
      */
-    public final static int RATING_NONE = 0;
+    public static final int RATING_NONE = 0;
 
     /**
      * A rating style with a single degree of rating, "heart" vs "no heart". Can be used to
      * indicate the content referred to is a favorite (or not).
      */
-    public final static int RATING_HEART = 1;
+    public static final int RATING_HEART = 1;
 
     /**
      * A rating style for "thumb up" vs "thumb down".
      */
-    public final static int RATING_THUMB_UP_DOWN = 2;
+    public static final int RATING_THUMB_UP_DOWN = 2;
 
     /**
      * A rating style with 0 to 3 stars.
      */
-    public final static int RATING_3_STARS = 3;
+    public static final int RATING_3_STARS = 3;
 
     /**
      * A rating style with 0 to 4 stars.
      */
-    public final static int RATING_4_STARS = 4;
+    public static final int RATING_4_STARS = 4;
 
     /**
      * A rating style with 0 to 5 stars.
      */
-    public final static int RATING_5_STARS = 5;
+    public static final int RATING_5_STARS = 5;
 
     /**
      * A rating style expressed as a percentage.
      */
-    public final static int RATING_PERCENTAGE = 6;
+    public static final int RATING_PERCENTAGE = 6;
 
-    private final static float RATING_NOT_RATED = -1.0f;
+    private static final float RATING_NOT_RATED = -1.0f;
 
     private final int mRatingStyle;
 
     private final float mRatingValue;
 
-    private Rating(int ratingStyle, float rating) {
+    private Rating(@Style int ratingStyle, float rating) {
         mRatingStyle = ratingStyle;
         mRatingValue = rating;
     }
@@ -97,8 +116,7 @@ public final class Rating implements Parcelable {
         dest.writeFloat(mRatingValue);
     }
 
-    public static final Parcelable.Creator<Rating> CREATOR
-            = new Parcelable.Creator<Rating>() {
+    public static final @android.annotation.NonNull Parcelable.Creator<Rating> CREATOR = new Parcelable.Creator<Rating>() {
         /**
          * Rebuilds a Rating previously stored with writeToParcel().
          * @param p    Parcel object to read the Rating from
@@ -124,7 +142,7 @@ public final class Rating implements Parcelable {
      *    or {@link #RATING_PERCENTAGE}.
      * @return null if an invalid rating style is passed, a new Rating instance otherwise.
      */
-    public static Rating newUnratedRating(int ratingStyle) {
+    public static Rating newUnratedRating(@Style int ratingStyle) {
         switch(ratingStyle) {
             case RATING_HEART:
             case RATING_THUMB_UP_DOWN:
@@ -172,7 +190,7 @@ public final class Rating implements Parcelable {
      * @return null if the rating style is invalid, or the rating is out of range,
      *     a new Rating instance otherwise.
      */
-    public static Rating newStarRating(int starRatingStyle, float starRating) {
+    public static Rating newStarRating(@StarStyle int starRatingStyle, float starRating) {
         float maxRating = -1.0f;
         switch(starRatingStyle) {
             case RATING_3_STARS:
@@ -186,7 +204,7 @@ public final class Rating implements Parcelable {
                 break;
             default:
                 Log.e(TAG, "Invalid rating style (" + starRatingStyle + ") for a star rating");
-                        return null;
+                return null;
         }
         if ((starRating < 0.0f) || (starRating > maxRating)) {
             Log.e(TAG, "Trying to set out of range star-based rating");
@@ -225,6 +243,7 @@ public final class Rating implements Parcelable {
      *    {@link #RATING_3_STARS}, {@link #RATING_4_STARS}, {@link #RATING_5_STARS},
      *    or {@link #RATING_PERCENTAGE}.
      */
+    @Style
     public int getRatingStyle() {
         return mRatingStyle;
     }
@@ -261,16 +280,16 @@ public final class Rating implements Parcelable {
      *    not star-based, or if it is unrated.
      */
     public float getStarRating() {
+        float ratingValue = -1.0f;
         switch (mRatingStyle) {
             case RATING_3_STARS:
             case RATING_4_STARS:
             case RATING_5_STARS:
                 if (isRated()) {
-                    return mRatingValue;
+                    ratingValue = mRatingValue;
                 }
-            default:
-                return -1.0f;
         }
+        return ratingValue;
     }
 
     /**

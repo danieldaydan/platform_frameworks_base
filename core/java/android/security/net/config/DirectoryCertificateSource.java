@@ -16,24 +16,23 @@
 
 package android.security.net.config;
 
-import android.os.Environment;
-import android.os.UserHandle;
 import android.util.ArraySet;
-import android.util.Pair;
+import android.util.Log;
+
+import libcore.io.IoUtils;
+
 import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.InputStream;
 import java.io.IOException;
-import java.security.cert.Certificate;
+import java.io.InputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.util.Collections;
 import java.util.Set;
-import libcore.io.IoUtils;
-
-import com.android.org.conscrypt.Hex;
-import com.android.org.conscrypt.NativeCrypto;
 
 import javax.security.auth.x500.X500Principal;
 
@@ -43,6 +42,7 @@ import javax.security.auth.x500.X500Principal;
  * @hide
  */
 abstract class DirectoryCertificateSource implements CertificateSource {
+    private static final String LOG_TAG = "DirectoryCertificateSrc";
     private final File mDir;
     private final Object mLock = new Object();
     private final CertificateFactory mCertFactory;
@@ -110,8 +110,58 @@ abstract class DirectoryCertificateSource implements CertificateSource {
         });
     }
 
+    @Override
+    public Set<X509Certificate> findAllByIssuerAndSignature(final X509Certificate cert) {
+        return findCerts(cert.getIssuerX500Principal(), new CertSelector() {
+            @Override
+            public boolean match(X509Certificate ca) {
+                try {
+                    cert.verify(ca.getPublicKey());
+                    return true;
+                } catch (Exception e) {
+                    return false;
+                }
+            }
+        });
+    }
+
+    @Override
+    public void handleTrustStorageUpdate() {
+        synchronized (mLock) {
+            mCertificates = null;
+        }
+    }
+
     private static interface CertSelector {
         boolean match(X509Certificate cert);
+    }
+
+    private Set<X509Certificate> findCerts(X500Principal subj, CertSelector selector) {
+        String hash = getHash(subj);
+        Set<X509Certificate> certs = null;
+        for (int index = 0; index >= 0; index++) {
+            String fileName = hash + "." + index;
+            if (!new File(mDir, fileName).exists()) {
+                break;
+            }
+            if (isCertMarkedAsRemoved(fileName)) {
+                continue;
+            }
+            X509Certificate cert = readCertificate(fileName);
+            if (cert == null) {
+                continue;
+            }
+            if (!subj.equals(cert.getSubjectX500Principal())) {
+                continue;
+            }
+            if (selector.match(cert)) {
+                if (certs == null) {
+                    certs = new ArraySet<X509Certificate>();
+                }
+                certs.add(cert);
+            }
+        }
+        return certs != null ? certs : Collections.<X509Certificate>emptySet();
     }
 
     private X509Certificate findCert(X500Principal subj, CertSelector selector) {
@@ -125,6 +175,9 @@ abstract class DirectoryCertificateSource implements CertificateSource {
                 continue;
             }
             X509Certificate cert = readCertificate(fileName);
+            if (cert == null) {
+                continue;
+            }
             if (!subj.equals(cert.getSubjectX500Principal())) {
                 continue;
             }
@@ -136,8 +189,36 @@ abstract class DirectoryCertificateSource implements CertificateSource {
     }
 
     private String getHash(X500Principal name) {
-        int hash = NativeCrypto.X509_NAME_hash_old(name);
-        return Hex.intToHexString(hash, 8);
+        int hash = hashName(name);
+        return intToHexString(hash, 8);
+    }
+
+    private static final char[] DIGITS = {
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+
+    private static String intToHexString(int i, int minWidth) {
+        int bufLen = 8;  // Max number of hex digits in an int
+        char[] buf = new char[bufLen];
+        int cursor = bufLen;
+
+        do {
+            buf[--cursor] = DIGITS[i & 0xf];
+        } while ((i >>>= 4) != 0 || (bufLen - cursor < minWidth));
+
+        return new String(buf, cursor, bufLen - cursor);
+    }
+
+    // This code matches the code in X509_NAME_hash_old() in Conscrypt, which in turn matches
+    // the names of certificate files.  It must be kept in sync.
+    private static int hashName(X500Principal principal) {
+        try {
+            byte[] digest = MessageDigest.getInstance("MD5").digest(principal.getEncoded());
+            int offset = 0;
+            return (((digest[offset++] & 0xff) << 0) | ((digest[offset++] & 0xff) << 8)
+                    | ((digest[offset++] & 0xff) << 16) | ((digest[offset] & 0xff) << 24));
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError(e);
+        }
     }
 
     private X509Certificate readCertificate(String file) {
@@ -146,6 +227,7 @@ abstract class DirectoryCertificateSource implements CertificateSource {
             is = new BufferedInputStream(new FileInputStream(new File(mDir, file)));
             return (X509Certificate) mCertFactory.generateCertificate(is);
         } catch (CertificateException | IOException e) {
+            Log.e(LOG_TAG, "Failed to read certificate from " + file, e);
             return null;
         } finally {
             IoUtils.closeQuietly(is);

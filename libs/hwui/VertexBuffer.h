@@ -17,7 +17,7 @@
 #ifndef ANDROID_HWUI_VERTEX_BUFFER_H
 #define ANDROID_HWUI_VERTEX_BUFFER_H
 
-#include "utils/MathUtils.h"
+#include <algorithm>
 
 namespace android {
 namespace uirenderer {
@@ -41,8 +41,7 @@ public:
             , mMeshFeatureFlags(kNone)
             , mReallocBuffer(nullptr)
             , mCleanupMethod(nullptr)
-            , mCleanupIndexMethod(nullptr)
-    {}
+            , mCleanupIndexMethod(nullptr) {}
 
     ~VertexBuffer() {
         if (mCleanupMethod) mCleanupMethod(mBuffer);
@@ -118,7 +117,7 @@ public:
         TYPE* end = current + vertexCount;
         mBounds.set(current->x, current->y, current->x, current->y);
         for (; current < end; current++) {
-            mBounds.expandToCoverVertex(current->x, current->y);
+            mBounds.expandToCover(current->x, current->y);
         }
     }
 
@@ -128,11 +127,11 @@ public:
     unsigned int getVertexCount() const { return mVertexCount; }
     unsigned int getSize() const { return mByteCount; }
     unsigned int getIndexCount() const { return mIndexCount; }
-    void updateIndexCount(unsigned int newCount)  {
-        mIndexCount = MathUtils::min(newCount, mAllocatedIndexCount);
+    void updateIndexCount(unsigned int newCount) {
+        mIndexCount = std::min(newCount, mAllocatedIndexCount);
     }
-    void updateVertexCount(unsigned int newCount)  {
-        mVertexCount = MathUtils::min(newCount, mAllocatedVertexCount);
+    void updateVertexCount(unsigned int newCount) {
+        mVertexCount = std::min(newCount, mAllocatedVertexCount);
     }
     MeshFeatureFlags getMeshFeatureFlags() const { return mMeshFeatureFlags; }
     void setMeshFeatureFlags(int flags) {
@@ -153,7 +152,7 @@ public:
 private:
     template <class TYPE>
     static void cleanup(void* buffer) {
-        delete[] (TYPE*)buffer;
+        delete[](TYPE*) buffer;
     }
 
     Rect mBounds;
@@ -169,13 +168,13 @@ private:
 
     MeshFeatureFlags mMeshFeatureFlags;
 
-    void* mReallocBuffer; // used for multi-allocation
+    void* mReallocBuffer;  // used for multi-allocation
 
     void (*mCleanupMethod)(void*);
     void (*mCleanupIndexMethod)(void*);
 };
 
-}; // namespace uirenderer
-}; // namespace android
+}  // namespace uirenderer
+}  // namespace android
 
-#endif // ANDROID_HWUI_VERTEX_BUFFER_H
+#endif  // ANDROID_HWUI_VERTEX_BUFFER_H

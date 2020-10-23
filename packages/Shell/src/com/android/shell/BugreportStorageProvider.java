@@ -19,26 +19,30 @@ package com.android.shell;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.database.MatrixCursor.RowBuilder;
+import android.net.Uri;
+import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.FileUtils;
 import android.os.ParcelFileDescriptor;
+import android.provider.DocumentsContract;
 import android.provider.DocumentsContract.Document;
 import android.provider.DocumentsContract.Root;
-import android.provider.DocumentsProvider;
-import android.webkit.MimeTypeMap;
+
+import com.android.internal.content.FileSystemProvider;
 
 import java.io.File;
 import java.io.FileNotFoundException;
 
-public class BugreportStorageProvider extends DocumentsProvider {
+public class BugreportStorageProvider extends FileSystemProvider {
+    private static final String AUTHORITY = "com.android.shell.documents";
     private static final String DOC_ID_ROOT = "bugreport";
 
-    private static final String[] DEFAULT_ROOT_PROJECTION = new String[] {
+    private static final String[] DEFAULT_ROOT_PROJECTION = new String[]{
             Root.COLUMN_ROOT_ID, Root.COLUMN_FLAGS, Root.COLUMN_ICON, Root.COLUMN_TITLE,
             Root.COLUMN_DOCUMENT_ID,
     };
 
-    private static final String[] DEFAULT_DOCUMENT_PROJECTION = new String[] {
+    private static final String[] DEFAULT_DOCUMENT_PROJECTION = new String[]{
             Document.COLUMN_DOCUMENT_ID, Document.COLUMN_MIME_TYPE, Document.COLUMN_DISPLAY_NAME,
             Document.COLUMN_LAST_MODIFIED, Document.COLUMN_FLAGS, Document.COLUMN_SIZE,
     };
@@ -47,6 +51,7 @@ public class BugreportStorageProvider extends DocumentsProvider {
 
     @Override
     public boolean onCreate() {
+        super.onCreate(DEFAULT_DOCUMENT_PROJECTION);
         mRoot = new File(getContext().getFilesDir(), "bugreports");
         return true;
     }
@@ -56,7 +61,7 @@ public class BugreportStorageProvider extends DocumentsProvider {
         final MatrixCursor result = new MatrixCursor(resolveRootProjection(projection));
         final RowBuilder row = result.newRow();
         row.add(Root.COLUMN_ROOT_ID, DOC_ID_ROOT);
-        row.add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY | Root.FLAG_ADVANCED);
+        row.add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY);
         row.add(Root.COLUMN_ICON, android.R.mipmap.sym_def_app_icon);
         row.add(Root.COLUMN_TITLE, getContext().getString(R.string.bugreport_storage_title));
         row.add(Root.COLUMN_DOCUMENT_ID, DOC_ID_ROOT);
@@ -64,36 +69,27 @@ public class BugreportStorageProvider extends DocumentsProvider {
     }
 
     @Override
-    public Cursor queryDocument(String documentId, String[] projection)
-            throws FileNotFoundException {
-        final MatrixCursor result = new MatrixCursor(resolveDocumentProjection(projection));
-        if (DOC_ID_ROOT.equals(documentId)) {
-            final RowBuilder row = result.newRow();
-            row.add(Document.COLUMN_DOCUMENT_ID, documentId);
-            row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR);
-            row.add(Document.COLUMN_DISPLAY_NAME, mRoot.getName());
-            row.add(Document.COLUMN_LAST_MODIFIED, mRoot.lastModified());
-            row.add(Document.COLUMN_FLAGS, Document.FLAG_DIR_PREFERS_LAST_MODIFIED);
-        } else {
-            addFileRow(result, getFileForDocId(documentId));
-        }
-        return result;
-    }
-
-    @Override
     public Cursor queryChildDocuments(
             String parentDocumentId, String[] projection, String sortOrder)
             throws FileNotFoundException {
-        final MatrixCursor result = new MatrixCursor(resolveDocumentProjection(projection));
-        if (DOC_ID_ROOT.equals(parentDocumentId)) {
-            final File[] files = mRoot.listFiles();
-            if (files != null) {
-                for (File file : files) {
-                    addFileRow(result, file);
-                }
-            }
+        final Cursor c = super.queryChildDocuments(parentDocumentId, projection, sortOrder);
+        final Bundle extras = new Bundle();
+        extras.putCharSequence(DocumentsContract.EXTRA_INFO,
+                getContext().getText(R.string.bugreport_confirm));
+        c.setExtras(extras);
+        return c;
+    }
+
+    @Override
+    public Cursor queryDocument(String documentId, String[] projection)
+            throws FileNotFoundException {
+        if (DOC_ID_ROOT.equals(documentId)) {
+            final MatrixCursor result = new MatrixCursor(resolveDocumentProjection(projection));
+            includeDefaultDocument(result);
+            return result;
+        } else {
+            return super.queryDocument(documentId, projection);
         }
-        return result;
     }
 
     @Override
@@ -108,10 +104,8 @@ public class BugreportStorageProvider extends DocumentsProvider {
     }
 
     @Override
-    public void deleteDocument(String documentId) throws FileNotFoundException {
-        if (!getFileForDocId(documentId).delete()) {
-            throw new FileNotFoundException("Failed to delete: " + documentId);
-        }
+    protected Uri buildNotificationUri(String docId) {
+        return DocumentsContract.buildChildDocumentsUri(AUTHORITY, docId);
     }
 
     private static String[] resolveRootProjection(String[] projection) {
@@ -122,43 +116,45 @@ public class BugreportStorageProvider extends DocumentsProvider {
         return projection != null ? projection : DEFAULT_DOCUMENT_PROJECTION;
     }
 
-    private static String getTypeForName(String name) {
-        final int lastDot = name.lastIndexOf('.');
-        if (lastDot >= 0) {
-            final String extension = name.substring(lastDot + 1).toLowerCase();
-            final String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
-            if (mime != null) {
-                return mime;
-            }
-        }
-        return "application/octet-stream";
-    }
-
-    private String getDocIdForFile(File file) {
+    @Override
+    protected String getDocIdForFile(File file) {
         return DOC_ID_ROOT + ":" + file.getName();
     }
 
-    private File getFileForDocId(String documentId) throws FileNotFoundException {
-        final int splitIndex = documentId.indexOf(':', 1);
-        final String name = documentId.substring(splitIndex + 1);
-        if (splitIndex == -1 || !DOC_ID_ROOT.equals(documentId.substring(0, splitIndex)) ||
-                !FileUtils.isValidExtFilename(name)) {
-            throw new FileNotFoundException("Invalid document ID: " + documentId);
+    @Override
+    protected File getFileForDocId(String documentId, boolean visible)
+            throws FileNotFoundException {
+        if (DOC_ID_ROOT.equals(documentId)) {
+            return mRoot;
+        } else {
+            final int splitIndex = documentId.indexOf(':', 1);
+            final String name = documentId.substring(splitIndex + 1);
+            if (splitIndex == -1 || !DOC_ID_ROOT.equals(documentId.substring(0, splitIndex)) ||
+                    !FileUtils.isValidExtFilename(name)) {
+                throw new FileNotFoundException("Invalid document ID: " + documentId);
+            }
+            final File file = new File(mRoot, name);
+            if (!file.exists()) {
+                throw new FileNotFoundException("File not found: " + documentId);
+            }
+            return file;
         }
-        final File file = new File(mRoot, name);
-        if (!file.exists()) {
-            throw new FileNotFoundException("File not found: " + documentId);
-        }
-        return file;
     }
 
-    private void addFileRow(MatrixCursor result, File file) {
-        final RowBuilder row = result.newRow();
-        row.add(Document.COLUMN_DOCUMENT_ID, getDocIdForFile(file));
-        row.add(Document.COLUMN_MIME_TYPE, getTypeForName(file.getName()));
-        row.add(Document.COLUMN_DISPLAY_NAME, file.getName());
-        row.add(Document.COLUMN_LAST_MODIFIED, file.lastModified());
+    @Override
+    protected RowBuilder includeFile(MatrixCursor result, String docId, File file)
+            throws FileNotFoundException {
+        RowBuilder row = super.includeFile(result, docId, file);
         row.add(Document.COLUMN_FLAGS, Document.FLAG_SUPPORTS_DELETE);
-        row.add(Document.COLUMN_SIZE, file.length());
+        return row;
+    }
+
+    private void includeDefaultDocument(MatrixCursor result) {
+        final RowBuilder row = result.newRow();
+        row.add(Document.COLUMN_DOCUMENT_ID, DOC_ID_ROOT);
+        row.add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR);
+        row.add(Document.COLUMN_DISPLAY_NAME, mRoot.getName());
+        row.add(Document.COLUMN_LAST_MODIFIED, mRoot.lastModified());
+        row.add(Document.COLUMN_FLAGS, Document.FLAG_DIR_PREFERS_LAST_MODIFIED);
     }
 }

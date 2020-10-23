@@ -17,9 +17,9 @@
 package com.android.ims.internal;
 
 import android.os.Message;
-import com.android.ims.ImsCallProfile;
-import com.android.ims.ImsStreamMediaProfile;
-import com.android.ims.internal.IImsCallSessionListener;
+import android.telephony.ims.aidl.IImsCallSessionListener;
+import android.telephony.ims.ImsCallProfile;
+import android.telephony.ims.ImsStreamMediaProfile;
 import com.android.ims.internal.IImsVideoCallProvider;
 
 /**
@@ -135,12 +135,35 @@ interface IImsCallSession {
     void accept(int callType, in ImsStreamMediaProfile profile);
 
     /**
+     * Deflects an incoming call.
+     *
+     * @param deflectNumber number to deflect the call
+     */
+    void deflect(String deflectNumber);
+
+    /**
      * Rejects an incoming call or session update.
      *
      * @param reason reason code to reject an incoming call
      * @see Listener#callSessionStartFailed
      */
     void reject(int reason);
+
+    /**
+     * Transfer an established call to given number
+     *
+     * @param number number to transfer the call
+     * @param isConfirmationRequired if {@code True}, indicates a confirmed transfer,
+     * if {@code False} it indicates an unconfirmed transfer.
+     */
+    void transfer(String number, boolean isConfirmationRequired);
+
+    /**
+     * Transfer an established call to another call session
+     *
+     * @param transferToSession The other ImsCallSession to transfer the ongoing session to.
+     */
+    void consultativeTransfer(in IImsCallSession transferToSession);
 
     /**
      * Terminates a call.
@@ -255,4 +278,23 @@ interface IImsCallSession {
      * @return {@code True} if the session is multiparty.
      */
     boolean isMultiparty();
+
+    /**
+     * Device issues RTT modify request
+     * @param toProfile The profile with requested changes made
+     */
+    void sendRttModifyRequest(in ImsCallProfile toProfile);
+
+    /*
+     * Device responds to Remote RTT modify request
+     * @param status true : Accepted the request
+     *                false : Declined the request
+     */
+    void sendRttModifyResponse(in boolean status);
+
+    /*
+     * Device sends RTT message
+     * @param rttMessage RTT message to be sent
+     */
+    void sendRttMessage(in String rttMessage);
 }

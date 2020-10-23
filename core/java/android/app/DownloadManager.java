@@ -16,47 +16,63 @@
 
 package android.app;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
 import android.annotation.SdkConstant;
 import android.annotation.SdkConstant.SdkConstantType;
+import android.annotation.SystemApi;
+import android.annotation.SystemService;
+import android.annotation.TestApi;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.ClipDescription;
+import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.database.CursorWrapper;
+import android.database.DatabaseUtils;
 import android.net.ConnectivityManager;
 import android.net.NetworkPolicyManager;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
 import android.os.Environment;
+import android.os.FileUtils;
 import android.os.ParcelFileDescriptor;
+import android.os.RemoteException;
+import android.provider.BaseColumns;
 import android.provider.Downloads;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.provider.Settings.SettingNotFoundException;
 import android.text.TextUtils;
+import android.util.LongSparseArray;
 import android.util.Pair;
+import android.webkit.MimeTypeMap;
 
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * The download manager is a system service that handles long-running HTTP downloads. Clients may
  * request that a URI be downloaded to a particular destination file. The download manager will
  * conduct the download in the background, taking care of HTTP interactions and retrying downloads
  * after failures or across connectivity changes and system reboots.
- *
- * Instances of this class should be obtained through
- * {@link android.content.Context#getSystemService(String)} by passing
- * {@link android.content.Context#DOWNLOAD_SERVICE}.
- *
+ * <p>
  * Apps that request downloads through this API should register a broadcast receiver for
  * {@link #ACTION_NOTIFICATION_CLICKED} to appropriately handle when the user clicks on a running
  * download in a notification or from the downloads UI.
- *
+ * <p>
  * Note that the application must have the {@link android.Manifest.permission#INTERNET}
  * permission to use this class.
  */
+@SystemService(Context.DOWNLOAD_SERVICE)
 public class DownloadManager {
 
     /**
@@ -105,14 +121,26 @@ public class DownloadManager {
     public final static String COLUMN_LOCAL_URI = "local_uri";
 
     /**
-     * The pathname of the file where the download is stored.
+     * Path to the downloaded file on disk.
+     * <p>
+     * Note that apps may not have filesystem permissions to directly access
+     * this path. Instead of trying to open this path directly, apps should use
+     * {@link ContentResolver#openFileDescriptor(Uri, String)} to gain access.
+     *
+     * @deprecated apps should transition to using
+     *             {@link ContentResolver#openFileDescriptor(Uri, String)}
+     *             instead.
      */
+    @Deprecated
     public final static String COLUMN_LOCAL_FILENAME = "local_filename";
 
     /**
      * Current status of the download, as one of the STATUS_* constants.
      */
     public final static String COLUMN_STATUS = Downloads.Impl.COLUMN_STATUS;
+
+    /** {@hide} */
+    public final static String COLUMN_FILE_NAME_HINT = Downloads.Impl.COLUMN_FILE_NAME_HINT;
 
     /**
      * Provides more detail on the status of the download.  Its meaning depends on the value of
@@ -150,6 +178,13 @@ public class DownloadManager {
      * downloaded list.
      */
     public static final String COLUMN_MEDIAPROVIDER_URI = Downloads.Impl.COLUMN_MEDIAPROVIDER_URI;
+
+    /** {@hide} */
+    public static final String COLUMN_DESTINATION = Downloads.Impl.COLUMN_DESTINATION;
+
+    /** @hide */
+    @TestApi
+    public static final String COLUMN_MEDIASTORE_URI = Downloads.Impl.COLUMN_MEDIASTORE_URI;
 
     /**
      * @hide
@@ -307,31 +342,33 @@ public class DownloadManager {
      */
     public static final String EXTRA_NOTIFICATION_CLICK_DOWNLOAD_IDS = "extra_click_download_ids";
 
+    /** {@hide} */
+    @SystemApi
+    public static final String ACTION_DOWNLOAD_COMPLETED =
+            "android.intent.action.DOWNLOAD_COMPLETED";
+
     /**
      * columns to request from DownloadProvider.
      * @hide
      */
+    @UnsupportedAppUsage
     public static final String[] UNDERLYING_COLUMNS = new String[] {
-        Downloads.Impl._ID,
-        Downloads.Impl._DATA + " AS " + COLUMN_LOCAL_FILENAME,
-        Downloads.Impl.COLUMN_MEDIAPROVIDER_URI,
-        Downloads.Impl.COLUMN_DESTINATION,
-        Downloads.Impl.COLUMN_TITLE,
-        Downloads.Impl.COLUMN_DESCRIPTION,
-        Downloads.Impl.COLUMN_URI,
-        Downloads.Impl.COLUMN_STATUS,
-        Downloads.Impl.COLUMN_FILE_NAME_HINT,
-        Downloads.Impl.COLUMN_MIME_TYPE + " AS " + COLUMN_MEDIA_TYPE,
-        Downloads.Impl.COLUMN_TOTAL_BYTES + " AS " + COLUMN_TOTAL_SIZE_BYTES,
-        Downloads.Impl.COLUMN_LAST_MODIFICATION + " AS " + COLUMN_LAST_MODIFIED_TIMESTAMP,
-        Downloads.Impl.COLUMN_CURRENT_BYTES + " AS " + COLUMN_BYTES_DOWNLOADED_SO_FAR,
-        Downloads.Impl.COLUMN_ALLOW_WRITE,
-        /* add the following 'computed' columns to the cursor.
-         * they are not 'returned' by the database, but their inclusion
-         * eliminates need to have lot of methods in CursorTranslator
-         */
-        "'placeholder' AS " + COLUMN_LOCAL_URI,
-        "'placeholder' AS " + COLUMN_REASON
+        DownloadManager.COLUMN_ID,
+        DownloadManager.COLUMN_LOCAL_FILENAME,
+        DownloadManager.COLUMN_MEDIAPROVIDER_URI,
+        DownloadManager.COLUMN_DESTINATION,
+        DownloadManager.COLUMN_TITLE,
+        DownloadManager.COLUMN_DESCRIPTION,
+        DownloadManager.COLUMN_URI,
+        DownloadManager.COLUMN_STATUS,
+        DownloadManager.COLUMN_FILE_NAME_HINT,
+        DownloadManager.COLUMN_MEDIA_TYPE,
+        DownloadManager.COLUMN_TOTAL_SIZE_BYTES,
+        DownloadManager.COLUMN_LAST_MODIFIED_TIMESTAMP,
+        DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR,
+        DownloadManager.COLUMN_ALLOW_WRITE,
+        DownloadManager.COLUMN_LOCAL_URI,
+        DownloadManager.COLUMN_REASON
     };
 
     /**
@@ -360,8 +397,10 @@ public class DownloadManager {
          * {@link ConnectivityManager#TYPE_BLUETOOTH}.
          * @hide
          */
+        @Deprecated
         public static final int NETWORK_BLUETOOTH = 1 << 2;
 
+        @UnsupportedAppUsage
         private Uri mUri;
         private Uri mDestinationUri;
         private List<Pair<String, String>> mRequestHeaders = new ArrayList<Pair<String, String>>();
@@ -371,20 +410,20 @@ public class DownloadManager {
         private int mAllowedNetworkTypes = ~0; // default to all network types allowed
         private boolean mRoamingAllowed = true;
         private boolean mMeteredAllowed = true;
+        private int mFlags = 0;
         private boolean mIsVisibleInDownloadsUi = true;
         private boolean mScannable = false;
-        private boolean mUseSystemCache = false;
         /** if a file is designated as a MediaScanner scannable file, the following value is
          * stored in the database column {@link Downloads.Impl#COLUMN_MEDIA_SCANNED}.
          */
-        private static final int SCANNABLE_VALUE_YES = 0;
+        private static final int SCANNABLE_VALUE_YES = Downloads.Impl.MEDIA_NOT_SCANNED;
         // value of 1 is stored in the above column by DownloadProvider after it is scanned by
         // MediaScanner
         /** if a file is designated as a file that should not be scanned by MediaScanner,
          * the following value is stored in the database column
          * {@link Downloads.Impl#COLUMN_MEDIA_SCANNED}.
          */
-        private static final int SCANNABLE_VALUE_NO = 2;
+        private static final int SCANNABLE_VALUE_NO = Downloads.Impl.MEDIA_NOT_SCANNABLE;
 
         /**
          * This download is visible but only shows in the notifications
@@ -446,28 +485,19 @@ public class DownloadManager {
          * By default, downloads are saved to a generated filename in the shared download cache and
          * may be deleted by the system at any time to reclaim space.
          *
+         * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+         * {@link android.Manifest.permission#WRITE_EXTERNAL_STORAGE WRITE EXTERNAL_STORAGE}
+         * permission is not needed and the {@code uri} must refer to a path within the
+         * directories owned by the application (e.g. {@link Context#getExternalFilesDir(String)})
+         * or a path within the top-level Downloads directory (as returned by
+         * {@link Environment#getExternalStoragePublicDirectory(String)} with
+         * {@link Environment#DIRECTORY_DOWNLOADS}).
+         *
+         * @param uri a file {@link Uri} indicating the destination for the downloaded file.
          * @return this object
          */
         public Request setDestinationUri(Uri uri) {
             mDestinationUri = uri;
-            return this;
-        }
-
-        /**
-         * Set the local destination for the downloaded file to the system cache dir (/cache).
-         * This is only available to System apps with the permission
-         * {@link android.Manifest.permission#ACCESS_CACHE_FILESYSTEM}.
-         * <p>
-         * The downloaded file is not scanned by MediaScanner.
-         * But it can be made scannable by calling {@link #allowScanningByMediaScanner()}.
-         * <p>
-         * Files downloaded to /cache may be deleted by the system at any time to reclaim space.
-         *
-         * @return this object
-         * @hide
-         */
-        public Request setDestinationToSystemCache() {
-            mUseSystemCache = true;
             return this;
         }
 
@@ -517,6 +547,12 @@ public class DownloadManager {
          * The downloaded file is not scanned by MediaScanner. But it can be
          * made scannable by calling {@link #allowScanningByMediaScanner()}.
          *
+         * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+         * {@link android.Manifest.permission#WRITE_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE}
+         * permission is not needed and the {@code dirType} must be one of the known public
+         * directories like {@link Environment#DIRECTORY_DOWNLOADS},
+         * {@link Environment#DIRECTORY_PICTURES}, {@link Environment#DIRECTORY_MOVIES}, etc.
+         *
          * @param dirType the directory type to pass to {@link Environment#getExternalStoragePublicDirectory(String)}
          * @param subPath the path within the external directory, including the
          *            destination filename
@@ -528,15 +564,29 @@ public class DownloadManager {
             File file = Environment.getExternalStoragePublicDirectory(dirType);
             if (file == null) {
                 throw new IllegalStateException("Failed to get external storage public directory");
-            } else if (file.exists()) {
-                if (!file.isDirectory()) {
-                    throw new IllegalStateException(file.getAbsolutePath() +
-                            " already exists and is not a directory");
+            }
+
+            final Context context = AppGlobals.getInitialApplication();
+            if (context.getApplicationInfo().targetSdkVersion
+                    >= Build.VERSION_CODES.Q || !Environment.isExternalStorageLegacy()) {
+                try (ContentProviderClient client = context.getContentResolver()
+                        .acquireContentProviderClient(Downloads.Impl.AUTHORITY)) {
+                    final Bundle extras = new Bundle();
+                    extras.putString(Downloads.DIR_TYPE, dirType);
+                    client.call(Downloads.CALL_CREATE_EXTERNAL_PUBLIC_DIR, null, extras);
+                } catch (RemoteException e) {
+                    throw new IllegalStateException("Unable to create directory: "
+                            + file.getAbsolutePath());
                 }
             } else {
-                if (!file.mkdirs()) {
-                    throw new IllegalStateException("Unable to create directory: "+
-                            file.getAbsolutePath());
+                if (file.exists()) {
+                    if (!file.isDirectory()) {
+                        throw new IllegalStateException(file.getAbsolutePath()
+                                + " already exists and is not a directory");
+                    }
+                } else if (!file.mkdirs()) {
+                    throw new IllegalStateException("Unable to create directory: "
+                            + file.getAbsolutePath());
                 }
             }
             setDestinationFromBase(file, subPath);
@@ -553,7 +603,12 @@ public class DownloadManager {
         /**
          * If the file to be downloaded is to be scanned by MediaScanner, this method
          * should be called before {@link DownloadManager#enqueue(Request)} is called.
+         *
+         * @deprecated Starting in Q, this value is ignored. Files downloaded to
+         * directories owned by applications (e.g. {@link Context#getExternalFilesDir(String)})
+         * will not be scanned by MediaScanner and the rest will be scanned.
          */
+        @Deprecated
         public void allowScanningByMediaScanner() {
             mScannable = true;
         }
@@ -659,6 +714,10 @@ public class DownloadManager {
          * By default, all network types are allowed. Consider using
          * {@link #setAllowedOverMetered(boolean)} instead, since it's more
          * flexible.
+         * <p>
+         * As of {@link android.os.Build.VERSION_CODES#N}, setting only the
+         * {@link #NETWORK_WIFI} flag here is equivalent to calling
+         * {@link #setAllowedOverMetered(boolean)} with {@code false}.
          *
          * @param flags any combination of the NETWORK_* bit flags.
          * @return this object
@@ -691,11 +750,55 @@ public class DownloadManager {
         }
 
         /**
+         * Specify that to run this download, the device needs to be plugged in.
+         * This defaults to false.
+         *
+         * @param requiresCharging Whether or not the device is plugged in.
+         * @see android.app.job.JobInfo.Builder#setRequiresCharging(boolean)
+         */
+        public Request setRequiresCharging(boolean requiresCharging) {
+            if (requiresCharging) {
+                mFlags |= Downloads.Impl.FLAG_REQUIRES_CHARGING;
+            } else {
+                mFlags &= ~Downloads.Impl.FLAG_REQUIRES_CHARGING;
+            }
+            return this;
+        }
+
+        /**
+         * Specify that to run, the download needs the device to be in idle
+         * mode. This defaults to false.
+         * <p>
+         * Idle mode is a loose definition provided by the system, which means
+         * that the device is not in use, and has not been in use for some time.
+         *
+         * @param requiresDeviceIdle Whether or not the device need be within an
+         *            idle maintenance window.
+         * @see android.app.job.JobInfo.Builder#setRequiresDeviceIdle(boolean)
+         */
+        public Request setRequiresDeviceIdle(boolean requiresDeviceIdle) {
+            if (requiresDeviceIdle) {
+                mFlags |= Downloads.Impl.FLAG_REQUIRES_DEVICE_IDLE;
+            } else {
+                mFlags &= ~Downloads.Impl.FLAG_REQUIRES_DEVICE_IDLE;
+            }
+            return this;
+        }
+
+        /**
          * Set whether this download should be displayed in the system's Downloads UI. True by
          * default.
          * @param isVisible whether to display this download in the Downloads UI
          * @return this object
+         *
+         * @deprecated Starting in Q, this value is ignored. Only files downloaded to
+         * public Downloads directory (as returned by
+         * {@link Environment#getExternalStoragePublicDirectory(String)} with
+         * {@link Environment#DIRECTORY_DOWNLOADS}) will be visible in system's Downloads UI
+         * and the rest will not be visible.
+         * (e.g. {@link Context#getExternalFilesDir(String)}) will not be visible.
          */
+        @Deprecated
         public Request setVisibleInDownloadsUi(boolean isVisible) {
             mIsVisibleInDownloadsUi = isVisible;
             return this;
@@ -712,13 +815,13 @@ public class DownloadManager {
             values.put(Downloads.Impl.COLUMN_NOTIFICATION_PACKAGE, packageName);
 
             if (mDestinationUri != null) {
-                values.put(Downloads.Impl.COLUMN_DESTINATION, Downloads.Impl.DESTINATION_FILE_URI);
-                values.put(Downloads.Impl.COLUMN_FILE_NAME_HINT, mDestinationUri.toString());
+                values.put(Downloads.Impl.COLUMN_DESTINATION,
+                        Downloads.Impl.DESTINATION_FILE_URI);
+                values.put(Downloads.Impl.COLUMN_FILE_NAME_HINT,
+                        mDestinationUri.toString());
             } else {
                 values.put(Downloads.Impl.COLUMN_DESTINATION,
-                           (this.mUseSystemCache) ?
-                                   Downloads.Impl.DESTINATION_SYSTEMCACHE_PARTITION :
-                                   Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE);
+                        Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE);
             }
             // is the file supposed to be media-scannable?
             values.put(Downloads.Impl.COLUMN_MEDIA_SCANNED, (mScannable) ? SCANNABLE_VALUE_YES :
@@ -736,6 +839,7 @@ public class DownloadManager {
             values.put(Downloads.Impl.COLUMN_ALLOWED_NETWORK_TYPES, mAllowedNetworkTypes);
             values.put(Downloads.Impl.COLUMN_ALLOW_ROAMING, mRoamingAllowed);
             values.put(Downloads.Impl.COLUMN_ALLOW_METERED, mMeteredAllowed);
+            values.put(Downloads.Impl.COLUMN_FLAGS, mFlags);
             values.put(Downloads.Impl.COLUMN_IS_VISIBLE_IN_DOWNLOADS_UI, mIsVisibleInDownloadsUi);
 
             return values;
@@ -775,6 +879,7 @@ public class DownloadManager {
 
         private long[] mIds = null;
         private Integer mStatusFlags = null;
+        private String mFilterString = null;
         private String mOrderByColumn = Downloads.Impl.COLUMN_LAST_MODIFICATION;
         private int mOrderDirection = ORDER_DESCENDING;
         private boolean mOnlyIncludeVisibleInDownloadsUi = false;
@@ -785,6 +890,17 @@ public class DownloadManager {
          */
         public Query setFilterById(long... ids) {
             mIds = ids;
+            return this;
+        }
+
+        /**
+         *
+         * Include only the downloads that contains the given string in its name.
+         * @return this object
+         * @hide
+         */
+        public Query setFilterByString(@Nullable String filter) {
+            mFilterString = filter;
             return this;
         }
 
@@ -806,6 +922,7 @@ public class DownloadManager {
          * @return this object
          * @hide
          */
+        @UnsupportedAppUsage
         public Query setOnlyIncludeVisibleInDownloadsUi(boolean value) {
             mOnlyIncludeVisibleInDownloadsUi = value;
             return this;
@@ -821,6 +938,7 @@ public class DownloadManager {
          * @return this object
          * @hide
          */
+        @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
         public Query orderBy(String column, int direction) {
             if (direction != ORDER_ASCENDING && direction != ORDER_DESCENDING) {
                 throw new IllegalArgumentException("Invalid direction: " + direction);
@@ -847,9 +965,20 @@ public class DownloadManager {
             List<String> selectionParts = new ArrayList<String>();
             String[] selectionArgs = null;
 
-            if (mIds != null) {
-                selectionParts.add(getWhereClauseForIds(mIds));
-                selectionArgs = getWhereArgsForIds(mIds);
+            int whereArgsCount = (mIds == null) ? 0 : mIds.length;
+            whereArgsCount = (mFilterString == null) ? whereArgsCount : whereArgsCount + 1;
+            selectionArgs = new String[whereArgsCount];
+
+            if (whereArgsCount > 0) {
+                if (mIds != null) {
+                    selectionParts.add(getWhereClauseForIds(mIds));
+                    getWhereArgsForIds(mIds, selectionArgs);
+                }
+
+                if (mFilterString != null) {
+                    selectionParts.add(Downloads.Impl.COLUMN_TITLE + " LIKE ?");
+                    selectionArgs[selectionArgs.length - 1] = "%" + mFilterString + "%";
+                }
             }
 
             if (mStatusFlags != null) {
@@ -908,16 +1037,22 @@ public class DownloadManager {
         }
     }
 
-    private ContentResolver mResolver;
-    private String mPackageName;
+    private final ContentResolver mResolver;
+    private final String mPackageName;
+
     private Uri mBaseUri = Downloads.Impl.CONTENT_URI;
+    private boolean mAccessFilename;
 
     /**
      * @hide
      */
-    public DownloadManager(ContentResolver resolver, String packageName) {
-        mResolver = resolver;
-        mPackageName = packageName;
+    public DownloadManager(Context context) {
+        mResolver = context.getContentResolver();
+        mPackageName = context.getPackageName();
+
+        // Callers can access filename columns when targeting old platform
+        // versions; otherwise we throw telling them it's deprecated.
+        mAccessFilename = context.getApplicationInfo().targetSdkVersion < Build.VERSION_CODES.N;
     }
 
     /**
@@ -925,11 +1060,49 @@ public class DownloadManager {
      * /my_downloads URIs, for clients that have permission to do so.
      * @hide
      */
+    @UnsupportedAppUsage
     public void setAccessAllDownloads(boolean accessAllDownloads) {
         if (accessAllDownloads) {
             mBaseUri = Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI;
         } else {
             mBaseUri = Downloads.Impl.CONTENT_URI;
+        }
+    }
+
+    /** {@hide} */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
+    public void setAccessFilename(boolean accessFilename) {
+        mAccessFilename = accessFilename;
+    }
+
+    /**
+     * Notify {@link DownloadManager} that the given {@link MediaStore} items
+     * were just deleted so that {@link DownloadManager} internal data
+     * structures can be cleaned up.
+     *
+     * @param idToMime map from {@link BaseColumns#_ID} to
+     *            {@link ContentResolver#getType(Uri)}.
+     * @hide
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.WRITE_MEDIA_STORAGE)
+    public void onMediaStoreDownloadsDeleted(@NonNull LongSparseArray<String> idToMime) {
+        try (ContentProviderClient client = mResolver
+                .acquireUnstableContentProviderClient(mBaseUri)) {
+           final Bundle callExtras = new Bundle();
+           final long[] ids = new long[idToMime.size()];
+           final String[] mimeTypes = new String[idToMime.size()];
+           for (int i = idToMime.size() - 1; i >= 0; --i) {
+               ids[i] = idToMime.keyAt(i);
+               mimeTypes[i] = idToMime.valueAt(i);
+           }
+           callExtras.putLongArray(android.provider.Downloads.EXTRA_IDS, ids);
+           callExtras.putStringArray(android.provider.Downloads.EXTRA_MIME_TYPES,
+                   mimeTypes);
+           client.call(android.provider.Downloads.CALL_MEDIASTORE_DOWNLOADS_DELETED,
+                   null, callExtras);
+        } catch (RemoteException e) {
+            // Should not happen
         }
     }
 
@@ -962,16 +1135,7 @@ public class DownloadManager {
             // called with nothing to remove!
             throw new IllegalArgumentException("input param 'ids' can't be null");
         }
-        ContentValues values = new ContentValues();
-        values.put(Downloads.Impl.COLUMN_DELETED, 1);
-        // if only one id is passed in, then include it in the uri itself.
-        // this will eliminate a full database scan in the download service.
-        if (ids.length == 1) {
-            return mResolver.update(ContentUris.withAppendedId(mBaseUri, ids[0]), values,
-                    null, null);
-        } 
-        return mResolver.update(mBaseUri, values, getWhereClauseForIds(ids),
-                getWhereArgsForIds(ids));
+        return mResolver.delete(mBaseUri, getWhereClauseForIds(ids), getWhereArgsForIds(ids));
     }
 
     /**
@@ -993,11 +1157,16 @@ public class DownloadManager {
      * COLUMN_* constants.
      */
     public Cursor query(Query query) {
-        Cursor underlyingCursor = query.runQuery(mResolver, UNDERLYING_COLUMNS, mBaseUri);
+        return query(query, UNDERLYING_COLUMNS);
+    }
+
+    /** @hide */
+    public Cursor query(Query query, String[] projection) {
+        Cursor underlyingCursor = query.runQuery(mResolver, projection, mBaseUri);
         if (underlyingCursor == null) {
             return null;
         }
-        return new CursorTranslator(underlyingCursor, mBaseUri);
+        return new CursorTranslator(underlyingCursor, mBaseUri, mAccessFilename);
     }
 
     /**
@@ -1030,7 +1199,7 @@ public class DownloadManager {
             if (cursor.moveToFirst()) {
                 int status = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_STATUS));
                 if (DownloadManager.STATUS_SUCCESSFUL == status) {
-                    return ContentUris.withAppendedId(Downloads.Impl.CONTENT_URI, id);
+                    return ContentUris.withAppendedId(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, id);
                 }
             }
         } finally {
@@ -1076,6 +1245,7 @@ public class DownloadManager {
      * @param ids the IDs of the downloads
      * @hide
      */
+    @UnsupportedAppUsage
     public void restartDownload(long... ids) {
         Cursor cursor = query(new Query().setFilterById(ids));
         try {
@@ -1100,6 +1270,20 @@ public class DownloadManager {
     }
 
     /**
+     * Force the given downloads to proceed even if their size is larger than
+     * {@link #getMaxBytesOverMobile(Context)}.
+     *
+     * @hide
+     */
+    public void forceDownload(long... ids) {
+        ContentValues values = new ContentValues();
+        values.put(Downloads.Impl.COLUMN_STATUS, Downloads.Impl.STATUS_PENDING);
+        values.put(Downloads.Impl.COLUMN_CONTROL, Downloads.Impl.CONTROL_RUN);
+        values.put(Downloads.Impl.COLUMN_BYPASS_RECOMMENDED_SIZE_LIMIT, 1);
+        mResolver.update(mBaseUri, values, getWhereClauseForIds(ids), getWhereArgsForIds(ids));
+    }
+
+    /**
      * Returns maximum size, in bytes, of downloads that may go over a mobile connection; or null if
      * there's no limit
      *
@@ -1114,6 +1298,71 @@ public class DownloadManager {
         } catch (SettingNotFoundException exc) {
             return null;
         }
+    }
+
+    /**
+     * Rename the given download if the download has completed
+     *
+     * @param context the {@link Context} to use in case need to update MediaProvider
+     * @param id the downloaded id
+     * @param displayName the new name to rename to
+     * @return true if rename was successful, false otherwise
+     * @hide
+     */
+    public boolean rename(Context context, long id, String displayName) {
+        if (!FileUtils.isValidFatFilename(displayName)) {
+            throw new SecurityException(displayName + " is not a valid filename");
+        }
+
+        final String filePath;
+        final Query query = new Query().setFilterById(id);
+        try (Cursor cursor = query(query)) {
+            if (cursor == null) {
+                throw new IllegalStateException("Missing cursor for download id=" + id);
+            }
+            if (cursor.moveToFirst()) {
+                final int status = cursor.getInt(cursor.getColumnIndexOrThrow(COLUMN_STATUS));
+                if (status != DownloadManager.STATUS_SUCCESSFUL) {
+                    throw new IllegalStateException("Download is not completed yet: "
+                            + DatabaseUtils.dumpCurrentRowToString(cursor));
+                }
+                filePath = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_LOCAL_FILENAME));
+                if (filePath == null) {
+                    throw new IllegalStateException("Download doesn't have a valid file path: "
+                            + DatabaseUtils.dumpCurrentRowToString(cursor));
+                } else if (!new File(filePath).exists()) {
+                    throw new IllegalStateException("Downloaded file doesn't exist anymore: "
+                            + DatabaseUtils.dumpCurrentRowToString(cursor));
+                }
+            } else {
+                throw new IllegalStateException("Missing download id=" + id);
+            }
+        }
+
+        final File before = new File(filePath);
+        final File after = new File(before.getParentFile(), displayName);
+
+        if (after.exists()) {
+            throw new IllegalStateException("File already exists: " + after);
+        }
+        if (!before.renameTo(after)) {
+            throw new IllegalStateException(
+                    "Failed to rename file from " + before + " to " + after);
+        }
+
+        // TODO: DownloadProvider.update() should take care of updating corresponding
+        // MediaProvider entries.
+        MediaStore.scanFile(mResolver, before);
+        MediaStore.scanFile(mResolver, after);
+
+        final ContentValues values = new ContentValues();
+        values.put(Downloads.Impl.COLUMN_TITLE, displayName);
+        values.put(Downloads.Impl._DATA, after.toString());
+        values.putNull(Downloads.Impl.COLUMN_MEDIAPROVIDER_URI);
+        final long[] ids = { id };
+
+        return mResolver.update(
+                mBaseUri, values, getWhereClauseForIds(ids), getWhereArgsForIds(ids)) == 1;
     }
 
     /**
@@ -1154,6 +1403,16 @@ public class DownloadManager {
      * isMediaScannerScannable to true. It makes the file visible in media managing
      * applications such as Gallery App, which could be a useful purpose of using this API.
      *
+     * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+     * {@code path} must be within directories owned by the application
+     * {e.g. {@link Context#getExternalFilesDir(String)}} or if the application is running under
+     * the legacy storage model (see
+     * {@link android.R.styleable#AndroidManifestApplication_requestLegacyExternalStorage
+     * android:requestLegacyExternalStorage}), {@code path} can also be within the top-level
+     * Downloads directory (as returned by
+     * {@link Environment#getExternalStoragePublicDirectory(String)} with
+     * {@link Environment#DIRECTORY_DOWNLOADS}).
+     *
      * @param title the title that would appear for this file in Downloads App.
      * @param description the description that would appear for this file in Downloads App.
      * @param isMediaScannerScannable true if the file is to be scanned by MediaScanner. Files
@@ -1167,18 +1426,111 @@ public class DownloadManager {
      * @param showNotification true if a notification is to be sent, false otherwise
      * @return  an ID for the download entry added to the downloads app, unique across the system
      * This ID is used to make future calls related to this download.
+     *
+     * @deprecated Apps should instead contribute files to
+     * {@link android.provider.MediaStore.Downloads} collection to make them available to user
+     * as part of Downloads.
      */
+    @Deprecated
     public long addCompletedDownload(String title, String description,
             boolean isMediaScannerScannable, String mimeType, String path, long length,
             boolean showNotification) {
         return addCompletedDownload(title, description, isMediaScannerScannable, mimeType, path,
-                length, showNotification, false);
+                length, showNotification, false, null, null);
     }
 
-    /** {@hide} */
+    /**
+     * Adds a file to the downloads database system, so it could appear in Downloads App
+     * (and thus become eligible for management by the Downloads App).
+     * <p>
+     * It is helpful to make the file scannable by MediaScanner by setting the param
+     * isMediaScannerScannable to true. It makes the file visible in media managing
+     * applications such as Gallery App, which could be a useful purpose of using this API.
+     *
+     * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+     * {@code path} must be within directories owned by the application
+     * {e.g. {@link Context#getExternalFilesDir(String)}} or if the application is running under
+     * the legacy storage model (see
+     * {@link android.R.styleable#AndroidManifestApplication_requestLegacyExternalStorage
+     * android:requestLegacyExternalStorage}), {@code path} can also be within the top-level
+     * Downloads directory (as returned by
+     * {@link Environment#getExternalStoragePublicDirectory(String)} with
+     * {@link Environment#DIRECTORY_DOWNLOADS}).
+     *
+     * @param title the title that would appear for this file in Downloads App.
+     * @param description the description that would appear for this file in Downloads App.
+     * @param isMediaScannerScannable true if the file is to be scanned by MediaScanner. Files
+     * scanned by MediaScanner appear in the applications used to view media (for example,
+     * Gallery app).
+     * @param mimeType mimetype of the file.
+     * @param path absolute pathname to the file. The file should be world-readable, so that it can
+     * be managed by the Downloads App and any other app that is used to read it (for example,
+     * Gallery app to display the file, if the file contents represent a video/image).
+     * @param length length of the downloaded file
+     * @param showNotification true if a notification is to be sent, false otherwise
+     * @param uri the original HTTP URI of the download
+     * @param referer the HTTP Referer for the download
+     * @return  an ID for the download entry added to the downloads app, unique across the system
+     * This ID is used to make future calls related to this download.
+     *
+     * @deprecated Apps should instead contribute files to
+     * {@link android.provider.MediaStore.Downloads} collection to make them available to user
+     * as part of Downloads.
+     */
+    @Deprecated
+    public long addCompletedDownload(String title, String description,
+            boolean isMediaScannerScannable, String mimeType, String path, long length,
+            boolean showNotification, Uri uri, Uri referer) {
+        return addCompletedDownload(title, description, isMediaScannerScannable, mimeType, path,
+                length, showNotification, false, uri, referer);
+    }
+
+    /**
+     * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+     * {@code path} must be within directories owned by the application
+     * {e.g. {@link Context#getExternalFilesDir(String)}} or if the application is running under
+     * the legacy storage model (see
+     * {@link android.R.styleable#AndroidManifestApplication_requestLegacyExternalStorage
+     * android:requestLegacyExternalStorage}), {@code path} can also be within the top-level
+     * Downloads directory (as returned by
+     * {@link Environment#getExternalStoragePublicDirectory(String)} with
+     * {@link Environment#DIRECTORY_DOWNLOADS}).
+     *
+     * @deprecated Apps should instead contribute files to
+     * {@link android.provider.MediaStore.Downloads} collection to make them available to user
+     * as part of Downloads.
+     *
+     * {@hide}
+     */
+    @Deprecated
     public long addCompletedDownload(String title, String description,
             boolean isMediaScannerScannable, String mimeType, String path, long length,
             boolean showNotification, boolean allowWrite) {
+        return addCompletedDownload(title, description, isMediaScannerScannable, mimeType, path,
+                length, showNotification, allowWrite, null, null);
+    }
+
+    /**
+     * <p> For applications targeting {@link android.os.Build.VERSION_CODES#Q} or above,
+     * {@code path} must be within directories owned by the application
+     * {e.g. {@link Context#getExternalFilesDir(String)}} or if the application is running under
+     * the legacy storage model (see
+     * {@link android.R.styleable#AndroidManifestApplication_requestLegacyExternalStorage
+     * android:requestLegacyExternalStorage}), {@code path} can also be within the top-level
+     * Downloads directory (as returned by
+     * {@link Environment#getExternalStoragePublicDirectory(String)} with
+     * {@link Environment#DIRECTORY_DOWNLOADS}).
+     *
+     * {@hide}
+     *
+     * @deprecated Apps should instead contribute files to
+     * {@link android.provider.MediaStore.Downloads} collection to make them available to user
+     * as part of Downloads.
+     */
+    @Deprecated
+    public long addCompletedDownload(String title, String description,
+            boolean isMediaScannerScannable, String mimeType, String path, long length,
+            boolean showNotification, boolean allowWrite, Uri uri, Uri referer) {
         // make sure the input args are non-null/non-zero
         validateArgumentIsNonEmpty("title", title);
         validateArgumentIsNonEmpty("description", description);
@@ -1189,14 +1541,23 @@ public class DownloadManager {
         }
 
         // if there is already an entry with the given path name in downloads.db, return its id
-        Request request = new Request(NON_DOWNLOADMANAGER_DOWNLOAD)
-                .setTitle(title)
+        Request request;
+        if (uri != null) {
+            request = new Request(uri);
+        } else {
+            request = new Request(NON_DOWNLOADMANAGER_DOWNLOAD);
+        }
+        request.setTitle(title)
                 .setDescription(description)
                 .setMimeType(mimeType);
+        if (referer != null) {
+            request.addRequestHeader("Referer", referer.toString());
+        }
         ContentValues values = request.toContentValues(null);
         values.put(Downloads.Impl.COLUMN_DESTINATION,
                 Downloads.Impl.DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD);
         values.put(Downloads.Impl._DATA, path);
+        values.put(Downloads.Impl.COLUMN_MIME_TYPE, resolveMimeType(new File(path)));
         values.put(Downloads.Impl.COLUMN_STATUS, Downloads.Impl.STATUS_SUCCESS);
         values.put(Downloads.Impl.COLUMN_TOTAL_BYTES, length);
         values.put(Downloads.Impl.COLUMN_MEDIA_SCANNED,
@@ -1210,6 +1571,58 @@ public class DownloadManager {
             return -1;
         }
         return Long.parseLong(downloadUri.getLastPathSegment());
+    }
+
+    /**
+     * Shamelessly borrowed from
+     * {@code packages/providers/MediaProvider/src/com/android/providers/media/util/MimeUtils.java}
+     *
+     * @hide
+     */
+    private static @NonNull String resolveMimeType(@NonNull File file) {
+        final String extension = extractFileExtension(file.getPath());
+        if (extension == null) return ClipDescription.MIMETYPE_UNKNOWN;
+
+        final String mimeType = MimeTypeMap.getSingleton()
+                .getMimeTypeFromExtension(extension.toLowerCase(Locale.ROOT));
+        if (mimeType == null) return ClipDescription.MIMETYPE_UNKNOWN;
+
+        return mimeType;
+    }
+
+    /**
+     * Shamelessly borrowed from
+     * {@code packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java}
+     *
+     * @hide
+     */
+    private static @Nullable String extractDisplayName(@Nullable String data) {
+        if (data == null) return null;
+        if (data.indexOf('/') == -1) {
+            return data;
+        }
+        if (data.endsWith("/")) {
+            data = data.substring(0, data.length() - 1);
+        }
+        return data.substring(data.lastIndexOf('/') + 1);
+    }
+
+    /**
+     * Shamelessly borrowed from
+     * {@code packages/providers/MediaProvider/src/com/android/providers/media/util/FileUtils.java}
+     *
+     * @hide
+     */
+    private static @Nullable String extractFileExtension(@Nullable String data) {
+        if (data == null) return null;
+        data = extractDisplayName(data);
+
+        final int lastDot = data.lastIndexOf('.');
+        if (lastDot == -1) {
+            return null;
+        } else {
+            return data.substring(lastDot + 1);
+        }
     }
 
     private static final String NON_DOWNLOADMANAGER_DOWNLOAD =
@@ -1227,12 +1640,13 @@ public class DownloadManager {
      * @hide
      */
     public Uri getDownloadUri(long id) {
-        return ContentUris.withAppendedId(mBaseUri, id);
+        return ContentUris.withAppendedId(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, id);
     }
 
     /**
      * Get a parameterized SQL WHERE clause to select a bunch of IDs.
      */
+    @UnsupportedAppUsage
     static String getWhereClauseForIds(long[] ids) {
         StringBuilder whereClause = new StringBuilder();
         whereClause.append("(");
@@ -1250,13 +1664,24 @@ public class DownloadManager {
     /**
      * Get the selection args for a clause returned by {@link #getWhereClauseForIds(long[])}.
      */
+    @UnsupportedAppUsage
     static String[] getWhereArgsForIds(long[] ids) {
         String[] whereArgs = new String[ids.length];
-        for (int i = 0; i < ids.length; i++) {
-            whereArgs[i] = Long.toString(ids[i]);
-        }
-        return whereArgs;
+        return getWhereArgsForIds(ids, whereArgs);
     }
+
+    /**
+     * Get selection args for a clause returned by {@link #getWhereClauseForIds(long[])}
+     * and write it to the supplied args array.
+     */
+    static String[] getWhereArgsForIds(long[] ids, String[] args) {
+        assert(args.length >= ids.length);
+        for (int i = 0; i < ids.length; i++) {
+            args[i] = Long.toString(ids[i]);
+        }
+        return args;
+    }
+
 
     /**
      * This class wraps a cursor returned by DownloadProvider -- the "underlying cursor" -- and
@@ -1265,11 +1690,13 @@ public class DownloadManager {
      * underlying data.
      */
     private static class CursorTranslator extends CursorWrapper {
-        private Uri mBaseUri;
+        private final Uri mBaseUri;
+        private final boolean mAccessFilename;
 
-        public CursorTranslator(Cursor cursor, Uri baseUri) {
+        public CursorTranslator(Cursor cursor, Uri baseUri, boolean accessFilename) {
             super(cursor);
             mBaseUri = baseUri;
+            mAccessFilename = accessFilename;
         }
 
         @Override
@@ -1290,8 +1717,19 @@ public class DownloadManager {
 
         @Override
         public String getString(int columnIndex) {
-            return (getColumnName(columnIndex).equals(COLUMN_LOCAL_URI)) ? getLocalUri() :
-                    super.getString(columnIndex);
+            final String columnName = getColumnName(columnIndex);
+            switch (columnName) {
+                case COLUMN_LOCAL_URI:
+                    return getLocalUri();
+                case COLUMN_LOCAL_FILENAME:
+                    if (!mAccessFilename) {
+                        throw new SecurityException(
+                                "COLUMN_LOCAL_FILENAME is deprecated;"
+                                        + " use ContentResolver.openFileDescriptor() instead");
+                    }
+                default:
+                    return super.getString(columnIndex);
+            }
         }
 
         private String getLocalUri() {
@@ -1299,7 +1737,7 @@ public class DownloadManager {
             if (destinationType == Downloads.Impl.DESTINATION_FILE_URI ||
                     destinationType == Downloads.Impl.DESTINATION_EXTERNAL ||
                     destinationType == Downloads.Impl.DESTINATION_NON_DOWNLOADMANAGER_DOWNLOAD) {
-                String localPath = getString(getColumnIndex(COLUMN_LOCAL_FILENAME));
+                String localPath = super.getString(getColumnIndex(COLUMN_LOCAL_FILENAME));
                 if (localPath == null) {
                     return null;
                 }
@@ -1308,7 +1746,7 @@ public class DownloadManager {
 
             // return content URI for cache download
             long downloadId = getLong(getColumnIndex(Downloads.Impl._ID));
-            return ContentUris.withAppendedId(mBaseUri, downloadId).toString();
+            return ContentUris.withAppendedId(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, downloadId).toString();
         }
 
         private long getReason(int status) {

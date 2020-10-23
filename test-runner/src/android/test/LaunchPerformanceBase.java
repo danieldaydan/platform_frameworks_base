@@ -23,11 +23,11 @@ import android.os.Bundle;
 
 /**
  * Base class for all launch performance Instrumentation classes.
- *
- * @hide
  */
+@Deprecated
 public class LaunchPerformanceBase extends Instrumentation {
 
+    /** @hide */
     public static final String LOG_TAG = "Launch Performance";
 
     protected Bundle mResults;
@@ -39,11 +39,9 @@ public class LaunchPerformanceBase extends Instrumentation {
         mIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         setAutomaticPerformanceSnapshots();
     }
-   
+
     /**
      * Launches intent, and waits for idle before returning.
-     *
-     * @hide
      */
     protected void LaunchApp() {
         startActivitySync(mIntent);

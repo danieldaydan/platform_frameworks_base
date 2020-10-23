@@ -16,15 +16,14 @@
 
 package android.view;
 
-import com.android.frameworks.coretests.R;
-import android.test.TouchUtils;
-import android.test.suitebuilder.annotation.MediumTest;
-import android.test.suitebuilder.annotation.LargeTest;
-
 import android.test.ActivityInstrumentationTestCase;
+import android.test.TouchUtils;
 import android.widget.Button;
-import android.view.KeyEvent;
-import android.view.View;
+
+import androidx.test.filters.LargeTest;
+import androidx.test.filters.MediumTest;
+
+import com.android.frameworks.coretests.R;
 
 /**
  * Exercises {@link android.view.View}'s disabled property.
@@ -45,18 +44,23 @@ public class DisabledTest extends ActivityInstrumentationTestCase<Disabled> {
 
         final Disabled a = getActivity();
         mDisabled = (Button) a.findViewById(R.id.disabledButton);
-        mDisabled.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                mClicked = true;
-            }
-        });
-
         mDisabledParent = a.findViewById(R.id.clickableParent);
-        mDisabledParent.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                mParentClicked = true;
-            }
-        });
+        getInstrumentation().runOnMainSync(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        mDisabled.setOnClickListener(new View.OnClickListener() {
+                            public void onClick(View v) {
+                                mClicked = true;
+                            }
+                        });
+                        mDisabledParent.setOnClickListener(new View.OnClickListener() {
+                            public void onClick(View v) {
+                                mParentClicked = true;
+                            }
+                        });
+                    }
+                });
     }
 
     @Override
@@ -73,7 +77,7 @@ public class DisabledTest extends ActivityInstrumentationTestCase<Disabled> {
         assertNotNull(mDisabledParent);
         assertFalse(mDisabled.isEnabled());
         assertTrue(mDisabledParent.isEnabled());
-        assertTrue(mDisabled.hasFocus());
+        assertFalse(mDisabled.hasFocus());
     }
 
     @MediumTest

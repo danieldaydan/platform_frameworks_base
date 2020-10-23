@@ -16,475 +16,807 @@
 
 package com.android.server.pm;
 
+import android.annotation.AppIdInt;
+import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.annotation.UserIdInt;
 import android.content.Context;
 import android.content.pm.PackageStats;
 import android.os.Build;
-import android.text.TextUtils;
+import android.os.IBinder;
+import android.os.IBinder.DeathRecipient;
+import android.os.IInstalld;
+import android.os.RemoteException;
+import android.os.ServiceManager;
+import android.os.storage.CrateMetadata;
+import android.text.format.DateUtils;
 import android.util.Slog;
 
-import dalvik.system.VMRuntime;
-
-import com.android.internal.os.InstallerConnection;
+import com.android.internal.os.BackgroundThread;
 import com.android.server.SystemService;
 
-public final class Installer extends SystemService {
+import dalvik.system.BlockGuard;
+import dalvik.system.VMRuntime;
+
+import java.io.FileDescriptor;
+import java.util.Arrays;
+
+public class Installer extends SystemService {
     private static final String TAG = "Installer";
 
     /* ***************************************************************************
      * IMPORTANT: These values are passed to native code. Keep them in sync with
-     * frameworks/native/cmds/installd/installd.h
+     * frameworks/native/cmds/installd/installd_constants.h
      * **************************************************************************/
     /** Application should be visible to everyone */
-    public static final int DEXOPT_PUBLIC       = 1 << 1;
-    /** Application wants to run in VM safe mode */
-    public static final int DEXOPT_SAFEMODE     = 1 << 2;
+    public static final int DEXOPT_PUBLIC         = 1 << 1;
     /** Application wants to allow debugging of its code */
-    public static final int DEXOPT_DEBUGGABLE   = 1 << 3;
+    public static final int DEXOPT_DEBUGGABLE     = 1 << 2;
     /** The system boot has finished */
-    public static final int DEXOPT_BOOTCOMPLETE = 1 << 4;
-    /** Run the application with the JIT compiler */
-    public static final int DEXOPT_USEJIT       = 1 << 5;
+    public static final int DEXOPT_BOOTCOMPLETE   = 1 << 3;
+    /** Hint that the dexopt type is profile-guided. */
+    public static final int DEXOPT_PROFILE_GUIDED = 1 << 4;
+    /** The compilation is for a secondary dex file. */
+    public static final int DEXOPT_SECONDARY_DEX  = 1 << 5;
+    /** Ignore the result of dexoptNeeded and force compilation. */
+    public static final int DEXOPT_FORCE          = 1 << 6;
+    /** Indicates that the dex file passed to dexopt in on CE storage. */
+    public static final int DEXOPT_STORAGE_CE     = 1 << 7;
+    /** Indicates that the dex file passed to dexopt in on DE storage. */
+    public static final int DEXOPT_STORAGE_DE     = 1 << 8;
+    /** Indicates that dexopt is invoked from the background service. */
+    public static final int DEXOPT_IDLE_BACKGROUND_JOB = 1 << 9;
+    /** Indicates that dexopt should restrict access to private APIs. */
+    public static final int DEXOPT_ENABLE_HIDDEN_API_CHECKS = 1 << 10;
+    /** Indicates that dexopt should convert to CompactDex. */
+    public static final int DEXOPT_GENERATE_COMPACT_DEX = 1 << 11;
+    /** Indicates that dexopt should generate an app image */
+    public static final int DEXOPT_GENERATE_APP_IMAGE = 1 << 12;
+    /** Indicates that dexopt may be run with different performance / priority tuned for restore */
+    public static final int DEXOPT_FOR_RESTORE = 1 << 13; // TODO(b/135202722): remove
 
-    private final InstallerConnection mInstaller;
+    public static final int FLAG_STORAGE_DE = IInstalld.FLAG_STORAGE_DE;
+    public static final int FLAG_STORAGE_CE = IInstalld.FLAG_STORAGE_CE;
+    public static final int FLAG_STORAGE_EXTERNAL = IInstalld.FLAG_STORAGE_EXTERNAL;
+
+    public static final int FLAG_CLEAR_CACHE_ONLY = IInstalld.FLAG_CLEAR_CACHE_ONLY;
+    public static final int FLAG_CLEAR_CODE_CACHE_ONLY = IInstalld.FLAG_CLEAR_CODE_CACHE_ONLY;
+
+    public static final int FLAG_FREE_CACHE_V2 = IInstalld.FLAG_FREE_CACHE_V2;
+    public static final int FLAG_FREE_CACHE_V2_DEFY_QUOTA = IInstalld.FLAG_FREE_CACHE_V2_DEFY_QUOTA;
+    public static final int FLAG_FREE_CACHE_NOOP = IInstalld.FLAG_FREE_CACHE_NOOP;
+
+    public static final int FLAG_USE_QUOTA = IInstalld.FLAG_USE_QUOTA;
+    public static final int FLAG_FORCE = IInstalld.FLAG_FORCE;
+
+    public static final int FLAG_CLEAR_APP_DATA_KEEP_ART_PROFILES =
+            IInstalld.FLAG_CLEAR_APP_DATA_KEEP_ART_PROFILES;
+
+    private final boolean mIsolated;
+
+    private volatile IInstalld mInstalld;
+    private volatile Object mWarnIfHeld;
 
     public Installer(Context context) {
+        this(context, false);
+    }
+
+    /**
+     * @param isolated indicates if this object should <em>not</em> connect to
+     *            the real {@code installd}. All remote calls will be ignored
+     *            unless you extend this class and intercept them.
+     */
+    public Installer(Context context, boolean isolated) {
         super(context);
-        mInstaller = new InstallerConnection();
+        mIsolated = isolated;
+    }
+
+    /**
+     * Yell loudly if someone tries making future calls while holding a lock on
+     * the given object.
+     */
+    public void setWarnIfHeld(Object warnIfHeld) {
+        mWarnIfHeld = warnIfHeld;
     }
 
     @Override
     public void onStart() {
-        Slog.i(TAG, "Waiting for installd to be ready.");
-        mInstaller.waitForConnection();
-    }
-
-    private static String escapeNull(String arg) {
-        if (TextUtils.isEmpty(arg)) {
-            return "!";
+        if (mIsolated) {
+            mInstalld = null;
         } else {
-            if (arg.indexOf('\0') != -1 || arg.indexOf(' ') != -1) {
-                throw new IllegalArgumentException(arg);
+            connect();
+        }
+    }
+
+    private void connect() {
+        IBinder binder = ServiceManager.getService("installd");
+        if (binder != null) {
+            try {
+                binder.linkToDeath(new DeathRecipient() {
+                    @Override
+                    public void binderDied() {
+                        Slog.w(TAG, "installd died; reconnecting");
+                        connect();
+                    }
+                }, 0);
+            } catch (RemoteException e) {
+                binder = null;
             }
-            return arg;
-        }
-    }
-
-    @Deprecated
-    public int install(String name, int uid, int gid, String seinfo) {
-        return install(null, name, uid, gid, seinfo);
-    }
-
-    public int install(String uuid, String name, int uid, int gid, String seinfo) {
-        StringBuilder builder = new StringBuilder("install");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(uid);
-        builder.append(' ');
-        builder.append(gid);
-        builder.append(' ');
-        builder.append(seinfo != null ? seinfo : "!");
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int dexopt(String apkPath, int uid, String instructionSet,
-            int dexoptNeeded, int dexFlags) {
-        if (!isValidInstructionSet(instructionSet)) {
-            Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-            return -1;
         }
 
-        return mInstaller.dexopt(apkPath, uid, instructionSet, dexoptNeeded, dexFlags);
-    }
-
-    public int dexopt(String apkPath, int uid, String pkgName, String instructionSet,
-            int dexoptNeeded, @Nullable String outputPath, int dexFlags) {
-        if (!isValidInstructionSet(instructionSet)) {
-            Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-            return -1;
+        if (binder != null) {
+            mInstalld = IInstalld.Stub.asInterface(binder);
+            try {
+                invalidateMounts();
+            } catch (InstallerException ignored) {
+            }
+        } else {
+            Slog.w(TAG, "installd not found; trying again");
+            BackgroundThread.getHandler().postDelayed(() -> {
+                connect();
+            }, DateUtils.SECOND_IN_MILLIS);
         }
-        return mInstaller.dexopt(apkPath, uid, pkgName, instructionSet, dexoptNeeded,
-                outputPath, dexFlags);
-    }
-
-    public int idmap(String targetApkPath, String overlayApkPath, int uid) {
-        StringBuilder builder = new StringBuilder("idmap");
-        builder.append(' ');
-        builder.append(targetApkPath);
-        builder.append(' ');
-        builder.append(overlayApkPath);
-        builder.append(' ');
-        builder.append(uid);
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int movedex(String srcPath, String dstPath, String instructionSet) {
-        if (!isValidInstructionSet(instructionSet)) {
-            Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-            return -1;
-        }
-
-        StringBuilder builder = new StringBuilder("movedex");
-        builder.append(' ');
-        builder.append(srcPath);
-        builder.append(' ');
-        builder.append(dstPath);
-        builder.append(' ');
-        builder.append(instructionSet);
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int rmdex(String codePath, String instructionSet) {
-        if (!isValidInstructionSet(instructionSet)) {
-            Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-            return -1;
-        }
-
-        StringBuilder builder = new StringBuilder("rmdex");
-        builder.append(' ');
-        builder.append(codePath);
-        builder.append(' ');
-        builder.append(instructionSet);
-        return mInstaller.execute(builder.toString());
     }
 
     /**
-     * Removes packageDir or its subdirectory
+     * Do several pre-flight checks before making a remote call.
+     *
+     * @return if the remote call should continue.
      */
-    public int rmPackageDir(String packageDir) {
-        StringBuilder builder = new StringBuilder("rmpackagedir");
-        builder.append(' ');
-        builder.append(packageDir);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int remove(String name, int userId) {
-        return remove(null, name, userId);
-    }
-
-    public int remove(String uuid, String name, int userId) {
-        StringBuilder builder = new StringBuilder("remove");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int rename(String oldname, String newname) {
-        StringBuilder builder = new StringBuilder("rename");
-        builder.append(' ');
-        builder.append(oldname);
-        builder.append(' ');
-        builder.append(newname);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int fixUid(String name, int uid, int gid) {
-        return fixUid(null, name, uid, gid);
-    }
-
-    public int fixUid(String uuid, String name, int uid, int gid) {
-        StringBuilder builder = new StringBuilder("fixuid");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(uid);
-        builder.append(' ');
-        builder.append(gid);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int deleteCacheFiles(String name, int userId) {
-        return deleteCacheFiles(null, name, userId);
-    }
-
-    public int deleteCacheFiles(String uuid, String name, int userId) {
-        StringBuilder builder = new StringBuilder("rmcache");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int deleteCodeCacheFiles(String name, int userId) {
-        return deleteCodeCacheFiles(null, name, userId);
-    }
-
-    public int deleteCodeCacheFiles(String uuid, String name, int userId) {
-        StringBuilder builder = new StringBuilder("rmcodecache");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int createUserData(String name, int uid, int userId, String seinfo) {
-        return createUserData(null, name, uid, userId, seinfo);
-    }
-
-    public int createUserData(String uuid, String name, int uid, int userId, String seinfo) {
-        StringBuilder builder = new StringBuilder("mkuserdata");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(uid);
-        builder.append(' ');
-        builder.append(userId);
-        builder.append(' ');
-        builder.append(seinfo != null ? seinfo : "!");
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int createUserConfig(int userId) {
-        StringBuilder builder = new StringBuilder("mkuserconfig");
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int removeUserDataDirs(int userId) {
-        return removeUserDataDirs(null, userId);
-    }
-
-    public int removeUserDataDirs(String uuid, int userId) {
-        StringBuilder builder = new StringBuilder("rmuser");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int copyCompleteApp(String fromUuid, String toUuid, String packageName,
-            String dataAppName, int appId, String seinfo) {
-        StringBuilder builder = new StringBuilder("cpcompleteapp");
-        builder.append(' ');
-        builder.append(escapeNull(fromUuid));
-        builder.append(' ');
-        builder.append(escapeNull(toUuid));
-        builder.append(' ');
-        builder.append(packageName);
-        builder.append(' ');
-        builder.append(dataAppName);
-        builder.append(' ');
-        builder.append(appId);
-        builder.append(' ');
-        builder.append(seinfo);
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public int clearUserData(String name, int userId) {
-        return clearUserData(null, name, userId);
-    }
-
-    public int clearUserData(String uuid, String name, int userId) {
-        StringBuilder builder = new StringBuilder("rmuserdata");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(name);
-        builder.append(' ');
-        builder.append(userId);
-        return mInstaller.execute(builder.toString());
-    }
-
-    public int markBootComplete(String instructionSet) {
-        if (!isValidInstructionSet(instructionSet)) {
-            Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-            return -1;
+    private boolean checkBeforeRemote() {
+        if (mWarnIfHeld != null && Thread.holdsLock(mWarnIfHeld)) {
+            Slog.wtf(TAG, "Calling thread " + Thread.currentThread().getName() + " is holding 0x"
+                    + Integer.toHexString(System.identityHashCode(mWarnIfHeld)), new Throwable());
         }
-
-        StringBuilder builder = new StringBuilder("markbootcomplete");
-        builder.append(' ');
-        builder.append(instructionSet);
-        return mInstaller.execute(builder.toString());
+        if (mIsolated) {
+            Slog.i(TAG, "Ignoring request because this installer is isolated");
+            return false;
+        } else {
+            return true;
+        }
     }
 
-    @Deprecated
-    public int freeCache(long freeStorageSize) {
-        return freeCache(null, freeStorageSize);
+    public long createAppData(String uuid, String packageName, int userId, int flags, int appId,
+            String seInfo, int targetSdkVersion) throws InstallerException {
+        if (!checkBeforeRemote()) return -1;
+        try {
+            return mInstalld.createAppData(uuid, packageName, userId, flags, appId, seInfo,
+                    targetSdkVersion);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
     }
 
-    public int freeCache(String uuid, long freeStorageSize) {
-        StringBuilder builder = new StringBuilder("freecache");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(String.valueOf(freeStorageSize));
-        return mInstaller.execute(builder.toString());
-    }
+    /**
+     * Batched version of createAppData for use with multiple packages.
+     */
+    public void createAppDataBatched(String[] uuids, String[] packageNames, int userId, int flags,
+            int[] appIds, String[] seInfos, int[] targetSdkVersions) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        final int batchSize = 256;
+        for (int i = 0; i < uuids.length; i += batchSize) {
+            int to = i + batchSize;
+            if (to > uuids.length) {
+                to = uuids.length;
+            }
 
-    @Deprecated
-    public int getSizeInfo(String pkgName, int persona, String apkPath, String libDirPath,
-            String fwdLockApkPath, String asecPath, String[] instructionSets, PackageStats pStats) {
-        return getSizeInfo(null, pkgName, persona, apkPath, libDirPath, fwdLockApkPath, asecPath,
-                instructionSets, pStats);
-    }
-
-    public int getSizeInfo(String uuid, String pkgName, int persona, String apkPath,
-            String libDirPath, String fwdLockApkPath, String asecPath, String[] instructionSets,
-            PackageStats pStats) {
-        for (String instructionSet : instructionSets) {
-            if (!isValidInstructionSet(instructionSet)) {
-                Slog.e(TAG, "Invalid instruction set: " + instructionSet);
-                return -1;
+            try {
+                mInstalld.createAppDataBatched(Arrays.copyOfRange(uuids, i, to),
+                        Arrays.copyOfRange(packageNames, i, to), userId, flags,
+                        Arrays.copyOfRange(appIds, i, to), Arrays.copyOfRange(seInfos, i, to),
+                        Arrays.copyOfRange(targetSdkVersions, i, to));
+            } catch (Exception e) {
+                throw InstallerException.from(e);
             }
         }
+    }
 
-        StringBuilder builder = new StringBuilder("getsize");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(pkgName);
-        builder.append(' ');
-        builder.append(persona);
-        builder.append(' ');
-        builder.append(apkPath);
-        builder.append(' ');
-        // TODO: Extend getSizeInfo to look at the full subdirectory tree,
-        // not just the first level.
-        builder.append(libDirPath != null ? libDirPath : "!");
-        builder.append(' ');
-        builder.append(fwdLockApkPath != null ? fwdLockApkPath : "!");
-        builder.append(' ');
-        builder.append(asecPath != null ? asecPath : "!");
-        builder.append(' ');
-        // TODO: Extend getSizeInfo to look at *all* instrution sets, not
-        // just the primary.
-        builder.append(instructionSets[0]);
+    public void restoreconAppData(String uuid, String packageName, int userId, int flags, int appId,
+            String seInfo) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.restoreconAppData(uuid, packageName, userId, flags, appId, seInfo);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
 
-        String s = mInstaller.transact(builder.toString());
-        String res[] = s.split(" ");
+    public void migrateAppData(String uuid, String packageName, int userId, int flags)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.migrateAppData(uuid, packageName, userId, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
 
-        if ((res == null) || (res.length != 5)) {
-            return -1;
+    public void clearAppData(String uuid, String packageName, int userId, int flags,
+            long ceDataInode) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.clearAppData(uuid, packageName, userId, flags, ceDataInode);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void destroyAppData(String uuid, String packageName, int userId, int flags,
+            long ceDataInode) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.destroyAppData(uuid, packageName, userId, flags, ceDataInode);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void fixupAppData(String uuid, int flags) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.fixupAppData(uuid, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void moveCompleteApp(String fromUuid, String toUuid, String packageName,
+            int appId, String seInfo, int targetSdkVersion,
+            String fromCodePath) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.moveCompleteApp(fromUuid, toUuid, packageName, appId, seInfo,
+                    targetSdkVersion, fromCodePath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void getAppSize(String uuid, String[] packageNames, int userId, int flags, int appId,
+            long[] ceDataInodes, String[] codePaths, PackageStats stats)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        if (codePaths != null) {
+            for (String codePath : codePaths) {
+                BlockGuard.getVmPolicy().onPathAccess(codePath);
+            }
         }
         try {
-            pStats.codeSize = Long.parseLong(res[1]);
-            pStats.dataSize = Long.parseLong(res[2]);
-            pStats.cacheSize = Long.parseLong(res[3]);
-            pStats.externalCodeSize = Long.parseLong(res[4]);
-            return Integer.parseInt(res[0]);
-        } catch (NumberFormatException e) {
-            return -1;
+            final long[] res = mInstalld.getAppSize(uuid, packageNames, userId, flags,
+                    appId, ceDataInodes, codePaths);
+            stats.codeSize += res[0];
+            stats.dataSize += res[1];
+            stats.cacheSize += res[2];
+            stats.externalCodeSize += res[3];
+            stats.externalDataSize += res[4];
+            stats.externalCacheSize += res[5];
+        } catch (Exception e) {
+            throw InstallerException.from(e);
         }
     }
 
-    public int moveFiles() {
-        return mInstaller.execute("movefiles");
+    public void getUserSize(String uuid, int userId, int flags, int[] appIds, PackageStats stats)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            final long[] res = mInstalld.getUserSize(uuid, userId, flags, appIds);
+            stats.codeSize += res[0];
+            stats.dataSize += res[1];
+            stats.cacheSize += res[2];
+            stats.externalCodeSize += res[3];
+            stats.externalDataSize += res[4];
+            stats.externalCacheSize += res[5];
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
     }
 
-    @Deprecated
-    public int linkNativeLibraryDirectory(String dataPath, String nativeLibPath32, int userId) {
-        return linkNativeLibraryDirectory(null, dataPath, nativeLibPath32, userId);
+    public long[] getExternalSize(String uuid, int userId, int flags, int[] appIds)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return new long[6];
+        try {
+            return mInstalld.getExternalSize(uuid, userId, flags, appIds);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
     }
 
     /**
-     * Links the 32 bit native library directory in an application's data directory to the
-     * real location for backward compatibility. Note that no such symlink is created for
-     * 64 bit shared libraries.
+     * To get all of the CrateMetadata of the crates for the specified user app by the installd.
      *
-     * @return -1 on error
+     * @param uuid the UUID
+     * @param packageNames the application package names
+     * @param userId the user id
+     * @return the array of CrateMetadata
      */
-    public int linkNativeLibraryDirectory(String uuid, String dataPath, String nativeLibPath32,
-            int userId) {
-        if (dataPath == null) {
-            Slog.e(TAG, "linkNativeLibraryDirectory dataPath is null");
-            return -1;
-        } else if (nativeLibPath32 == null) {
-            Slog.e(TAG, "linkNativeLibraryDirectory nativeLibPath is null");
-            return -1;
+    @Nullable
+    public CrateMetadata[] getAppCrates(@NonNull String uuid, @NonNull String[] packageNames,
+            @UserIdInt int userId) throws InstallerException {
+        if (!checkBeforeRemote()) return null;
+        try {
+            return mInstalld.getAppCrates(uuid, packageNames, userId);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
         }
-
-        StringBuilder builder = new StringBuilder("linklib");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(dataPath);
-        builder.append(' ');
-        builder.append(nativeLibPath32);
-        builder.append(' ');
-        builder.append(userId);
-
-        return mInstaller.execute(builder.toString());
-    }
-
-    @Deprecated
-    public boolean restoreconData(String pkgName, String seinfo, int uid) {
-        return restoreconData(null, pkgName, seinfo, uid);
-    }
-
-    public boolean restoreconData(String uuid, String pkgName, String seinfo, int uid) {
-        StringBuilder builder = new StringBuilder("restorecondata");
-        builder.append(' ');
-        builder.append(escapeNull(uuid));
-        builder.append(' ');
-        builder.append(pkgName);
-        builder.append(' ');
-        builder.append(seinfo != null ? seinfo : "!");
-        builder.append(' ');
-        builder.append(uid);
-        return (mInstaller.execute(builder.toString()) == 0);
-    }
-
-    public int createOatDir(String oatDir, String dexInstructionSet) {
-        StringBuilder builder = new StringBuilder("createoatdir");
-        builder.append(' ');
-        builder.append(oatDir);
-        builder.append(' ');
-        builder.append(dexInstructionSet);
-        return mInstaller.execute(builder.toString());
-    }
-
-
-    public int linkFile(String relativePath, String fromBase, String toBase) {
-        StringBuilder builder = new StringBuilder("linkfile");
-        builder.append(' ');
-        builder.append(relativePath);
-        builder.append(' ');
-        builder.append(fromBase);
-        builder.append(' ');
-        builder.append(toBase);
-        return mInstaller.execute(builder.toString());
     }
 
     /**
-     * Returns true iff. {@code instructionSet} is a valid instruction set.
+     * To retrieve all of the CrateMetadata of the crate for the specified user app by the installd.
+     *
+     * @param uuid the UUID
+     * @param userId the user id
+     * @return the array of CrateMetadata
      */
-    private static boolean isValidInstructionSet(String instructionSet) {
-        if (instructionSet == null) {
-            return false;
+    @Nullable
+    public CrateMetadata[] getUserCrates(String uuid, @UserIdInt int userId)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return null;
+        try {
+            return mInstalld.getUserCrates(uuid, userId);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
         }
+    }
 
+    public void setAppQuota(String uuid, int userId, int appId, long cacheQuota)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.setAppQuota(uuid, userId, appId, cacheQuota);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void dexopt(String apkPath, int uid, @Nullable String pkgName, String instructionSet,
+            int dexoptNeeded, @Nullable String outputPath, int dexFlags,
+            String compilerFilter, @Nullable String volumeUuid, @Nullable String sharedLibraries,
+            @Nullable String seInfo, boolean downgrade, int targetSdkVersion,
+            @Nullable String profileName, @Nullable String dexMetadataPath,
+            @Nullable String compilationReason) throws InstallerException {
+        assertValidInstructionSet(instructionSet);
+        BlockGuard.getVmPolicy().onPathAccess(apkPath);
+        BlockGuard.getVmPolicy().onPathAccess(outputPath);
+        BlockGuard.getVmPolicy().onPathAccess(dexMetadataPath);
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.dexopt(apkPath, uid, pkgName, instructionSet, dexoptNeeded, outputPath,
+                    dexFlags, compilerFilter, volumeUuid, sharedLibraries, seInfo, downgrade,
+                    targetSdkVersion, profileName, dexMetadataPath, compilationReason);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean mergeProfiles(int uid, String packageName, String profileName)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        try {
+            return mInstalld.mergeProfiles(uid, packageName, profileName);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean dumpProfiles(int uid, String packageName, String profileName, String codePath)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        BlockGuard.getVmPolicy().onPathAccess(codePath);
+        try {
+            return mInstalld.dumpProfiles(uid, packageName, profileName, codePath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean copySystemProfile(String systemProfile, int uid, String packageName,
+                String profileName) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        try {
+            return mInstalld.copySystemProfile(systemProfile, uid, packageName, profileName);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void rmdex(String codePath, String instructionSet) throws InstallerException {
+        assertValidInstructionSet(instructionSet);
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(codePath);
+        try {
+            mInstalld.rmdex(codePath, instructionSet);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void rmPackageDir(String packageDir) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(packageDir);
+        try {
+            mInstalld.rmPackageDir(packageDir);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void clearAppProfiles(String packageName, String profileName) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.clearAppProfiles(packageName, profileName);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void destroyAppProfiles(String packageName) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.destroyAppProfiles(packageName);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void createUserData(String uuid, int userId, int userSerial, int flags)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.createUserData(uuid, userId, userSerial, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void destroyUserData(String uuid, int userId, int flags) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.destroyUserData(uuid, userId, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void freeCache(String uuid, long targetFreeBytes, long cacheReservedBytes, int flags)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.freeCache(uuid, targetFreeBytes, cacheReservedBytes, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Links the 32 bit native library directory in an application's data
+     * directory to the real location for backward compatibility. Note that no
+     * such symlink is created for 64 bit shared libraries.
+     */
+    public void linkNativeLibraryDirectory(String uuid, String packageName, String nativeLibPath32,
+            int userId) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(nativeLibPath32);
+        try {
+            mInstalld.linkNativeLibraryDirectory(uuid, packageName, nativeLibPath32, userId);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void createOatDir(String oatDir, String dexInstructionSet)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.createOatDir(oatDir, dexInstructionSet);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void linkFile(String relativePath, String fromBase, String toBase)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(fromBase);
+        BlockGuard.getVmPolicy().onPathAccess(toBase);
+        try {
+            mInstalld.linkFile(relativePath, fromBase, toBase);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void moveAb(String apkPath, String instructionSet, String outputPath)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(apkPath);
+        BlockGuard.getVmPolicy().onPathAccess(outputPath);
+        try {
+            mInstalld.moveAb(apkPath, instructionSet, outputPath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void deleteOdex(String apkPath, String instructionSet, String outputPath)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(apkPath);
+        BlockGuard.getVmPolicy().onPathAccess(outputPath);
+        try {
+            mInstalld.deleteOdex(apkPath, instructionSet, outputPath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void installApkVerity(String filePath, FileDescriptor verityInput, int contentSize)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(filePath);
+        try {
+            mInstalld.installApkVerity(filePath, verityInput, contentSize);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void assertFsverityRootHashMatches(String filePath, @NonNull byte[] expectedHash)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        BlockGuard.getVmPolicy().onPathAccess(filePath);
+        try {
+            mInstalld.assertFsverityRootHashMatches(filePath, expectedHash);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean reconcileSecondaryDexFile(String apkPath, String packageName, int uid,
+            String[] isas, @Nullable String volumeUuid, int flags) throws InstallerException {
+        for (int i = 0; i < isas.length; i++) {
+            assertValidInstructionSet(isas[i]);
+        }
+        if (!checkBeforeRemote()) return false;
+        BlockGuard.getVmPolicy().onPathAccess(apkPath);
+        try {
+            return mInstalld.reconcileSecondaryDexFile(apkPath, packageName, uid, isas,
+                    volumeUuid, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public byte[] hashSecondaryDexFile(String dexPath, String packageName, int uid,
+            @Nullable String volumeUuid, int flags) throws InstallerException {
+        if (!checkBeforeRemote()) return new byte[0];
+        BlockGuard.getVmPolicy().onPathAccess(dexPath);
+        try {
+            return mInstalld.hashSecondaryDexFile(dexPath, packageName, uid, volumeUuid, flags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean createProfileSnapshot(int appId, String packageName, String profileName,
+            String classpath) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        try {
+            return mInstalld.createProfileSnapshot(appId, packageName, profileName, classpath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void destroyProfileSnapshot(String packageName, String profileName)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.destroyProfileSnapshot(packageName, profileName);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public void invalidateMounts() throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.invalidateMounts();
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean isQuotaSupported(String volumeUuid) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        try {
+            return mInstalld.isQuotaSupported(volumeUuid);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Bind mount private volume CE and DE mirror storage.
+     */
+    public void tryMountDataMirror(String volumeUuid) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.tryMountDataMirror(volumeUuid);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Unmount private volume CE and DE mirror storage.
+     */
+    public void onPrivateVolumeRemoved(String volumeUuid) throws InstallerException {
+        if (!checkBeforeRemote()) return;
+        try {
+            mInstalld.onPrivateVolumeRemoved(volumeUuid);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    public boolean prepareAppProfile(String pkg, @UserIdInt int userId, @AppIdInt int appId,
+            String profileName, String codePath, String dexMetadataPath) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+        BlockGuard.getVmPolicy().onPathAccess(codePath);
+        BlockGuard.getVmPolicy().onPathAccess(dexMetadataPath);
+        try {
+            return mInstalld.prepareAppProfile(pkg, userId, appId, profileName, codePath,
+                    dexMetadataPath);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Snapshots user data of the given package.
+     *
+     * @param pkg name of the package to snapshot user data for.
+     * @param userId id of the user whose data to snapshot.
+     * @param snapshotId id of this snapshot.
+     * @param storageFlags flags controlling which data (CE or DE) to snapshot.
+     *
+     * @return inode of the snapshot of users CE package data, or {@code 0} if a remote calls
+     *  shouldn't be continued. See {@link #checkBeforeRemote}.
+     *
+     * @throws InstallerException if failed to snapshot user data.
+     */
+    public long snapshotAppData(String pkg, @UserIdInt int userId, int snapshotId, int storageFlags)
+            throws InstallerException {
+        if (!checkBeforeRemote()) return 0;
+
+        try {
+            return mInstalld.snapshotAppData(null, pkg, userId, snapshotId, storageFlags);
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Restores user data snapshot of the given package.
+     *
+     * @param pkg name of the package to restore user data for.
+     * @param appId id of the package to restore user data for.
+     * @param userId id of the user whose data to restore.
+     * @param snapshotId id of the snapshot to restore.
+     * @param storageFlags flags controlling which data (CE or DE) to restore.
+     *
+     * @return {@code true} if user data restore was successful, or {@code false} if a remote call
+     *  shouldn't be continued. See {@link #checkBeforeRemote}.
+     *
+     * @throws InstallerException if failed to restore user data.
+     */
+    public boolean restoreAppDataSnapshot(String pkg, @AppIdInt  int appId, String seInfo,
+            @UserIdInt int userId, int snapshotId, int storageFlags) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+
+        try {
+            mInstalld.restoreAppDataSnapshot(null, pkg, appId, seInfo, userId, snapshotId,
+                    storageFlags);
+            return true;
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Deletes user data snapshot of the given package.
+     *
+     * @param pkg name of the package to delete user data snapshot for.
+     * @param userId id of the user whose user data snapshot to delete.
+     * @param ceSnapshotInode inode of CE user data snapshot.
+     * @param snapshotId id of the snapshot to delete.
+     * @param storageFlags flags controlling which user data snapshot (CE or DE) to delete.
+     *
+     * @return {@code true} if user data snapshot was successfully deleted, or {@code false} if a
+     *  remote call shouldn't be continued. See {@link #checkBeforeRemote}.
+     *
+     * @throws InstallerException if failed to delete user data snapshot.
+     */
+    public boolean destroyAppDataSnapshot(String pkg, @UserIdInt int userId, long ceSnapshotInode,
+            int snapshotId, int storageFlags) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+
+        try {
+            mInstalld.destroyAppDataSnapshot(null, pkg, userId, ceSnapshotInode, snapshotId,
+                    storageFlags);
+            return true;
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Deletes all snapshots of credential encrypted user data, where the snapshot id is not
+     * included in {@code retainSnapshotIds}.
+     *
+     * @param userId id of the user whose user data snapshots to delete.
+     * @param retainSnapshotIds ids of the snapshots that should not be deleted.
+     *
+     * @return {@code true} if the operation was successful, or {@code false} if a remote call
+     * shouldn't be continued. See {@link #checkBeforeRemote}.
+     *
+     * @throws InstallerException if failed to delete user data snapshot.
+     */
+    public boolean destroyCeSnapshotsNotSpecified(@UserIdInt int userId,
+            int[] retainSnapshotIds) throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+
+        try {
+            mInstalld.destroyCeSnapshotsNotSpecified(null, userId, retainSnapshotIds);
+            return true;
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    /**
+     * Migrates obb data from its legacy location {@code /data/media/obb} to
+     * {@code /data/media/0/Android/obb}. This call is idempotent and a fast no-op if data has
+     * already been migrated.
+     *
+     * @throws InstallerException if an error occurs.
+     */
+    public boolean migrateLegacyObbData() throws InstallerException {
+        if (!checkBeforeRemote()) return false;
+
+        try {
+            mInstalld.migrateLegacyObbData();
+            return true;
+        } catch (Exception e) {
+            throw InstallerException.from(e);
+        }
+    }
+
+    private static void assertValidInstructionSet(String instructionSet)
+            throws InstallerException {
         for (String abi : Build.SUPPORTED_ABIS) {
-            if (instructionSet.equals(VMRuntime.getInstructionSet(abi))) {
-                return true;
+            if (VMRuntime.getInstructionSet(abi).equals(instructionSet)) {
+                return;
             }
         }
+        throw new InstallerException("Invalid instruction set: " + instructionSet);
+    }
 
-        return false;
+    public boolean compileLayouts(String apkPath, String packageName, String outDexFile, int uid) {
+        try {
+            return mInstalld.compileLayouts(apkPath, packageName, outDexFile, uid);
+        } catch (RemoteException e) {
+            return false;
+        }
+    }
+
+    public static class InstallerException extends Exception {
+        public InstallerException(String detailMessage) {
+            super(detailMessage);
+        }
+
+        public static InstallerException from(Exception e) throws InstallerException {
+            throw new InstallerException(e.toString());
+        }
     }
 }

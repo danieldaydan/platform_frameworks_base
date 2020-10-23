@@ -16,9 +16,35 @@
 
 package com.android.internal.app;
 
+import android.animation.Animator;
+import android.animation.Animator.AnimatorListener;
+import android.animation.AnimatorListenerAdapter;
+import android.animation.AnimatorSet;
+import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator;
+import android.app.ActionBar;
+import android.app.Activity;
+import android.app.Dialog;
+import android.app.FragmentTransaction;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.Context;
+import android.content.res.Configuration;
+import android.content.res.Resources;
 import android.content.res.TypedArray;
+import android.graphics.drawable.Drawable;
+import android.util.TypedValue;
+import android.view.ActionMode;
+import android.view.ContextThemeWrapper;
+import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
+import android.view.View;
 import android.view.ViewParent;
+import android.view.Window;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.animation.AnimationUtils;
+import android.widget.SpinnerAdapter;
 import android.widget.Toolbar;
 
 import com.android.internal.R;
@@ -31,32 +57,6 @@ import com.android.internal.widget.ActionBarContextView;
 import com.android.internal.widget.ActionBarOverlayLayout;
 import com.android.internal.widget.DecorToolbar;
 import com.android.internal.widget.ScrollingTabContainerView;
-
-import android.animation.Animator;
-import android.animation.Animator.AnimatorListener;
-import android.animation.AnimatorListenerAdapter;
-import android.animation.AnimatorSet;
-import android.animation.ObjectAnimator;
-import android.app.ActionBar;
-import android.app.Activity;
-import android.app.Dialog;
-import android.app.FragmentTransaction;
-import android.content.Context;
-import android.content.res.Configuration;
-import android.content.res.Resources;
-import android.graphics.drawable.Drawable;
-import android.util.TypedValue;
-import android.view.ActionMode;
-import android.view.ContextThemeWrapper;
-import android.view.LayoutInflater;
-import android.view.Menu;
-import android.view.MenuInflater;
-import android.view.MenuItem;
-import android.view.View;
-import android.view.Window;
-import android.view.accessibility.AccessibilityEvent;
-import android.view.animation.AnimationUtils;
-import android.widget.SpinnerAdapter;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -80,9 +80,11 @@ public class WindowDecorActionBar extends ActionBar implements
     private ActionBarOverlayLayout mOverlayLayout;
     private ActionBarContainer mContainerView;
     private DecorToolbar mDecorToolbar;
+    @UnsupportedAppUsage
     private ActionBarContextView mContextView;
     private ActionBarContainer mSplitView;
     private View mContentView;
+    @UnsupportedAppUsage
     private ScrollingTabContainerView mTabScrollView;
 
     private ArrayList<TabImpl> mTabs = new ArrayList<TabImpl>();
@@ -330,6 +332,7 @@ public class WindowDecorActionBar extends ActionBar implements
      *
      * @param enabled true to animate, false to not animate.
      */
+    @UnsupportedAppUsage
     public void setShowHideAnimationEnabled(boolean enabled) {
         mShowHideAnimationEnabled = enabled;
         if (!enabled && mCurrentShowAnim != null) {
@@ -503,6 +506,9 @@ public class WindowDecorActionBar extends ActionBar implements
         mContextView.killMode();
         ActionModeImpl mode = new ActionModeImpl(mContextView.getContext(), callback);
         if (mode.dispatchOnCreate()) {
+            // This needs to be set before invalidate() so that it calls
+            // onPrepareActionMode()
+            mActionMode = mode;
             mode.invalidate();
             mContextView.initForMode(mode);
             animateToMode(true);
@@ -516,7 +522,6 @@ public class WindowDecorActionBar extends ActionBar implements
                 }
             }
             mContextView.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED);
-            mActionMode = mode;
             return mode;
         }
         return null;
@@ -869,22 +874,38 @@ public class WindowDecorActionBar extends ActionBar implements
             hideForActionMode();
         }
 
-        Animator fadeIn, fadeOut;
-        if (toActionMode) {
-            fadeOut = mDecorToolbar.setupAnimatorToVisibility(View.GONE,
-                    FADE_OUT_DURATION_MS);
-            fadeIn = mContextView.setupAnimatorToVisibility(View.VISIBLE,
-                    FADE_IN_DURATION_MS);
+        if (shouldAnimateContextView()) {
+            Animator fadeIn, fadeOut;
+            if (toActionMode) {
+                fadeOut = mDecorToolbar.setupAnimatorToVisibility(View.GONE,
+                        FADE_OUT_DURATION_MS);
+                fadeIn = mContextView.setupAnimatorToVisibility(View.VISIBLE,
+                        FADE_IN_DURATION_MS);
+            } else {
+                fadeIn = mDecorToolbar.setupAnimatorToVisibility(View.VISIBLE,
+                        FADE_IN_DURATION_MS);
+                fadeOut = mContextView.setupAnimatorToVisibility(View.GONE,
+                        FADE_OUT_DURATION_MS);
+            }
+            AnimatorSet set = new AnimatorSet();
+            set.playSequentially(fadeOut, fadeIn);
+            set.start();
         } else {
-            fadeIn = mDecorToolbar.setupAnimatorToVisibility(View.VISIBLE,
-                    FADE_IN_DURATION_MS);
-            fadeOut = mContextView.setupAnimatorToVisibility(View.GONE,
-                    FADE_OUT_DURATION_MS);
+            if (toActionMode) {
+                mDecorToolbar.setVisibility(View.GONE);
+                mContextView.setVisibility(View.VISIBLE);
+            } else {
+                mDecorToolbar.setVisibility(View.VISIBLE);
+                mContextView.setVisibility(View.GONE);
+            }
         }
-        AnimatorSet set = new AnimatorSet();
-        set.playSequentially(fadeOut, fadeIn);
-        set.start();
         // mTabScrollView's visibility is not affected by action mode.
+    }
+
+    private boolean shouldAnimateContextView() {
+        // We only to animate the action mode in if the container view has already been laid out.
+        // If it hasn't been laid out, it hasn't been drawn to screen yet.
+        return mContainerView.isLaidOut();
     }
 
     public Context getThemedContext() {
@@ -1128,6 +1149,7 @@ public class WindowDecorActionBar extends ActionBar implements
      * @hide
      */
     public class TabImpl extends ActionBar.Tab {
+        @UnsupportedAppUsage
         private ActionBar.TabListener mCallback;
         private Object mTag;
         private Drawable mIcon;

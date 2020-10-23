@@ -23,9 +23,10 @@
 
 #include <androidfw/Asset.h>
 #include <androidfw/StreamingZipInflater.h>
+#include <androidfw/Util.h>
 #include <androidfw/ZipFileRO.h>
 #include <androidfw/ZipUtils.h>
-#include <utils/Atomic.h>
+#include <cutils/atomic.h>
 #include <utils/FileMap.h>
 #include <utils/Log.h>
 #include <utils/threads.h>
@@ -51,6 +52,47 @@ static Mutex gAssetLock;
 static int32_t gCount = 0;
 static Asset* gHead = NULL;
 static Asset* gTail = NULL;
+
+void Asset::registerAsset(Asset* asset)
+{
+    AutoMutex _l(gAssetLock);
+    gCount++;
+    asset->mNext = asset->mPrev = NULL;
+    if (gTail == NULL) {
+        gHead = gTail = asset;
+    } else {
+        asset->mPrev = gTail;
+        gTail->mNext = asset;
+        gTail = asset;
+    }
+
+    if (kIsDebug) {
+        ALOGI("Creating Asset %p #%d\n", asset, gCount);
+    }
+}
+
+void Asset::unregisterAsset(Asset* asset)
+{
+    AutoMutex _l(gAssetLock);
+    gCount--;
+    if (gHead == asset) {
+        gHead = asset->mNext;
+    }
+    if (gTail == asset) {
+        gTail = asset->mPrev;
+    }
+    if (asset->mNext != NULL) {
+        asset->mNext->mPrev = asset->mPrev;
+    }
+    if (asset->mPrev != NULL) {
+        asset->mPrev->mNext = asset->mNext;
+    }
+    asset->mNext = asset->mPrev = NULL;
+
+    if (kIsDebug) {
+        ALOGI("Destroying Asset in %p #%d\n", asset, gCount);
+    }
+}
 
 int32_t Asset::getGlobalCount()
 {
@@ -79,43 +121,8 @@ String8 Asset::getAssetAllocations()
 }
 
 Asset::Asset(void)
-    : mAccessMode(ACCESS_UNKNOWN)
+    : mAccessMode(ACCESS_UNKNOWN), mNext(NULL), mPrev(NULL)
 {
-    AutoMutex _l(gAssetLock);
-    gCount++;
-    mNext = mPrev = NULL;
-    if (gTail == NULL) {
-        gHead = gTail = this;
-    } else {
-        mPrev = gTail;
-        gTail->mNext = this;
-        gTail = this;
-    }
-    if (kIsDebug) {
-        ALOGI("Creating Asset %p #%d\n", this, gCount);
-    }
-}
-
-Asset::~Asset(void)
-{
-    AutoMutex _l(gAssetLock);
-    gCount--;
-    if (gHead == this) {
-        gHead = mNext;
-    }
-    if (gTail == this) {
-        gTail = mPrev;
-    }
-    if (mNext != NULL) {
-        mNext->mPrev = mPrev;
-    }
-    if (mPrev != NULL) {
-        mPrev->mNext = mNext;
-    }
-    mNext = mPrev = NULL;
-    if (kIsDebug) {
-        ALOGI("Destroying Asset in %p #%d\n", this, gCount);
-    }
 }
 
 /*
@@ -126,14 +133,24 @@ Asset::~Asset(void)
  */
 /*static*/ Asset* Asset::createFromFile(const char* fileName, AccessMode mode)
 {
+    return createFromFd(open(fileName, O_RDONLY | O_BINARY), fileName, mode);
+}
+
+/*
+ * Create a new Asset from a file on disk.  There is a fair chance that
+ * the file doesn't actually exist.
+ *
+ * We can use "mode" to decide how we want to go about it.
+ */
+/*static*/ Asset* Asset::createFromFd(const int fd, const char* fileName, AccessMode mode)
+{
+    if (fd < 0) {
+        return NULL;
+    }
+
     _FileAsset* pAsset;
     status_t result;
     off64_t length;
-    int fd;
-
-    fd = open(fileName, O_RDONLY | O_BINARY);
-    if (fd < 0)
-        return NULL;
 
     /*
      * Under Linux, the lseek fails if we actually opened a directory.  To
@@ -246,8 +263,10 @@ Asset::~Asset(void)
 
     pAsset = new _FileAsset;
     result = pAsset->openChunk(NULL, fd, offset, length);
-    if (result != NO_ERROR)
+    if (result != NO_ERROR) {
+        delete pAsset;
         return NULL;
+    }
 
     pAsset->mAccessMode = mode;
     return pAsset;
@@ -266,8 +285,10 @@ Asset::~Asset(void)
     pAsset = new _CompressedAsset;
     result = pAsset->openChunk(fd, offset, compressionMethod,
                 uncompressedLen, compressedLen);
-    if (result != NO_ERROR)
+    if (result != NO_ERROR) {
+        delete pAsset;
         return NULL;
+    }
 
     pAsset->mAccessMode = mode;
     return pAsset;
@@ -277,19 +298,36 @@ Asset::~Asset(void)
 /*
  * Create a new Asset from a memory mapping.
  */
-/*static*/ Asset* Asset::createFromUncompressedMap(FileMap* dataMap,
-    AccessMode mode)
+/*static*/ Asset* Asset::createFromUncompressedMap(FileMap* dataMap, AccessMode mode)
 {
     _FileAsset* pAsset;
     status_t result;
 
     pAsset = new _FileAsset;
-    result = pAsset->openChunk(dataMap);
-    if (result != NO_ERROR)
+    result = pAsset->openChunk(dataMap, base::unique_fd(-1));
+    if (result != NO_ERROR) {
+        delete pAsset;
         return NULL;
+    }
 
     pAsset->mAccessMode = mode;
     return pAsset;
+}
+
+/*static*/ std::unique_ptr<Asset> Asset::createFromUncompressedMap(std::unique_ptr<FileMap> dataMap,
+    base::unique_fd fd, AccessMode mode)
+{
+    std::unique_ptr<_FileAsset> pAsset = util::make_unique<_FileAsset>();
+
+    status_t result = pAsset->openChunk(dataMap.get(), std::move(fd));
+    if (result != NO_ERROR) {
+        return NULL;
+    }
+
+    // We succeeded, so relinquish control of dataMap
+    (void) dataMap.release();
+    pAsset->mAccessMode = mode;
+    return std::move(pAsset);
 }
 
 /*
@@ -303,13 +341,30 @@ Asset::~Asset(void)
 
     pAsset = new _CompressedAsset;
     result = pAsset->openChunk(dataMap, uncompressedLen);
-    if (result != NO_ERROR)
+    if (result != NO_ERROR) {
+        delete pAsset;
         return NULL;
+    }
 
     pAsset->mAccessMode = mode;
     return pAsset;
 }
 
+/*static*/ std::unique_ptr<Asset> Asset::createFromCompressedMap(std::unique_ptr<FileMap> dataMap,
+    size_t uncompressedLen, AccessMode mode)
+{
+  std::unique_ptr<_CompressedAsset> pAsset = util::make_unique<_CompressedAsset>();
+
+  status_t result = pAsset->openChunk(dataMap.get(), uncompressedLen);
+  if (result != NO_ERROR) {
+      return NULL;
+  }
+
+  // We succeeded, so relinquish control of dataMap
+  (void) dataMap.release();
+  pAsset->mAccessMode = mode;
+  return std::move(pAsset);
+}
 
 /*
  * Do generic seek() housekeeping.  Pass in the offset/whence values from
@@ -359,8 +414,11 @@ off64_t Asset::handleSeek(off64_t offset, int whence, off64_t curPosn, off64_t m
  * Constructor.
  */
 _FileAsset::_FileAsset(void)
-    : mStart(0), mLength(0), mOffset(0), mFp(NULL), mFileName(NULL), mMap(NULL), mBuf(NULL)
+    : mStart(0), mLength(0), mOffset(0), mFp(NULL), mFileName(NULL), mFd(-1), mMap(NULL), mBuf(NULL)
 {
+    // Register the Asset with the global list here after it is fully constructed and its
+    // vtable pointer points to this concrete type. b/31113965
+    registerAsset(this);
 }
 
 /*
@@ -369,6 +427,10 @@ _FileAsset::_FileAsset(void)
 _FileAsset::~_FileAsset(void)
 {
     close();
+
+    // Unregister the Asset from the global list here before it is destructed and while its vtable
+    // pointer still points to this concrete type. b/31113965
+    unregisterAsset(this);
 }
 
 /*
@@ -422,7 +484,7 @@ status_t _FileAsset::openChunk(const char* fileName, int fd, off64_t offset, siz
 /*
  * Create the chunk from the map.
  */
-status_t _FileAsset::openChunk(FileMap* dataMap)
+status_t _FileAsset::openChunk(FileMap* dataMap, base::unique_fd fd)
 {
     assert(mFp == NULL);    // no reopen
     assert(mMap == NULL);
@@ -431,6 +493,7 @@ status_t _FileAsset::openChunk(FileMap* dataMap)
     mMap = dataMap;
     mStart = -1;            // not used
     mLength = dataMap->getDataLength();
+    mFd = std::move(fd);
     assert(mOffset == 0);
 
     return NO_ERROR;
@@ -629,6 +692,17 @@ const void* _FileAsset::getBuffer(bool wordAligned)
 int _FileAsset::openFileDescriptor(off64_t* outStart, off64_t* outLength) const
 {
     if (mMap != NULL) {
+        if (mFd.ok()) {
+          *outStart = mMap->getDataOffset();
+          *outLength = mMap->getDataLength();
+          const int fd = dup(mFd);
+          if (fd < 0) {
+            ALOGE("Unable to dup fd (%d).", mFd.get());
+            return -1;
+          }
+          lseek64(fd, 0, SEEK_SET);
+          return fd;
+        }
         const char* fname = mMap->getFileName();
         if (fname == NULL) {
             fname = mFileName;
@@ -685,6 +759,9 @@ _CompressedAsset::_CompressedAsset(void)
     : mStart(0), mCompressedLen(0), mUncompressedLen(0), mOffset(0),
       mMap(NULL), mFd(-1), mZipInflater(NULL), mBuf(NULL)
 {
+    // Register the Asset with the global list here after it is fully constructed and its
+    // vtable pointer points to this concrete type. b/31113965
+    registerAsset(this);
 }
 
 /*
@@ -693,6 +770,10 @@ _CompressedAsset::_CompressedAsset(void)
 _CompressedAsset::~_CompressedAsset(void)
 {
     close();
+
+    // Unregister the Asset from the global list here before it is destructed and while its vtable
+    // pointer still points to this concrete type. b/31113965
+    unregisterAsset(this);
 }
 
 /*

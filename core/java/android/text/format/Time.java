@@ -18,12 +18,11 @@ package android.text.format;
 
 import android.util.TimeFormatException;
 
-import java.io.IOException;
+import com.android.i18n.timezone.ZoneInfoData;
+import com.android.i18n.timezone.ZoneInfoDb;
+
 import java.util.Locale;
 import java.util.TimeZone;
-
-import libcore.util.ZoneInfo;
-import libcore.util.ZoneInfoDB;
 
 /**
  * An alternative to the {@link java.util.Calendar} and
@@ -331,7 +330,7 @@ public class Time {
      * @throws IllegalArgumentException if {@link #allDay} is true but {@code
      *             hour}, {@code minute}, and {@code second} are not 0.
      * @return a negative result if {@code a} is earlier, a positive result if
-     *         {@code a} is earlier, or 0 if they are equal.
+     *         {@code b} is earlier, or 0 if they are equal.
      */
     public static int compare(Time a, Time b) {
         if (a == null) {
@@ -346,9 +345,9 @@ public class Time {
     }
 
     /**
-     * Print the current value given the format string provided. See man
-     * strftime for what means what. The final string must be less than 256
-     * characters.
+     * Print the current value given the format string provided. See
+     * strftime(3) manual page for what means what. The final string must be
+     * less than 256 characters.
      * @param format a string containing the desired format.
      * @return a String containing the current time expressed in the current locale.
      */
@@ -358,11 +357,11 @@ public class Time {
     }
 
     /**
-     * Return the current time in YYYYMMDDTHHMMSS<tz> format
+     * Return the current time in YYYYMMDDTHHMMSS&lt;tz&gt; format
      */
     @Override
     public String toString() {
-        // toString() uses its own TimeCalculator rather than the shared one. Otherwise crazy stuff
+        // toString() uses its own TimeCalculator rather than the shared one. Otherwise weird stuff
         // happens during debugging when the debugger calls toString().
         TimeCalculator calculator = new TimeCalculator(this.timezone);
         calculator.copyFieldsFromTime(this);
@@ -738,6 +737,7 @@ public class Time {
      * <p>
      * You should also use <tt>toMillis(false)</tt> if you want
      * to read back the same milliseconds that you set with {@link #set(long)}
+     * or {@link #set(Time)} or after parsing a date string.
      *
      * <p>
      * This method can return {@code -1} when the date / time fields have been
@@ -745,8 +745,6 @@ public class Time {
      * For example, when daylight savings transitions cause an hour to be
      * skipped: times within that hour will return {@code -1} if isDst =
      * {@code -1}.
-     *
-     * or {@link #set(Time)} or after parsing a date string.
      */
     public long toMillis(boolean ignoreDst) {
         calculator.copyFieldsFromTime(this);
@@ -938,9 +936,12 @@ public class Time {
     }
 
     /**
-     * Returns true if the day of the given time is the epoch on the Julian Calendar
-     * (January 1, 1970 on the Gregorian calendar).
-     *
+     * Returns true if the instant of the supplied time would be for the
+     * Gregorian calendar date January 1, 1970 <em>for a user observing UTC
+     * </em>, i.e. the timezone of the time object is ignored.
+     * <p>
+     * See {@link #getJulianDay(long, long)} for how to determine the Julian day
+     * for the timezone of the time object.
      * <p>
      * This method can return an incorrect answer when the date / time fields have
      * been set to a local time that contradicts the available timezone information.
@@ -950,31 +951,39 @@ public class Time {
      */
     public static boolean isEpoch(Time time) {
         long millis = time.toMillis(true);
-        return getJulianDay(millis, 0) == EPOCH_JULIAN_DAY;
+        return getJulianDay(millis, 0 /* UTC offset */) == EPOCH_JULIAN_DAY;
     }
 
     /**
      * Computes the Julian day number for a point in time in a particular
-     * timezone. The Julian day for a given date is the same for every
-     * timezone. For example, the Julian day for July 1, 2008 is 2454649.
+     * timezone. The Julian day for a given calendar date is the same for
+     * every timezone. For example, the Julian day for July 1, 2008 is
+     * 2454649.
      *
      * <p>Callers must pass the time in UTC millisecond (as can be returned
      * by {@link #toMillis(boolean)} or {@link #normalize(boolean)})
-     * and the offset from UTC of the timezone in seconds (as might be in
-     * {@link #gmtoff}).
+     * and the offset from UTC of the timezone in seconds at that time (as
+     * might be in {@link #gmtoff}).
      *
      * <p>The Julian day is useful for testing if two events occur on the
      * same calendar date and for determining the relative time of an event
      * from the present ("yesterday", "3 days ago", etc.).
      *
      * @param millis the time in UTC milliseconds
-     * @param gmtoff the offset from UTC in seconds
+     * @param gmtoffSeconds the offset from UTC in seconds
      * @return the Julian day
+     * @deprecated Use {@link java.time.temporal.JulianFields#JULIAN_DAY} instead.
      */
-    public static int getJulianDay(long millis, long gmtoff) {
-        long offsetMillis = gmtoff * 1000;
-        long julianDay = (millis + offsetMillis) / DateUtils.DAY_IN_MILLIS;
-        return (int) julianDay + EPOCH_JULIAN_DAY;
+    @Deprecated
+    public static int getJulianDay(long millis, long gmtoffSeconds) {
+        long offsetMillis = gmtoffSeconds * 1000;
+        long adjustedMillis = millis + offsetMillis;
+        long julianDay = adjustedMillis / DateUtils.DAY_IN_MILLIS;
+        // Negative adjustedMillis values must round towards Integer.MIN_VALUE.
+        if (adjustedMillis < 0 && adjustedMillis % DateUtils.DAY_IN_MILLIS != 0) {
+            julianDay--;
+        }
+        return (int) (julianDay + EPOCH_JULIAN_DAY);
     }
 
     /**
@@ -1061,15 +1070,15 @@ public class Time {
      * to the enclosing object, but others do not: thus separate state is retained.
      */
     private static class TimeCalculator {
-        public final ZoneInfo.WallTime wallTime;
+        public final ZoneInfoData.WallTime wallTime;
         public String timezone;
 
         // Information about the current timezone.
-        private ZoneInfo zoneInfo;
+        private ZoneInfoData mZoneInfoData;
 
         public TimeCalculator(String timezoneId) {
-            this.zoneInfo = lookupZoneInfo(timezoneId);
-            this.wallTime = new ZoneInfo.WallTime();
+            this.mZoneInfoData = lookupZoneInfoData(timezoneId);
+            this.wallTime = new ZoneInfoData.WallTime();
         }
 
         public long toMillis(boolean ignoreDst) {
@@ -1077,7 +1086,7 @@ public class Time {
                 wallTime.setIsDst(-1);
             }
 
-            int r = wallTime.mktime(zoneInfo);
+            int r = wallTime.mktime(mZoneInfoData);
             if (r == -1) {
                 return -1;
             }
@@ -1089,7 +1098,7 @@ public class Time {
             int intSeconds = (int) (millis / 1000);
 
             updateZoneInfoFromTimeZone();
-            wallTime.localtime(intSeconds, zoneInfo);
+            wallTime.localtime(intSeconds, mZoneInfoData);
         }
 
         public String format(String format) {
@@ -1097,36 +1106,31 @@ public class Time {
                 format = "%c";
             }
             TimeFormatter formatter = new TimeFormatter();
-            return formatter.format(format, wallTime, zoneInfo);
+            return formatter.format(format, wallTime, mZoneInfoData);
         }
 
         private void updateZoneInfoFromTimeZone() {
-            if (!zoneInfo.getID().equals(timezone)) {
-                this.zoneInfo = lookupZoneInfo(timezone);
+            if (!mZoneInfoData.getID().equals(timezone)) {
+                this.mZoneInfoData = lookupZoneInfoData(timezone);
             }
         }
 
-        private static ZoneInfo lookupZoneInfo(String timezoneId) {
-            try {
-                ZoneInfo zoneInfo = ZoneInfoDB.getInstance().makeTimeZone(timezoneId);
-                if (zoneInfo == null) {
-                    zoneInfo = ZoneInfoDB.getInstance().makeTimeZone("GMT");
-                }
-                if (zoneInfo == null) {
-                    throw new AssertionError("GMT not found: \"" + timezoneId + "\"");
-                }
-                return zoneInfo;
-            } catch (IOException e) {
-                // This should not ever be thrown.
-                throw new AssertionError("Error loading timezone: \"" + timezoneId + "\"", e);
+        private static ZoneInfoData lookupZoneInfoData(String timezoneId) {
+            ZoneInfoData zoneInfoData = ZoneInfoDb.getInstance().makeZoneInfoData(timezoneId);
+            if (zoneInfoData == null) {
+                zoneInfoData = ZoneInfoDb.getInstance().makeZoneInfoData("GMT");
             }
+            if (zoneInfoData == null) {
+                throw new AssertionError("GMT not found: \"" + timezoneId + "\"");
+            }
+            return zoneInfoData;
         }
 
         public void switchTimeZone(String timezone) {
-            int seconds = wallTime.mktime(zoneInfo);
+            int seconds = wallTime.mktime(mZoneInfoData);
             this.timezone = timezone;
             updateZoneInfoFromTimeZone();
-            wallTime.localtime(seconds, zoneInfo);
+            wallTime.localtime(seconds, mZoneInfoData);
         }
 
         public String format2445(boolean hasTime) {

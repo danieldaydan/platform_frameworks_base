@@ -16,9 +16,10 @@
 
 package android.app.backup;
 
+import android.annotation.Nullable;
 import android.app.IBackupAgent;
 import android.app.QueuedWork;
-import android.app.backup.IBackupManager;
+import android.app.backup.FullBackup.BackupScheme.PathWithRequiredFlags;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.pm.ApplicationInfo;
@@ -29,6 +30,7 @@ import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -36,17 +38,20 @@ import android.system.StructStat;
 import android.util.ArraySet;
 import android.util.Log;
 
+import libcore.io.IoUtils;
+
+import org.xmlpull.v1.XmlPullParserException;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-
-import org.xmlpull.v1.XmlPullParserException;
 
 /**
  * Provides the central interface between an
@@ -103,6 +108,18 @@ import org.xmlpull.v1.XmlPullParserException;
  * {@link android.app.backup.BackupAgentHelper}.  That class is particularly
  * suited to handling of simple file or {@link android.content.SharedPreferences}
  * backup and restore.
+ * <p>
+ * <b>Threading</b>
+ * <p>
+ * The constructor, as well as {@link #onCreate()} and {@link #onDestroy()} lifecycle callbacks run
+ * on the main thread (UI thread) of the application that implements the BackupAgent.
+ * The data-handling callbacks:
+ * {@link #onBackup(ParcelFileDescriptor, BackupDataOutput, ParcelFileDescriptor) onBackup()},
+ * {@link #onFullBackup(FullBackupDataOutput)},
+ * {@link #onRestore(BackupDataInput, int, ParcelFileDescriptor) onRestore()},
+ * {@link #onRestoreFile(ParcelFileDescriptor, long, File, int, long, long) onRestoreFile()},
+ * {@link #onRestoreFinished()}, and {@link #onQuotaExceeded(long, long) onQuotaExceeded()}
+ * run on binder pool threads.
  *
  * @see android.app.backup.BackupManager
  * @see android.app.backup.BackupAgentHelper
@@ -112,6 +129,11 @@ import org.xmlpull.v1.XmlPullParserException;
 public abstract class BackupAgent extends ContextWrapper {
     private static final String TAG = "BackupAgent";
     private static final boolean DEBUG = false;
+
+    /** @hide */
+    public static final int RESULT_SUCCESS = 0;
+    /** @hide */
+    public static final int RESULT_ERROR = -1;
 
     /** @hide */
     public static final int TYPE_EOF = 0;
@@ -131,7 +153,39 @@ public abstract class BackupAgent extends ContextWrapper {
     /** @hide */
     public static final int TYPE_SYMLINK = 3;
 
+    /**
+     * Flag for {@link BackupDataOutput#getTransportFlags()} and
+     * {@link FullBackupDataOutput#getTransportFlags()} only.
+     *
+     * <p>The transport has client-side encryption enabled. i.e., the user's backup has been
+     * encrypted with a key known only to the device, and not to the remote storage solution. Even
+     * if an attacker had root access to the remote storage provider they should not be able to
+     * decrypt the user's backup data.
+     */
+    public static final int FLAG_CLIENT_SIDE_ENCRYPTION_ENABLED = 1;
+
+    /**
+     * Flag for {@link BackupDataOutput#getTransportFlags()} and
+     * {@link FullBackupDataOutput#getTransportFlags()} only.
+     *
+     * <p>The transport is for a device-to-device transfer. There is no third party or intermediate
+     * storage. The user's backup data is sent directly to another device over e.g., USB or WiFi.
+     */
+    public static final int FLAG_DEVICE_TO_DEVICE_TRANSFER = 2;
+
+    /**
+     * Flag for {@link BackupDataOutput#getTransportFlags()} and
+     * {@link FullBackupDataOutput#getTransportFlags()} only.
+     *
+     * <p>Used for internal testing only. Do not check this flag in production code.
+     *
+     * @hide
+     */
+    public static final int FLAG_FAKE_CLIENT_SIDE_ENCRYPTION_ENABLED = 1 << 31;
+
     Handler mHandler = null;
+
+    @Nullable private UserHandle mUser;
 
     Handler getHandler() {
         if (mHandler == null) {
@@ -172,6 +226,20 @@ public abstract class BackupAgent extends ContextWrapper {
      * <p>
      */
     public void onCreate() {
+    }
+
+    /**
+     * Provided as a convenience for agent implementations that need an opportunity
+     * to do one-time initialization before the actual backup or restore operation
+     * is begun with information about the calling user.
+     * <p>
+     *
+     * @hide
+     */
+    public void onCreate(UserHandle user) {
+        onCreate();
+
+        mUser = user;
     }
 
     /**
@@ -251,6 +319,39 @@ public abstract class BackupAgent extends ContextWrapper {
             ParcelFileDescriptor newState) throws IOException;
 
     /**
+     * New version of {@link #onRestore(BackupDataInput, int, android.os.ParcelFileDescriptor)}
+     * that handles a long app version code.  Default implementation casts the version code to
+     * an int and calls {@link #onRestore(BackupDataInput, int, android.os.ParcelFileDescriptor)}.
+     */
+    public void onRestore(BackupDataInput data, long appVersionCode,
+            ParcelFileDescriptor newState)
+            throws IOException {
+        onRestore(data, (int) appVersionCode, newState);
+    }
+
+    /**
+     * New version of {@link #onRestore(BackupDataInput, long, android.os.ParcelFileDescriptor)}
+     * that has a list of keys to be excluded from the restore. Key/value pairs for which the key
+     * is present in {@code excludedKeys} have already been excluded from the restore data by the
+     * system. The list is passed to the agent to make it aware of what data has been removed (in
+     * case it has any application-level consequences) as well as the data that should be removed
+     * by the agent itself.
+     *
+     * The default implementation calls {@link #onRestore(BackupDataInput, long,
+     * android.os.ParcelFileDescriptor)}.
+     *
+     * @param excludedKeys A list of keys to be excluded from restore.
+     *
+     * @hide
+     */
+    public void onRestore(BackupDataInput data, long appVersionCode,
+            ParcelFileDescriptor newState,
+            Set<String> excludedKeys)
+            throws IOException {
+        onRestore(data, appVersionCode, newState);
+    }
+
+    /**
      * The application is having its entire file system contents backed up.  {@code data}
      * points to the backup destination, and the app has the opportunity to choose which
      * files are to be stored.  To commit a file as part of the backup, call the
@@ -280,7 +381,6 @@ public abstract class BackupAgent extends ContextWrapper {
      * @throws IOException
      *
      * @see Context#getNoBackupFilesDir()
-     * @see ApplicationInfo#fullBackupContent
      * @see #fullBackupFile(File, FullBackupDataOutput)
      * @see #onRestoreFile(ParcelFileDescriptor, long, File, int, long, long)
      */
@@ -290,8 +390,8 @@ public abstract class BackupAgent extends ContextWrapper {
             return;
         }
 
-        Map<String, Set<String>> manifestIncludeMap;
-        ArraySet<String> manifestExcludeSet;
+        Map<String, Set<PathWithRequiredFlags>> manifestIncludeMap;
+        ArraySet<PathWithRequiredFlags> manifestExcludeSet;
         try {
             manifestIncludeMap =
                     backupScheme.maybeParseAndGetCanonicalIncludePaths();
@@ -308,14 +408,31 @@ public abstract class BackupAgent extends ContextWrapper {
         final String packageName = getPackageName();
         final ApplicationInfo appInfo = getApplicationInfo();
 
-        String rootDir = new File(appInfo.dataDir).getCanonicalPath();
-        String filesDir = getFilesDir().getCanonicalPath();
-        String nobackupDir = getNoBackupFilesDir().getCanonicalPath();
-        String databaseDir = getDatabasePath("foo").getParentFile().getCanonicalPath();
-        String sharedPrefsDir = getSharedPrefsFile("foo").getParentFile().getCanonicalPath();
-        String cacheDir = getCacheDir().getCanonicalPath();
-        String codeCacheDir = getCodeCacheDir().getCanonicalPath();
-        String libDir = (appInfo.nativeLibraryDir != null)
+        // System apps have control over where their default storage context
+        // is pointed, so we're always explicit when building paths.
+        final Context ceContext = createCredentialProtectedStorageContext();
+        final String rootDir = ceContext.getDataDir().getCanonicalPath();
+        final String filesDir = ceContext.getFilesDir().getCanonicalPath();
+        final String noBackupDir = ceContext.getNoBackupFilesDir().getCanonicalPath();
+        final String databaseDir = ceContext.getDatabasePath("foo").getParentFile()
+                .getCanonicalPath();
+        final String sharedPrefsDir = ceContext.getSharedPreferencesPath("foo").getParentFile()
+                .getCanonicalPath();
+        final String cacheDir = ceContext.getCacheDir().getCanonicalPath();
+        final String codeCacheDir = ceContext.getCodeCacheDir().getCanonicalPath();
+
+        final Context deContext = createDeviceProtectedStorageContext();
+        final String deviceRootDir = deContext.getDataDir().getCanonicalPath();
+        final String deviceFilesDir = deContext.getFilesDir().getCanonicalPath();
+        final String deviceNoBackupDir = deContext.getNoBackupFilesDir().getCanonicalPath();
+        final String deviceDatabaseDir = deContext.getDatabasePath("foo").getParentFile()
+                .getCanonicalPath();
+        final String deviceSharedPrefsDir = deContext.getSharedPreferencesPath("foo")
+                .getParentFile().getCanonicalPath();
+        final String deviceCacheDir = deContext.getCacheDir().getCanonicalPath();
+        final String deviceCodeCacheDir = deContext.getCodeCacheDir().getCanonicalPath();
+
+        final String libDir = (appInfo.nativeLibraryDir != null)
                 ? new File(appInfo.nativeLibraryDir).getCanonicalPath()
                 : null;
 
@@ -325,16 +442,23 @@ public abstract class BackupAgent extends ContextWrapper {
         final ArraySet<String> traversalExcludeSet = new ArraySet<String>();
 
         // Add the directories we always exclude.
+        traversalExcludeSet.add(filesDir);
+        traversalExcludeSet.add(noBackupDir);
+        traversalExcludeSet.add(databaseDir);
+        traversalExcludeSet.add(sharedPrefsDir);
         traversalExcludeSet.add(cacheDir);
         traversalExcludeSet.add(codeCacheDir);
-        traversalExcludeSet.add(nobackupDir);
+
+        traversalExcludeSet.add(deviceFilesDir);
+        traversalExcludeSet.add(deviceNoBackupDir);
+        traversalExcludeSet.add(deviceDatabaseDir);
+        traversalExcludeSet.add(deviceSharedPrefsDir);
+        traversalExcludeSet.add(deviceCacheDir);
+        traversalExcludeSet.add(deviceCodeCacheDir);
+
         if (libDir != null) {
             traversalExcludeSet.add(libDir);
         }
-
-        traversalExcludeSet.add(databaseDir);
-        traversalExcludeSet.add(sharedPrefsDir);
-        traversalExcludeSet.add(filesDir);
 
         // Root dir first.
         applyXmlFiltersAndDoFullBackupForDomain(
@@ -342,12 +466,23 @@ public abstract class BackupAgent extends ContextWrapper {
                 manifestExcludeSet, traversalExcludeSet, data);
         traversalExcludeSet.add(rootDir);
 
+        applyXmlFiltersAndDoFullBackupForDomain(
+                packageName, FullBackup.DEVICE_ROOT_TREE_TOKEN, manifestIncludeMap,
+                manifestExcludeSet, traversalExcludeSet, data);
+        traversalExcludeSet.add(deviceRootDir);
+
         // Data dir next.
         traversalExcludeSet.remove(filesDir);
         applyXmlFiltersAndDoFullBackupForDomain(
-                packageName, FullBackup.DATA_TREE_TOKEN, manifestIncludeMap,
+                packageName, FullBackup.FILES_TREE_TOKEN, manifestIncludeMap,
                 manifestExcludeSet, traversalExcludeSet, data);
         traversalExcludeSet.add(filesDir);
+
+        traversalExcludeSet.remove(deviceFilesDir);
+        applyXmlFiltersAndDoFullBackupForDomain(
+                packageName, FullBackup.DEVICE_FILES_TREE_TOKEN, manifestIncludeMap,
+                manifestExcludeSet, traversalExcludeSet, data);
+        traversalExcludeSet.add(deviceFilesDir);
 
         // Database directory.
         traversalExcludeSet.remove(databaseDir);
@@ -356,12 +491,24 @@ public abstract class BackupAgent extends ContextWrapper {
                 manifestExcludeSet, traversalExcludeSet, data);
         traversalExcludeSet.add(databaseDir);
 
+        traversalExcludeSet.remove(deviceDatabaseDir);
+        applyXmlFiltersAndDoFullBackupForDomain(
+                packageName, FullBackup.DEVICE_DATABASE_TREE_TOKEN, manifestIncludeMap,
+                manifestExcludeSet, traversalExcludeSet, data);
+        traversalExcludeSet.add(deviceDatabaseDir);
+
         // SharedPrefs.
         traversalExcludeSet.remove(sharedPrefsDir);
         applyXmlFiltersAndDoFullBackupForDomain(
                 packageName, FullBackup.SHAREDPREFS_TREE_TOKEN, manifestIncludeMap,
                 manifestExcludeSet, traversalExcludeSet, data);
         traversalExcludeSet.add(sharedPrefsDir);
+
+        traversalExcludeSet.remove(deviceSharedPrefsDir);
+        applyXmlFiltersAndDoFullBackupForDomain(
+                packageName, FullBackup.DEVICE_SHAREDPREFS_TREE_TOKEN, manifestIncludeMap,
+                manifestExcludeSet, traversalExcludeSet, data);
+        traversalExcludeSet.add(deviceSharedPrefsDir);
 
         // getExternalFilesDir() location associated with this app.  Technically there should
         // not be any files here if the app does not properly have permission to access
@@ -382,16 +529,49 @@ public abstract class BackupAgent extends ContextWrapper {
     }
 
     /**
+     * Notification that the application's current backup operation causes it to exceed
+     * the maximum size permitted by the transport.  The ongoing backup operation is
+     * halted and rolled back: any data that had been stored by a previous backup operation
+     * is still intact.  Typically the quota-exceeded state will be detected before any data
+     * is actually transmitted over the network.
+     *
+     * <p>The {@code quotaBytes} value is the total data size currently permitted for this
+     * application.  If desired, the application can use this as a hint for determining
+     * how much data to store.  For example, a messaging application might choose to
+     * store only the newest messages, dropping enough older content to stay under
+     * the quota.
+     *
+     * <p class="note">Note that the maximum quota for the application can change over
+     * time.  In particular, in the future the quota may grow.  Applications that adapt
+     * to the quota when deciding what data to store should be aware of this and implement
+     * their data storage mechanisms in a way that can take advantage of additional
+     * quota.
+     *
+     * @param backupDataBytes The amount of data measured while initializing the backup
+     *    operation, if the total exceeds the app's alloted quota.  If initial measurement
+     *    suggested that the data would fit but then too much data was actually submitted
+     *    as part of the operation, then this value is the amount of data that had been
+     *    streamed into the transport at the time the quota was reached.
+     * @param quotaBytes The maximum data size that the transport currently permits
+     *    this application to store as a backup.
+     */
+    public void onQuotaExceeded(long backupDataBytes, long quotaBytes) {
+    }
+
+    private int getBackupUserId() {
+        return mUser == null ? super.getUserId() : mUser.getIdentifier();
+    }
+
+    /**
      * Check whether the xml yielded any <include/> tag for the provided <code>domainToken</code>.
      * If so, perform a {@link #fullBackupFileTree} which backs up the file or recurses if the path
-     * is a directory.
+     * is a directory, but only if all the required flags of the include rule are satisfied by
+     * the transport.
      */
     private void applyXmlFiltersAndDoFullBackupForDomain(String packageName, String domainToken,
-                                                         Map<String, Set<String>> includeMap,
-                                                         ArraySet<String> filterSet,
-                                                         ArraySet<String> traversalExcludeSet,
-                                                         FullBackupDataOutput data)
-            throws IOException {
+            Map<String, Set<PathWithRequiredFlags>> includeMap,
+            ArraySet<PathWithRequiredFlags> filterSet, ArraySet<String> traversalExcludeSet,
+            FullBackupDataOutput data) throws IOException {
         if (includeMap == null || includeMap.size() == 0) {
             // Do entire sub-tree for the provided token.
             fullBackupFileTree(packageName, domainToken,
@@ -400,11 +580,20 @@ public abstract class BackupAgent extends ContextWrapper {
         } else if (includeMap.get(domainToken) != null) {
             // This will be null if the xml parsing didn't yield any rules for
             // this domain (there may still be rules for other domains).
-            for (String includeFile : includeMap.get(domainToken)) {
-                fullBackupFileTree(packageName, domainToken, includeFile, filterSet,
-                        traversalExcludeSet, data);
+            for (PathWithRequiredFlags includeFile : includeMap.get(domainToken)) {
+                if (areIncludeRequiredTransportFlagsSatisfied(includeFile.getRequiredFlags(),
+                        data.getTransportFlags())) {
+                    fullBackupFileTree(packageName, domainToken, includeFile.getPath(), filterSet,
+                            traversalExcludeSet, data);
+                }
             }
         }
+    }
+
+    private boolean areIncludeRequiredTransportFlagsSatisfied(int includeFlags,
+            int transportFlags) {
+        // all bits that are set in includeFlags must also be set in transportFlags
+        return (transportFlags & includeFlags) == includeFlags;
     }
 
     /**
@@ -413,9 +602,11 @@ public abstract class BackupAgent extends ContextWrapper {
      * to place it with the proper location and permissions on the device where the
      * data is restored.
      *
-     * <p class="note">It is safe to explicitly back up files underneath your application's
-     * {@link #getNoBackupFilesDir()} directory, and they will be restored to that
-     * location correctly.
+     * <p class="note">Attempting to back up files in directories that are ignored by
+     * the backup system will have no effect.  For example, if the app calls this method
+     * with a file inside the {@link #getNoBackupFilesDir()} directory, it will be ignored.
+     * See {@link #onFullBackup(FullBackupDataOutput)} for details on what directories
+     * are excluded from backups.
      *
      * @param file The file to be backed up.  The file must exist and be readable by
      *     the caller.
@@ -423,27 +614,49 @@ public abstract class BackupAgent extends ContextWrapper {
      */
     public final void fullBackupFile(File file, FullBackupDataOutput output) {
         // Look up where all of our various well-defined dir trees live on this device
-        String mainDir;
-        String filesDir;
-        String nbFilesDir;
-        String dbDir;
-        String spDir;
-        String cacheDir;
-        String codeCacheDir;
-        String libDir;
+        final String rootDir;
+        final String filesDir;
+        final String nbFilesDir;
+        final String dbDir;
+        final String spDir;
+        final String cacheDir;
+        final String codeCacheDir;
+        final String deviceRootDir;
+        final String deviceFilesDir;
+        final String deviceNbFilesDir;
+        final String deviceDbDir;
+        final String deviceSpDir;
+        final String deviceCacheDir;
+        final String deviceCodeCacheDir;
+        final String libDir;
+
         String efDir = null;
         String filePath;
 
         ApplicationInfo appInfo = getApplicationInfo();
 
         try {
-            mainDir = new File(appInfo.dataDir).getCanonicalPath();
-            filesDir = getFilesDir().getCanonicalPath();
-            nbFilesDir = getNoBackupFilesDir().getCanonicalPath();
-            dbDir = getDatabasePath("foo").getParentFile().getCanonicalPath();
-            spDir = getSharedPrefsFile("foo").getParentFile().getCanonicalPath();
-            cacheDir = getCacheDir().getCanonicalPath();
-            codeCacheDir = getCodeCacheDir().getCanonicalPath();
+            // System apps have control over where their default storage context
+            // is pointed, so we're always explicit when building paths.
+            final Context ceContext = createCredentialProtectedStorageContext();
+            rootDir = ceContext.getDataDir().getCanonicalPath();
+            filesDir = ceContext.getFilesDir().getCanonicalPath();
+            nbFilesDir = ceContext.getNoBackupFilesDir().getCanonicalPath();
+            dbDir = ceContext.getDatabasePath("foo").getParentFile().getCanonicalPath();
+            spDir = ceContext.getSharedPreferencesPath("foo").getParentFile().getCanonicalPath();
+            cacheDir = ceContext.getCacheDir().getCanonicalPath();
+            codeCacheDir = ceContext.getCodeCacheDir().getCanonicalPath();
+
+            final Context deContext = createDeviceProtectedStorageContext();
+            deviceRootDir = deContext.getDataDir().getCanonicalPath();
+            deviceFilesDir = deContext.getFilesDir().getCanonicalPath();
+            deviceNbFilesDir = deContext.getNoBackupFilesDir().getCanonicalPath();
+            deviceDbDir = deContext.getDatabasePath("foo").getParentFile().getCanonicalPath();
+            deviceSpDir = deContext.getSharedPreferencesPath("foo").getParentFile()
+                    .getCanonicalPath();
+            deviceCacheDir = deContext.getCacheDir().getCanonicalPath();
+            deviceCodeCacheDir = deContext.getCodeCacheDir().getCanonicalPath();
+
             libDir = (appInfo.nativeLibraryDir == null)
                     ? null
                     : new File(appInfo.nativeLibraryDir).getCanonicalPath();
@@ -467,8 +680,11 @@ public abstract class BackupAgent extends ContextWrapper {
 
         if (filePath.startsWith(cacheDir)
                 || filePath.startsWith(codeCacheDir)
-                || filePath.startsWith(libDir)
-                || filePath.startsWith(nbFilesDir)) {
+                || filePath.startsWith(nbFilesDir)
+                || filePath.startsWith(deviceCacheDir)
+                || filePath.startsWith(deviceCodeCacheDir)
+                || filePath.startsWith(deviceNbFilesDir)
+                || filePath.startsWith(libDir)) {
             Log.w(TAG, "lib, cache, code_cache, and no_backup files are not backed up");
             return;
         }
@@ -482,11 +698,23 @@ public abstract class BackupAgent extends ContextWrapper {
             domain = FullBackup.SHAREDPREFS_TREE_TOKEN;
             rootpath = spDir;
         } else if (filePath.startsWith(filesDir)) {
-            domain = FullBackup.DATA_TREE_TOKEN;
+            domain = FullBackup.FILES_TREE_TOKEN;
             rootpath = filesDir;
-        } else if (filePath.startsWith(mainDir)) {
+        } else if (filePath.startsWith(rootDir)) {
             domain = FullBackup.ROOT_TREE_TOKEN;
-            rootpath = mainDir;
+            rootpath = rootDir;
+        } else if (filePath.startsWith(deviceDbDir)) {
+            domain = FullBackup.DEVICE_DATABASE_TREE_TOKEN;
+            rootpath = deviceDbDir;
+        } else if (filePath.startsWith(deviceSpDir)) {
+            domain = FullBackup.DEVICE_SHAREDPREFS_TREE_TOKEN;
+            rootpath = deviceSpDir;
+        } else if (filePath.startsWith(deviceFilesDir)) {
+            domain = FullBackup.DEVICE_FILES_TREE_TOKEN;
+            rootpath = deviceFilesDir;
+        } else if (filePath.startsWith(deviceRootDir)) {
+            domain = FullBackup.DEVICE_ROOT_TREE_TOKEN;
+            rootpath = deviceRootDir;
         } else if ((efDir != null) && filePath.startsWith(efDir)) {
             domain = FullBackup.MANAGED_EXTERNAL_TREE_TOKEN;
             rootpath = efDir;
@@ -514,7 +742,7 @@ public abstract class BackupAgent extends ContextWrapper {
      * @hide
      */
     protected final void fullBackupFileTree(String packageName, String domain, String startingPath,
-                                            ArraySet<String> manifestExcludes,
+                                            ArraySet<PathWithRequiredFlags> manifestExcludes,
                                             ArraySet<String> systemExcludes,
             FullBackupDataOutput output) {
         // Pull out the domain and set it aside to use when making the tarball.
@@ -533,10 +761,20 @@ public abstract class BackupAgent extends ContextWrapper {
                 File file = scanQueue.remove(0);
                 String filePath;
                 try {
+                    // Ignore things that aren't "real" files or dirs
+                    StructStat stat = Os.lstat(file.getPath());
+                    if (!OsConstants.S_ISREG(stat.st_mode)
+                            && !OsConstants.S_ISDIR(stat.st_mode)) {
+                        if (DEBUG) Log.i(TAG, "Not a file/dir (skipping)!: " + file);
+                        continue;
+                    }
+
+                    // For all other verification, look at the canonicalized path
                     filePath = file.getCanonicalPath();
 
                     // prune this subtree?
-                    if (manifestExcludes != null && manifestExcludes.contains(filePath)) {
+                    if (manifestExcludes != null
+                            && manifestExcludesContainFilePath(manifestExcludes, filePath)) {
                         continue;
                     }
                     if (systemExcludes != null && systemExcludes.contains(filePath)) {
@@ -544,11 +782,7 @@ public abstract class BackupAgent extends ContextWrapper {
                     }
 
                     // If it's a directory, enqueue its contents for scanning.
-                    StructStat stat = Os.lstat(filePath);
-                    if (OsConstants.S_ISLNK(stat.st_mode)) {
-                        if (DEBUG) Log.i(TAG, "Symlink (skipping)!: " + file);
-                        continue;
-                    } else if (OsConstants.S_ISDIR(stat.st_mode)) {
+                    if (OsConstants.S_ISDIR(stat.st_mode)) {
                         File[] contents = file.listFiles();
                         if (contents != null) {
                             for (File entry : contents) {
@@ -574,6 +808,17 @@ public abstract class BackupAgent extends ContextWrapper {
                 FullBackup.backupToTar(packageName, domain, null, domainPath, filePath, output);
             }
         }
+    }
+
+    private boolean manifestExcludesContainFilePath(
+        ArraySet<PathWithRequiredFlags> manifestExcludes, String filePath) {
+        for (PathWithRequiredFlags exclude : manifestExcludes) {
+            String excludePath = exclude.getPath();
+            if (excludePath != null && excludePath.equals(filePath)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -622,8 +867,8 @@ public abstract class BackupAgent extends ContextWrapper {
             return false;
         }
 
-        Map<String, Set<String>> includes = null;
-        ArraySet<String> excludes = null;
+        Map<String, Set<PathWithRequiredFlags>> includes = null;
+        ArraySet<PathWithRequiredFlags> excludes = null;
         final String destinationCanonicalPath = destination.getCanonicalPath();
         try {
             includes = bs.maybeParseAndGetCanonicalIncludePaths();
@@ -639,7 +884,7 @@ public abstract class BackupAgent extends ContextWrapper {
         }
 
         if (excludes != null &&
-                isFileSpecifiedInPathList(destination, excludes)) {
+                BackupUtils.isFileSpecifiedInPathList(destination, excludes)) {
             if (Log.isLoggable(FullBackup.TAG_XML_PARSER, Log.VERBOSE)) {
                 Log.v(FullBackup.TAG_XML_PARSER,
                         "onRestoreFile: \"" + destinationCanonicalPath + "\": listed in"
@@ -652,8 +897,9 @@ public abstract class BackupAgent extends ContextWrapper {
             // Rather than figure out the <include/> domain based on the path (a lot of code, and
             // it's a small list), we'll go through and look for it.
             boolean explicitlyIncluded = false;
-            for (Set<String> domainIncludes : includes.values()) {
-                explicitlyIncluded |= isFileSpecifiedInPathList(destination, domainIncludes);
+            for (Set<PathWithRequiredFlags> domainIncludes : includes.values()) {
+                explicitlyIncluded |=
+                        BackupUtils.isFileSpecifiedInPathList(destination, domainIncludes);
                 if (explicitlyIncluded) {
                     break;
                 }
@@ -672,34 +918,8 @@ public abstract class BackupAgent extends ContextWrapper {
     }
 
     /**
-     * @return True if the provided file is either directly in the provided list, or the provided
-     * file is within a directory in the list.
-     */
-    private boolean isFileSpecifiedInPathList(File file, Collection<String> canonicalPathList)
-            throws IOException {
-        for (String canonicalPath : canonicalPathList) {
-            File fileFromList = new File(canonicalPath);
-            if (fileFromList.isDirectory()) {
-                if (file.isDirectory()) {
-                    // If they are both directories check exact equals.
-                    return file.equals(fileFromList);
-                } else {
-                    // O/w we have to check if the file is within the directory from the list.
-                    return file.getCanonicalPath().startsWith(canonicalPath);
-                }
-            } else {
-                if (file.equals(fileFromList)) {
-                    // Need to check the explicit "equals" so we don't end up with substrings.
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /**
      * Only specialized platform agents should overload this entry point to support
-     * restores to crazy non-app locations.
+     * restores to non-app locations.
      * @hide
      */
     protected void onRestoreFile(ParcelFileDescriptor data, long size,
@@ -773,18 +993,24 @@ public abstract class BackupAgent extends ContextWrapper {
         private static final String TAG = "BackupServiceBinder";
 
         @Override
-        public void doBackup(ParcelFileDescriptor oldState,
+        public void doBackup(
+                ParcelFileDescriptor oldState,
                 ParcelFileDescriptor data,
                 ParcelFileDescriptor newState,
-                int token, IBackupManager callbackBinder) throws RemoteException {
+                long quotaBytes,
+                IBackupCallback callbackBinder,
+                int transportFlags) throws RemoteException {
             // Ensure that we're running with the app's normal permission level
             long ident = Binder.clearCallingIdentity();
 
             if (DEBUG) Log.v(TAG, "doBackup() invoked");
-            BackupDataOutput output = new BackupDataOutput(data.getFileDescriptor());
+            BackupDataOutput output = new BackupDataOutput(
+                    data.getFileDescriptor(), quotaBytes, transportFlags);
 
+            long result = RESULT_ERROR;
             try {
                 BackupAgent.this.onBackup(oldState, output, newState);
+                result = RESULT_SUCCESS;
             } catch (IOException ex) {
                 Log.d(TAG, "onBackup (" + BackupAgent.this.getClass().getName() + ") threw", ex);
                 throw new RuntimeException(ex);
@@ -799,24 +1025,52 @@ public abstract class BackupAgent extends ContextWrapper {
 
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, 0);
+                    callbackBinder.operationComplete(result);
                 } catch (RemoteException e) {
-                    // we'll time out anyway, so we're safe
+                    // We will time out anyway.
+                }
+
+                // Don't close the fd out from under the system service if this was local
+                if (Binder.getCallingPid() != Process.myPid()) {
+                    IoUtils.closeQuietly(oldState);
+                    IoUtils.closeQuietly(data);
+                    IoUtils.closeQuietly(newState);
                 }
             }
         }
 
         @Override
-        public void doRestore(ParcelFileDescriptor data, int appVersionCode,
-                ParcelFileDescriptor newState,
-                int token, IBackupManager callbackBinder) throws RemoteException {
+        public void doRestore(ParcelFileDescriptor data, long appVersionCode,
+                ParcelFileDescriptor newState, int token, IBackupManager callbackBinder)
+                throws RemoteException {
+            doRestoreInternal(data, appVersionCode, newState, token, callbackBinder,
+                    /* excludedKeys */ null);
+        }
+
+        @Override
+        public void doRestoreWithExcludedKeys(ParcelFileDescriptor data, long appVersionCode,
+                ParcelFileDescriptor newState, int token, IBackupManager callbackBinder,
+                List<String> excludedKeys) throws RemoteException {
+            doRestoreInternal(data, appVersionCode, newState, token, callbackBinder, excludedKeys);
+        }
+
+        private void doRestoreInternal(ParcelFileDescriptor data, long appVersionCode,
+                ParcelFileDescriptor newState, int token, IBackupManager callbackBinder,
+                List<String> excludedKeys) throws RemoteException {
             // Ensure that we're running with the app's normal permission level
             long ident = Binder.clearCallingIdentity();
 
             if (DEBUG) Log.v(TAG, "doRestore() invoked");
+
+            // Ensure that any side-effect SharedPreferences writes have landed *before*
+            // we may be about to rewrite the file out from underneath
+            waitForSharedPrefs();
+
             BackupDataInput input = new BackupDataInput(data.getFileDescriptor());
             try {
-                BackupAgent.this.onRestore(input, appVersionCode, newState);
+                BackupAgent.this.onRestore(input, appVersionCode, newState,
+                        excludedKeys != null ? new HashSet<>(excludedKeys)
+                                : Collections.emptySet());
             } catch (IOException ex) {
                 Log.d(TAG, "onRestore (" + BackupAgent.this.getClass().getName() + ") threw", ex);
                 throw new RuntimeException(ex);
@@ -824,21 +1078,26 @@ public abstract class BackupAgent extends ContextWrapper {
                 Log.d(TAG, "onRestore (" + BackupAgent.this.getClass().getName() + ") threw", ex);
                 throw ex;
             } finally {
-                // Ensure that any side-effect SharedPreferences writes have landed
-                waitForSharedPrefs();
+                // And bring live SharedPreferences instances up to date
+                reloadSharedPreferences();
 
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, 0);
+                    callbackBinder.opCompleteForUser(getBackupUserId(), token, 0);
                 } catch (RemoteException e) {
                     // we'll time out anyway, so we're safe
+                }
+
+                if (Binder.getCallingPid() != Process.myPid()) {
+                    IoUtils.closeQuietly(data);
+                    IoUtils.closeQuietly(newState);
                 }
             }
         }
 
         @Override
         public void doFullBackup(ParcelFileDescriptor data,
-                int token, IBackupManager callbackBinder) {
+                long quotaBytes, int token, IBackupManager callbackBinder, int transportFlags) {
             // Ensure that we're running with the app's normal permission level
             long ident = Binder.clearCallingIdentity();
 
@@ -849,7 +1108,8 @@ public abstract class BackupAgent extends ContextWrapper {
             waitForSharedPrefs();
 
             try {
-                BackupAgent.this.onFullBackup(new FullBackupDataOutput(data));
+                BackupAgent.this.onFullBackup(new FullBackupDataOutput(
+                        data, quotaBytes, transportFlags));
             } catch (IOException ex) {
                 Log.d(TAG, "onFullBackup (" + BackupAgent.this.getClass().getName() + ") threw", ex);
                 throw new RuntimeException(ex);
@@ -872,17 +1132,23 @@ public abstract class BackupAgent extends ContextWrapper {
 
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, 0);
+                    callbackBinder.opCompleteForUser(getBackupUserId(), token, 0);
                 } catch (RemoteException e) {
                     // we'll time out anyway, so we're safe
+                }
+
+                if (Binder.getCallingPid() != Process.myPid()) {
+                    IoUtils.closeQuietly(data);
                 }
             }
         }
 
-        public void doMeasureFullBackup(int token, IBackupManager callbackBinder) {
+        public void doMeasureFullBackup(long quotaBytes, int token, IBackupManager callbackBinder,
+                int transportFlags) {
             // Ensure that we're running with the app's normal permission level
             final long ident = Binder.clearCallingIdentity();
-            FullBackupDataOutput measureOutput = new FullBackupDataOutput();
+            FullBackupDataOutput measureOutput =
+                    new FullBackupDataOutput(quotaBytes, transportFlags);
 
             waitForSharedPrefs();
             try {
@@ -896,7 +1162,8 @@ public abstract class BackupAgent extends ContextWrapper {
             } finally {
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, measureOutput.getSize());
+                    callbackBinder.opCompleteForUser(getBackupUserId(), token,
+                            measureOutput.getSize());
                 } catch (RemoteException e) {
                     // timeout, so we're safe
                 }
@@ -916,12 +1183,18 @@ public abstract class BackupAgent extends ContextWrapper {
             } finally {
                 // Ensure that any side-effect SharedPreferences writes have landed
                 waitForSharedPrefs();
+                // And bring live SharedPreferences instances up to date
+                reloadSharedPreferences();
 
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, 0);
+                    callbackBinder.opCompleteForUser(getBackupUserId(), token, 0);
                 } catch (RemoteException e) {
                     // we'll time out anyway, so we're safe
+                }
+
+                if (Binder.getCallingPid() != Process.myPid()) {
+                    IoUtils.closeQuietly(data);
                 }
             }
         }
@@ -940,7 +1213,7 @@ public abstract class BackupAgent extends ContextWrapper {
 
                 Binder.restoreCallingIdentity(ident);
                 try {
-                    callbackBinder.opComplete(token, 0);
+                    callbackBinder.opCompleteForUser(getBackupUserId(), token, 0);
                 } catch (RemoteException e) {
                     // we'll time out anyway, so we're safe
                 }
@@ -950,6 +1223,33 @@ public abstract class BackupAgent extends ContextWrapper {
         @Override
         public void fail(String message) {
             getHandler().post(new FailRunnable(message));
+        }
+
+        @Override
+        public void doQuotaExceeded(
+                long backupDataBytes,
+                long quotaBytes,
+                IBackupCallback callbackBinder) {
+            long ident = Binder.clearCallingIdentity();
+
+            long result = RESULT_ERROR;
+            try {
+                BackupAgent.this.onQuotaExceeded(backupDataBytes, quotaBytes);
+                result = RESULT_SUCCESS;
+            } catch (Exception e) {
+                Log.d(TAG, "onQuotaExceeded(" + BackupAgent.this.getClass().getName() + ") threw",
+                        e);
+                throw e;
+            } finally {
+                waitForSharedPrefs();
+                Binder.restoreCallingIdentity(ident);
+
+                try {
+                    callbackBinder.operationComplete(result);
+                } catch (RemoteException e) {
+                    // We will time out anyway.
+                }
+            }
         }
     }
 

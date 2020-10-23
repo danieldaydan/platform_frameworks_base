@@ -23,10 +23,13 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.StringRes;
 import android.annotation.StyleRes;
+import android.annotation.TestApi;
 import android.app.ActionBar;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.graphics.drawable.Drawable;
+import android.os.Build;
 import android.os.Parcel;
 import android.os.Parcelable;
 import android.text.Layout;
@@ -41,6 +44,8 @@ import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
+import android.view.inspector.InspectableProperty;
 
 import com.android.internal.R;
 import com.android.internal.view.menu.MenuBuilder;
@@ -98,13 +103,43 @@ import java.util.List;
  * <p>In modern Android UIs developers should lean more on a visually distinct color scheme for
  * toolbars than on their application icon. The use of application icon plus title as a standard
  * layout is discouraged on API 21 devices and newer.</p>
+ *
+ * @attr ref android.R.styleable#Toolbar_buttonGravity
+ * @attr ref android.R.styleable#Toolbar_collapseContentDescription
+ * @attr ref android.R.styleable#Toolbar_collapseIcon
+ * @attr ref android.R.styleable#Toolbar_contentInsetEnd
+ * @attr ref android.R.styleable#Toolbar_contentInsetLeft
+ * @attr ref android.R.styleable#Toolbar_contentInsetRight
+ * @attr ref android.R.styleable#Toolbar_contentInsetStart
+ * @attr ref android.R.styleable#Toolbar_contentInsetStartWithNavigation
+ * @attr ref android.R.styleable#Toolbar_contentInsetEndWithActions
+ * @attr ref android.R.styleable#Toolbar_gravity
+ * @attr ref android.R.styleable#Toolbar_logo
+ * @attr ref android.R.styleable#Toolbar_logoDescription
+ * @attr ref android.R.styleable#Toolbar_maxButtonHeight
+ * @attr ref android.R.styleable#Toolbar_navigationContentDescription
+ * @attr ref android.R.styleable#Toolbar_navigationIcon
+ * @attr ref android.R.styleable#Toolbar_popupTheme
+ * @attr ref android.R.styleable#Toolbar_subtitle
+ * @attr ref android.R.styleable#Toolbar_subtitleTextAppearance
+ * @attr ref android.R.styleable#Toolbar_subtitleTextColor
+ * @attr ref android.R.styleable#Toolbar_title
+ * @attr ref android.R.styleable#Toolbar_titleMargin
+ * @attr ref android.R.styleable#Toolbar_titleMarginBottom
+ * @attr ref android.R.styleable#Toolbar_titleMarginEnd
+ * @attr ref android.R.styleable#Toolbar_titleMarginStart
+ * @attr ref android.R.styleable#Toolbar_titleMarginTop
+ * @attr ref android.R.styleable#Toolbar_titleTextAppearance
+ * @attr ref android.R.styleable#Toolbar_titleTextColor
  */
 public class Toolbar extends ViewGroup {
     private static final String TAG = "Toolbar";
 
     private ActionMenuView mMenuView;
+    @UnsupportedAppUsage
     private TextView mTitleTextView;
     private TextView mSubtitleTextView;
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private ImageButton mNavButtonView;
     private ImageView mLogoView;
 
@@ -127,12 +162,18 @@ public class Toolbar extends ViewGroup {
 
     private int mMaxButtonHeight;
 
+    @UnsupportedAppUsage
     private int mTitleMarginStart;
+    @UnsupportedAppUsage
     private int mTitleMarginEnd;
+    @UnsupportedAppUsage
     private int mTitleMarginTop;
+    @UnsupportedAppUsage
     private int mTitleMarginBottom;
 
-    private final RtlSpacingHelper mContentInsets = new RtlSpacingHelper();
+    private RtlSpacingHelper mContentInsets;
+    private int mContentInsetStartWithNavigation;
+    private int mContentInsetEndWithActions;
 
     private int mGravity = Gravity.START | Gravity.CENTER_VERTICAL;
 
@@ -196,6 +237,8 @@ public class Toolbar extends ViewGroup {
 
         final TypedArray a = context.obtainStyledAttributes(attrs, R.styleable.Toolbar,
                 defStyleAttr, defStyleRes);
+        saveAttributeDataForStyleable(context, R.styleable.Toolbar,
+                attrs, a, defStyleAttr, defStyleRes);
 
         mTitleTextAppearance = a.getResourceId(R.styleable.Toolbar_titleTextAppearance, 0);
         mSubtitleTextAppearance = a.getResourceId(R.styleable.Toolbar_subtitleTextAppearance, 0);
@@ -203,7 +246,7 @@ public class Toolbar extends ViewGroup {
         mGravity = a.getInteger(R.styleable.Toolbar_gravity, mGravity);
         mButtonGravity = a.getInteger(R.styleable.Toolbar_buttonGravity, Gravity.TOP);
         mTitleMarginStart = mTitleMarginEnd = mTitleMarginTop = mTitleMarginBottom =
-                a.getDimensionPixelOffset(R.styleable.Toolbar_titleMargins, 0);
+                a.getDimensionPixelOffset(R.styleable.Toolbar_titleMargin, 0);
 
         final int marginStart = a.getDimensionPixelOffset(R.styleable.Toolbar_titleMarginStart, -1);
         if (marginStart >= 0) {
@@ -239,12 +282,18 @@ public class Toolbar extends ViewGroup {
         final int contentInsetRight =
                 a.getDimensionPixelSize(R.styleable.Toolbar_contentInsetRight, 0);
 
+        ensureContentInsets();
         mContentInsets.setAbsolute(contentInsetLeft, contentInsetRight);
 
         if (contentInsetStart != RtlSpacingHelper.UNDEFINED ||
                 contentInsetEnd != RtlSpacingHelper.UNDEFINED) {
             mContentInsets.setRelative(contentInsetStart, contentInsetEnd);
         }
+
+        mContentInsetStartWithNavigation = a.getDimensionPixelOffset(
+                R.styleable.Toolbar_contentInsetStartWithNavigation, RtlSpacingHelper.UNDEFINED);
+        mContentInsetEndWithActions = a.getDimensionPixelOffset(
+                R.styleable.Toolbar_contentInsetEndWithActions, RtlSpacingHelper.UNDEFINED);
 
         mCollapseIcon = a.getDrawable(R.styleable.Toolbar_collapseIcon);
         mCollapseDescription = a.getText(R.styleable.Toolbar_collapseContentDescription);
@@ -294,6 +343,26 @@ public class Toolbar extends ViewGroup {
         a.recycle();
     }
 
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+
+        // If the container is a cluster, unmark itself as a cluster to avoid having nested
+        // clusters.
+        ViewParent parent = getParent();
+        while (parent != null && parent instanceof ViewGroup) {
+            final ViewGroup vgParent = (ViewGroup) parent;
+            if (vgParent.isKeyboardNavigationCluster()) {
+                setKeyboardNavigationCluster(false);
+                if (vgParent.getTouchscreenBlocksFocus()) {
+                    setTouchscreenBlocksFocus(false);
+                }
+                break;
+            }
+            parent = vgParent.getParent();
+        }
+    }
+
     /**
      * Specifies the theme to use when inflating popup menus. By default, uses
      * the same theme as the toolbar itself.
@@ -317,13 +386,128 @@ public class Toolbar extends ViewGroup {
      *         0 if menus are inflated against the toolbar theme
      * @see #setPopupTheme(int)
      */
+    @InspectableProperty
     public int getPopupTheme() {
         return mPopupTheme;
+    }
+
+    /**
+     * Sets the title margin.
+     *
+     * @param start the starting title margin in pixels
+     * @param top the top title margin in pixels
+     * @param end the ending title margin in pixels
+     * @param bottom the bottom title margin in pixels
+     * @see #getTitleMarginStart()
+     * @see #getTitleMarginTop()
+     * @see #getTitleMarginEnd()
+     * @see #getTitleMarginBottom()
+     * @attr ref android.R.styleable#Toolbar_titleMargin
+     */
+    public void setTitleMargin(int start, int top, int end, int bottom) {
+        mTitleMarginStart = start;
+        mTitleMarginTop = top;
+        mTitleMarginEnd = end;
+        mTitleMarginBottom = bottom;
+
+        requestLayout();
+    }
+
+    /**
+     * @return the starting title margin in pixels
+     * @see #setTitleMarginStart(int)
+     * @attr ref android.R.styleable#Toolbar_titleMarginStart
+     */
+    @InspectableProperty
+    public int getTitleMarginStart() {
+        return mTitleMarginStart;
+    }
+
+    /**
+     * Sets the starting title margin in pixels.
+     *
+     * @param margin the starting title margin in pixels
+     * @see #getTitleMarginStart()
+     * @attr ref android.R.styleable#Toolbar_titleMarginStart
+     */
+    public void setTitleMarginStart(int margin) {
+        mTitleMarginStart = margin;
+
+        requestLayout();
+    }
+
+    /**
+     * @return the top title margin in pixels
+     * @see #setTitleMarginTop(int)
+     * @attr ref android.R.styleable#Toolbar_titleMarginTop
+     */
+    @InspectableProperty
+    public int getTitleMarginTop() {
+        return mTitleMarginTop;
+    }
+
+    /**
+     * Sets the top title margin in pixels.
+     *
+     * @param margin the top title margin in pixels
+     * @see #getTitleMarginTop()
+     * @attr ref android.R.styleable#Toolbar_titleMarginTop
+     */
+    public void setTitleMarginTop(int margin) {
+        mTitleMarginTop = margin;
+
+        requestLayout();
+    }
+
+    /**
+     * @return the ending title margin in pixels
+     * @see #setTitleMarginEnd(int)
+     * @attr ref android.R.styleable#Toolbar_titleMarginEnd
+     */
+    @InspectableProperty
+    public int getTitleMarginEnd() {
+        return mTitleMarginEnd;
+    }
+
+    /**
+     * Sets the ending title margin in pixels.
+     *
+     * @param margin the ending title margin in pixels
+     * @see #getTitleMarginEnd()
+     * @attr ref android.R.styleable#Toolbar_titleMarginEnd
+     */
+    public void setTitleMarginEnd(int margin) {
+        mTitleMarginEnd = margin;
+
+        requestLayout();
+    }
+
+    /**
+     * @return the bottom title margin in pixels
+     * @see #setTitleMarginBottom(int)
+     * @attr ref android.R.styleable#Toolbar_titleMarginBottom
+     */
+    @InspectableProperty
+    public int getTitleMarginBottom() {
+        return mTitleMarginBottom;
+    }
+
+    /**
+     * Sets the bottom title margin in pixels.
+     *
+     * @param margin the bottom title margin in pixels
+     * @see #getTitleMarginBottom()
+     * @attr ref android.R.styleable#Toolbar_titleMarginBottom
+     */
+    public void setTitleMarginBottom(int margin) {
+        mTitleMarginBottom = margin;
+        requestLayout();
     }
 
     @Override
     public void onRtlPropertiesChanged(@ResolvedLayoutDir int layoutDirection) {
         super.onRtlPropertiesChanged(layoutDirection);
+        ensureContentInsets();
         mContentInsets.setDirection(layoutDirection == LAYOUT_DIRECTION_RTL);
     }
 
@@ -474,6 +658,7 @@ public class Toolbar extends ViewGroup {
      * @see #setLogo(int)
      * @see #setLogo(android.graphics.drawable.Drawable)
      */
+    @InspectableProperty
     public Drawable getLogo() {
         return mLogoView != null ? mLogoView.getDrawable() : null;
     }
@@ -512,6 +697,7 @@ public class Toolbar extends ViewGroup {
      *
      * @return A description of the logo
      */
+    @InspectableProperty
     public CharSequence getLogoDescription() {
         return mLogoView != null ? mLogoView.getContentDescription() : null;
     }
@@ -559,6 +745,7 @@ public class Toolbar extends ViewGroup {
      *
      * @return The current title.
      */
+    @InspectableProperty
     public CharSequence getTitle() {
         return mTitleText;
     }
@@ -615,6 +802,7 @@ public class Toolbar extends ViewGroup {
      *
      * @return The current subtitle
      */
+    @InspectableProperty
     public CharSequence getSubtitle() {
         return mSubtitleText;
     }
@@ -719,6 +907,7 @@ public class Toolbar extends ViewGroup {
      *
      * @attr ref android.R.styleable#Toolbar_navigationContentDescription
      */
+    @InspectableProperty
     @Nullable
     public CharSequence getNavigationContentDescription() {
         return mNavButtonView != null ? mNavButtonView.getContentDescription() : null;
@@ -811,6 +1000,7 @@ public class Toolbar extends ViewGroup {
      *
      * @attr ref android.R.styleable#Toolbar_navigationIcon
      */
+    @InspectableProperty
     @Nullable
     public Drawable getNavigationIcon() {
         return mNavButtonView != null ? mNavButtonView.getDrawable() : null;
@@ -828,6 +1018,109 @@ public class Toolbar extends ViewGroup {
     public void setNavigationOnClickListener(OnClickListener listener) {
         ensureNavButtonView();
         mNavButtonView.setOnClickListener(listener);
+    }
+
+    /**
+     * @hide
+     */
+    @Nullable
+    @TestApi
+    public View getNavigationView() {
+        return mNavButtonView;
+    }
+
+    /**
+     * Retrieve the currently configured content description for the collapse button view.
+     * This will be used to describe the collapse action to users through mechanisms such
+     * as screen readers or tooltips.
+     *
+     * @return The collapse button's content description
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseContentDescription
+     */
+    @InspectableProperty
+    @Nullable
+    public CharSequence getCollapseContentDescription() {
+        return mCollapseButtonView != null ? mCollapseButtonView.getContentDescription() : null;
+    }
+
+    /**
+     * Set a content description for the collapse button if one is present. The content description
+     * will be read via screen readers or other accessibility systems to explain the action of the
+     * collapse button.
+     *
+     * @param resId Resource ID of a content description string to set, or 0 to
+     *              clear the description
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseContentDescription
+     */
+    public void setCollapseContentDescription(@StringRes int resId) {
+        setCollapseContentDescription(resId != 0 ? getContext().getText(resId) : null);
+    }
+
+    /**
+     * Set a content description for the collapse button if one is present. The content description
+     * will be read via screen readers or other accessibility systems to explain the action of the
+     * navigation button.
+     *
+     * @param description Content description to set, or <code>null</code> to
+     *                    clear the content description
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseContentDescription
+     */
+    public void setCollapseContentDescription(@Nullable CharSequence description) {
+        if (!TextUtils.isEmpty(description)) {
+            ensureCollapseButtonView();
+        }
+        if (mCollapseButtonView != null) {
+            mCollapseButtonView.setContentDescription(description);
+        }
+    }
+
+    /**
+     * Return the current drawable used as the collapse icon.
+     *
+     * @return The collapse icon drawable
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseIcon
+     */
+    @InspectableProperty
+    @Nullable
+    public Drawable getCollapseIcon() {
+        return mCollapseButtonView != null ? mCollapseButtonView.getDrawable() : null;
+    }
+
+    /**
+     * Set the icon to use for the toolbar's collapse button.
+     *
+     * <p>The collapse button appears at the start of the toolbar when an action view is present
+     * .</p>
+     *
+     * @param resId Resource ID of a drawable to set
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseIcon
+     */
+    public void setCollapseIcon(@DrawableRes int resId) {
+        setCollapseIcon(getContext().getDrawable(resId));
+    }
+
+    /**
+     * Set the icon to use for the toolbar's collapse button.
+     *
+     * <p>The collapse button appears at the start of the toolbar when an action view is present
+     * .</p>
+     *
+     * @param icon Drawable to set, may be null to use the default icon
+     *
+     * @attr ref android.R.styleable#Toolbar_collapseIcon
+     */
+    public void setCollapseIcon(@Nullable Drawable icon) {
+        if (icon != null) {
+            ensureCollapseButtonView();
+            mCollapseButtonView.setImageDrawable(icon);
+        } else if (mCollapseButtonView != null) {
+            mCollapseButtonView.setImageDrawable(mCollapseIcon);
+        }
     }
 
     /**
@@ -919,7 +1212,7 @@ public class Toolbar extends ViewGroup {
     }
 
     /**
-     * Set the content insets for this toolbar relative to layout direction.
+     * Sets the content insets for this toolbar relative to layout direction.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -933,13 +1226,16 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetEnd()
      * @see #getContentInsetLeft()
      * @see #getContentInsetRight()
+     * @attr ref android.R.styleable#Toolbar_contentInsetEnd
+     * @attr ref android.R.styleable#Toolbar_contentInsetStart
      */
     public void setContentInsetsRelative(int contentInsetStart, int contentInsetEnd) {
+        ensureContentInsets();
         mContentInsets.setRelative(contentInsetStart, contentInsetEnd);
     }
 
     /**
-     * Get the starting content inset for this toolbar.
+     * Gets the starting content inset for this toolbar.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -952,13 +1248,15 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetEnd()
      * @see #getContentInsetLeft()
      * @see #getContentInsetRight()
+     * @attr ref android.R.styleable#Toolbar_contentInsetStart
      */
+    @InspectableProperty
     public int getContentInsetStart() {
-        return mContentInsets.getStart();
+        return mContentInsets != null ? mContentInsets.getStart() : 0;
     }
 
     /**
-     * Get the ending content inset for this toolbar.
+     * Gets the ending content inset for this toolbar.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -971,13 +1269,15 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetStart()
      * @see #getContentInsetLeft()
      * @see #getContentInsetRight()
+     * @attr ref android.R.styleable#Toolbar_contentInsetEnd
      */
+    @InspectableProperty
     public int getContentInsetEnd() {
-        return mContentInsets.getEnd();
+        return mContentInsets != null ? mContentInsets.getEnd() : 0;
     }
 
     /**
-     * Set the content insets for this toolbar.
+     * Sets the content insets for this toolbar.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -991,13 +1291,16 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetEnd()
      * @see #getContentInsetLeft()
      * @see #getContentInsetRight()
+     * @attr ref android.R.styleable#Toolbar_contentInsetLeft
+     * @attr ref android.R.styleable#Toolbar_contentInsetRight
      */
     public void setContentInsetsAbsolute(int contentInsetLeft, int contentInsetRight) {
+        ensureContentInsets();
         mContentInsets.setAbsolute(contentInsetLeft, contentInsetRight);
     }
 
     /**
-     * Get the left content inset for this toolbar.
+     * Gets the left content inset for this toolbar.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -1010,13 +1313,15 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetStart()
      * @see #getContentInsetEnd()
      * @see #getContentInsetRight()
+     * @attr ref android.R.styleable#Toolbar_contentInsetLeft
      */
+    @InspectableProperty
     public int getContentInsetLeft() {
-        return mContentInsets.getLeft();
+        return mContentInsets != null ? mContentInsets.getLeft() : 0;
     }
 
     /**
-     * Get the right content inset for this toolbar.
+     * Gets the right content inset for this toolbar.
      *
      * <p>The content inset affects the valid area for Toolbar content other than
      * the navigation button and menu. Insets define the minimum margin for these components
@@ -1029,9 +1334,161 @@ public class Toolbar extends ViewGroup {
      * @see #getContentInsetStart()
      * @see #getContentInsetEnd()
      * @see #getContentInsetLeft()
+     * @attr ref android.R.styleable#Toolbar_contentInsetRight
      */
+    @InspectableProperty
     public int getContentInsetRight() {
-        return mContentInsets.getRight();
+        return mContentInsets != null ? mContentInsets.getRight() : 0;
+    }
+
+    /**
+     * Gets the start content inset to use when a navigation button is present.
+     *
+     * <p>Different content insets are often called for when additional buttons are present
+     * in the toolbar, as well as at different toolbar sizes. The larger value of
+     * {@link #getContentInsetStart()} and this value will be used during layout.</p>
+     *
+     * @return the start content inset used when a navigation icon has been set in pixels
+     *
+     * @see #setContentInsetStartWithNavigation(int)
+     * @attr ref android.R.styleable#Toolbar_contentInsetStartWithNavigation
+     */
+    @InspectableProperty
+    public int getContentInsetStartWithNavigation() {
+        return mContentInsetStartWithNavigation != RtlSpacingHelper.UNDEFINED
+                ? mContentInsetStartWithNavigation
+                : getContentInsetStart();
+    }
+
+    /**
+     * Sets the start content inset to use when a navigation button is present.
+     *
+     * <p>Different content insets are often called for when additional buttons are present
+     * in the toolbar, as well as at different toolbar sizes. The larger value of
+     * {@link #getContentInsetStart()} and this value will be used during layout.</p>
+     *
+     * @param insetStartWithNavigation the inset to use when a navigation icon has been set
+     *                                 in pixels
+     *
+     * @see #getContentInsetStartWithNavigation()
+     * @attr ref android.R.styleable#Toolbar_contentInsetStartWithNavigation
+     */
+    public void setContentInsetStartWithNavigation(int insetStartWithNavigation) {
+        if (insetStartWithNavigation < 0) {
+            insetStartWithNavigation = RtlSpacingHelper.UNDEFINED;
+        }
+        if (insetStartWithNavigation != mContentInsetStartWithNavigation) {
+            mContentInsetStartWithNavigation = insetStartWithNavigation;
+            if (getNavigationIcon() != null) {
+                requestLayout();
+            }
+        }
+    }
+
+    /**
+     * Gets the end content inset to use when action buttons are present.
+     *
+     * <p>Different content insets are often called for when additional buttons are present
+     * in the toolbar, as well as at different toolbar sizes. The larger value of
+     * {@link #getContentInsetEnd()} and this value will be used during layout.</p>
+     *
+     * @return the end content inset used when a menu has been set in pixels
+     *
+     * @see #setContentInsetEndWithActions(int)
+     * @attr ref android.R.styleable#Toolbar_contentInsetEndWithActions
+     */
+    @InspectableProperty
+    public int getContentInsetEndWithActions() {
+        return mContentInsetEndWithActions != RtlSpacingHelper.UNDEFINED
+                ? mContentInsetEndWithActions
+                : getContentInsetEnd();
+    }
+
+    /**
+     * Sets the start content inset to use when action buttons are present.
+     *
+     * <p>Different content insets are often called for when additional buttons are present
+     * in the toolbar, as well as at different toolbar sizes. The larger value of
+     * {@link #getContentInsetEnd()} and this value will be used during layout.</p>
+     *
+     * @param insetEndWithActions the inset to use when a menu has been set in pixels
+     *
+     * @see #setContentInsetEndWithActions(int)
+     * @attr ref android.R.styleable#Toolbar_contentInsetEndWithActions
+     */
+    public void setContentInsetEndWithActions(int insetEndWithActions) {
+        if (insetEndWithActions < 0) {
+            insetEndWithActions = RtlSpacingHelper.UNDEFINED;
+        }
+        if (insetEndWithActions != mContentInsetEndWithActions) {
+            mContentInsetEndWithActions = insetEndWithActions;
+            if (getNavigationIcon() != null) {
+                requestLayout();
+            }
+        }
+    }
+
+    /**
+     * Gets the content inset that will be used on the starting side of the bar in the current
+     * toolbar configuration.
+     *
+     * @return the current content inset start in pixels
+     *
+     * @see #getContentInsetStartWithNavigation()
+     */
+    public int getCurrentContentInsetStart() {
+        return getNavigationIcon() != null
+                ? Math.max(getContentInsetStart(), Math.max(mContentInsetStartWithNavigation, 0))
+                : getContentInsetStart();
+    }
+
+    /**
+     * Gets the content inset that will be used on the ending side of the bar in the current
+     * toolbar configuration.
+     *
+     * @return the current content inset end in pixels
+     *
+     * @see #getContentInsetEndWithActions()
+     */
+    public int getCurrentContentInsetEnd() {
+        boolean hasActions = false;
+        if (mMenuView != null) {
+            final MenuBuilder mb = mMenuView.peekMenu();
+            hasActions = mb != null && mb.hasVisibleItems();
+        }
+        return hasActions
+                ? Math.max(getContentInsetEnd(), Math.max(mContentInsetEndWithActions, 0))
+                : getContentInsetEnd();
+    }
+
+    /**
+     * Gets the content inset that will be used on the left side of the bar in the current
+     * toolbar configuration.
+     *
+     * @return the current content inset left in pixels
+     *
+     * @see #getContentInsetStartWithNavigation()
+     * @see #getContentInsetEndWithActions()
+     */
+    public int getCurrentContentInsetLeft() {
+        return isLayoutRtl()
+                ? getCurrentContentInsetEnd()
+                : getCurrentContentInsetStart();
+    }
+
+    /**
+     * Gets the content inset that will be used on the right side of the bar in the current
+     * toolbar configuration.
+     *
+     * @return the current content inset right in pixels
+     *
+     * @see #getContentInsetStartWithNavigation()
+     * @see #getContentInsetEndWithActions()
+     */
+    public int getCurrentContentInsetRight() {
+        return isLayoutRtl()
+                ? getCurrentContentInsetStart()
+                : getCurrentContentInsetEnd();
     }
 
     private void ensureNavButtonView() {
@@ -1270,7 +1727,7 @@ public class Toolbar extends ViewGroup {
             childState = combineMeasuredStates(childState, mCollapseButtonView.getMeasuredState());
         }
 
-        final int contentInsetStart = getContentInsetStart();
+        final int contentInsetStart = getCurrentContentInsetStart();
         width += Math.max(contentInsetStart, navWidth);
         collapsingMargins[marginStartIndex] = Math.max(0, contentInsetStart - navWidth);
 
@@ -1284,7 +1741,7 @@ public class Toolbar extends ViewGroup {
             childState = combineMeasuredStates(childState, mMenuView.getMeasuredState());
         }
 
-        final int contentInsetEnd = getContentInsetEnd();
+        final int contentInsetEnd = getCurrentContentInsetEnd();
         width += Math.max(contentInsetEnd, menuWidth);
         collapsingMargins[marginEndIndex] = Math.max(0, contentInsetEnd - menuWidth);
 
@@ -1375,7 +1832,8 @@ public class Toolbar extends ViewGroup {
         collapsingMargins[0] = collapsingMargins[1] = 0;
 
         // Align views within the minimum toolbar height, if set.
-        final int alignmentHeight = getMinimumHeight();
+        final int minHeight = getMinimumHeight();
+        final int alignmentHeight = minHeight >= 0 ? Math.min(minHeight, b - t) : 0;
 
         if (shouldLayout(mNavButtonView)) {
             if (isRtl) {
@@ -1407,10 +1865,12 @@ public class Toolbar extends ViewGroup {
             }
         }
 
-        collapsingMargins[0] = Math.max(0, getContentInsetLeft() - left);
-        collapsingMargins[1] = Math.max(0, getContentInsetRight() - (width - paddingRight - right));
-        left = Math.max(left, getContentInsetLeft());
-        right = Math.min(right, width - paddingRight - getContentInsetRight());
+        final int contentInsetLeft = getCurrentContentInsetLeft();
+        final int contentInsetRight = getCurrentContentInsetRight();
+        collapsingMargins[0] = Math.max(0, contentInsetLeft - left);
+        collapsingMargins[1] = Math.max(0, contentInsetRight - (width - paddingRight - right));
+        left = Math.max(left, contentInsetLeft);
+        right = Math.min(right, width - paddingRight - contentInsetRight);
 
         if (shouldLayout(mExpandedActionView)) {
             if (isRtl) {
@@ -1810,6 +2270,15 @@ public class Toolbar extends ViewGroup {
     public void setMenuCallbacks(MenuPresenter.Callback pcb, MenuBuilder.Callback mcb) {
         mActionMenuPresenterCallback = pcb;
         mMenuBuilderCallback = mcb;
+        if (mMenuView != null) {
+            mMenuView.setMenuCallbacks(pcb, mcb);
+        }
+    }
+
+    private void ensureContentInsets() {
+        if (mContentInsets == null) {
+            mContentInsets = new RtlSpacingHelper();
+        }
     }
 
     /**
@@ -1915,7 +2384,7 @@ public class Toolbar extends ViewGroup {
             out.writeInt(isOverflowOpen ? 1 : 0);
         }
 
-        public static final Creator<SavedState> CREATOR = new Creator<SavedState>() {
+        public static final @android.annotation.NonNull Creator<SavedState> CREATOR = new Creator<SavedState>() {
 
             @Override
             public SavedState createFromParcel(Parcel source) {
@@ -1934,7 +2403,7 @@ public class Toolbar extends ViewGroup {
         MenuItemImpl mCurrentExpandedItem;
 
         @Override
-        public void initForMenu(Context context, MenuBuilder menu) {
+        public void initForMenu(@NonNull Context context, @Nullable MenuBuilder menu) {
             // Clear the expanded action view when menus change.
             if (mMenu != null && mCurrentExpandedItem != null) {
                 mMenu.collapseItemActionView(mCurrentExpandedItem);

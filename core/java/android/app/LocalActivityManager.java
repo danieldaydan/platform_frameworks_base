@@ -16,12 +16,17 @@
 
 package android.app;
 
+import android.app.ActivityThread.ActivityClientRecord;
+import android.app.servertransaction.PendingTransactionActions;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.Window;
+
 import com.android.internal.content.ReferrerIntent;
 
 import java.util.ArrayList;
@@ -70,18 +75,33 @@ public class LocalActivityManager {
     /** Thread our activities are running in. */
     private final ActivityThread mActivityThread;
     /** The containing activity that owns the activities we create. */
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private final Activity mParent;
 
     /** The activity that is currently resumed. */
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private LocalActivityRecord mResumed;
     /** id -> record of all known activities. */
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private final Map<String, LocalActivityRecord> mActivities
             = new HashMap<String, LocalActivityRecord>();
     /** array of all known activities for easy iterating. */
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private final ArrayList<LocalActivityRecord> mActivityArray
             = new ArrayList<LocalActivityRecord>();
 
     /** True if only one activity can be resumed at a time */
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private boolean mSingleMode;
     
     /** Set to true once we find out the container is finishing. */
@@ -108,6 +128,9 @@ public class LocalActivityManager {
         mSingleMode = singleMode;
     }
 
+    @UnsupportedAppUsage(trackingBug = 137825207, maxTargetSdk = Build.VERSION_CODES.Q,
+            publicAlternatives = "Use {@code androidx.fragment.app.Fragment} and "
+                    + "{@code androidx.fragment.app.FragmentManager} instead")
     private void moveToState(LocalActivityRecord r, int desiredState) {
         if (r.curState == RESTORED || r.curState == DESTROYED) {
             // startActivity() has not yet been called, so nothing to do.
@@ -134,17 +157,32 @@ public class LocalActivityManager {
                 r.activityInfo = mActivityThread.resolveActivityInfo(r.intent);
             }
             r.activity = mActivityThread.startActivityNow(
-                    mParent, r.id, r.intent, r.activityInfo, r, r.instanceState, instance);
+                    mParent, r.id, r.intent, r.activityInfo, r, r.instanceState, instance, r);
             if (r.activity == null) {
                 return;
             }
             r.window = r.activity.getWindow();
             r.instanceState = null;
+
+            final ActivityClientRecord clientRecord = mActivityThread.getActivityClient(r);
+            final PendingTransactionActions pendingActions;
+
+            if (!r.activity.mFinished) {
+                // This matches pending actions set in ActivityThread#handleLaunchActivity
+                pendingActions = new PendingTransactionActions();
+                pendingActions.setOldState(clientRecord.state);
+                pendingActions.setRestoreInstanceState(true);
+                pendingActions.setCallOnPostCreate(true);
+            } else {
+                pendingActions = null;
+            }
+
+            mActivityThread.handleStartActivity(r, pendingActions);
             r.curState = STARTED;
             
             if (desiredState == RESUMED) {
                 if (localLOGV) Log.v(TAG, r.id + ": resuming");
-                mActivityThread.performResumeActivity(r, true);
+                mActivityThread.performResumeActivity(r, true, "moveToState-INITIALIZING");
                 r.curState = RESUMED;
             }
             
@@ -161,13 +199,13 @@ public class LocalActivityManager {
             case CREATED:
                 if (desiredState == STARTED) {
                     if (localLOGV) Log.v(TAG, r.id + ": restarting");
-                    mActivityThread.performRestartActivity(r);
+                    mActivityThread.performRestartActivity(r, true /* start */);
                     r.curState = STARTED;
                 }
                 if (desiredState == RESUMED) {
                     if (localLOGV) Log.v(TAG, r.id + ": restarting and resuming");
-                    mActivityThread.performRestartActivity(r);
-                    mActivityThread.performResumeActivity(r, true);
+                    mActivityThread.performRestartActivity(r, true /* start */);
+                    mActivityThread.performResumeActivity(r, true, "moveToState-CREATED");
                     r.curState = RESUMED;
                 }
                 return;
@@ -176,13 +214,13 @@ public class LocalActivityManager {
                 if (desiredState == RESUMED) {
                     // Need to resume it...
                     if (localLOGV) Log.v(TAG, r.id + ": resuming");
-                    mActivityThread.performResumeActivity(r, true);
+                    mActivityThread.performResumeActivity(r, true, "moveToState-STARTED");
                     r.instanceState = null;
                     r.curState = RESUMED;
                 }
                 if (desiredState == CREATED) {
                     if (localLOGV) Log.v(TAG, r.id + ": stopping");
-                    mActivityThread.performStopActivity(r, false);
+                    mActivityThread.performStopActivity(r, false, "moveToState-STARTED");
                     r.curState = CREATED;
                 }
                 return;
@@ -197,7 +235,7 @@ public class LocalActivityManager {
                     if (localLOGV) Log.v(TAG, r.id + ": pausing");
                     performPause(r, mFinishing);
                     if (localLOGV) Log.v(TAG, r.id + ": stopping");
-                    mActivityThread.performStopActivity(r, false);
+                    mActivityThread.performStopActivity(r, false, "moveToState-RESUMED");
                     r.curState = CREATED;
                 }
                 return;
@@ -205,9 +243,9 @@ public class LocalActivityManager {
     }
     
     private void performPause(LocalActivityRecord r, boolean finishing) {
-        boolean needState = r.instanceState == null;
-        Bundle instanceState = mActivityThread.performPauseActivity(r,
-                finishing, needState);
+        final boolean needState = r.instanceState == null;
+        final Bundle instanceState = mActivityThread.performPauseActivity(r, finishing,
+                "performPause", null /* pendingActions */);
         if (needState) {
             r.instanceState = instanceState;
         }
@@ -314,7 +352,7 @@ public class LocalActivityManager {
                     ArrayList<ReferrerIntent> intents = new ArrayList<>(1);
                     intents.add(new ReferrerIntent(intent, mParent.getPackageName()));
                     if (localLOGV) Log.v(TAG, r.id + ": new intent");
-                    mActivityThread.performNewIntents(r, intents);
+                    mActivityThread.handleNewIntent(r, intents);
                     r.intent = intent;
                     moveToState(r, mCurState);
                     if (mSingleMode) {
@@ -361,7 +399,8 @@ public class LocalActivityManager {
             performPause(r, finish);
         }
         if (localLOGV) Log.v(TAG, r.id + ": destroying");
-        mActivityThread.performDestroyActivity(r, finish);
+        mActivityThread.performDestroyActivity(r, finish, 0 /* configChanges */,
+                false /* getNonConfigInstance */, "LocalActivityManager::performDestroy");
         r.activity = null;
         r.window = null;
         if (finish) {
@@ -625,7 +664,8 @@ public class LocalActivityManager {
         for (int i=0; i<N; i++) {
             LocalActivityRecord r = mActivityArray.get(i);
             if (localLOGV) Log.v(TAG, r.id + ": destroying");
-            mActivityThread.performDestroyActivity(r, finishing);
+            mActivityThread.performDestroyActivity(r, finishing, 0 /* configChanges */,
+                    false /* getNonConfigInstance */, "LocalActivityManager::dispatchDestroy");
         }
         mActivities.clear();
         mActivityArray.clear();

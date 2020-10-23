@@ -2,9 +2,7 @@
 
 package android.service.media;
 
-import android.content.res.Configuration;
 import android.service.media.IMediaBrowserServiceCallbacks;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.ResultReceiver;
 
@@ -17,7 +15,11 @@ oneway interface IMediaBrowserService {
     void connect(String pkg, in Bundle rootHints, IMediaBrowserServiceCallbacks callbacks);
     void disconnect(IMediaBrowserServiceCallbacks callbacks);
 
-    void addSubscription(String uri, IMediaBrowserServiceCallbacks callbacks);
-    void removeSubscription(String uri, IMediaBrowserServiceCallbacks callbacks);
-    void getMediaItem(String uri, in ResultReceiver cb);
+    void addSubscriptionDeprecated(String uri, IMediaBrowserServiceCallbacks callbacks);
+    void removeSubscriptionDeprecated(String uri, IMediaBrowserServiceCallbacks callbacks);
+
+    void getMediaItem(String uri, in ResultReceiver cb, IMediaBrowserServiceCallbacks callbacks);
+    void addSubscription(String uri, in IBinder token, in Bundle options,
+            IMediaBrowserServiceCallbacks callbacks);
+    void removeSubscription(String uri, in IBinder token, IMediaBrowserServiceCallbacks callbacks);
 }

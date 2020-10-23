@@ -21,8 +21,11 @@ import android.view.KeyEvent;
 import android.view.inputmethod.CompletionInfo;
 import android.view.inputmethod.CorrectionInfo;
 import android.view.inputmethod.ExtractedTextRequest;
+import android.view.inputmethod.InputContentInfo;
 
-import com.android.internal.view.IInputContextCallback;
+import com.android.internal.inputmethod.ICharSequenceResultCallback;
+import com.android.internal.inputmethod.IExtractedTextResultCallback;
+import com.android.internal.inputmethod.IIntResultCallback;
 
 /**
  * Interface from an input method to the application, allowing it to perform
@@ -30,16 +33,17 @@ import com.android.internal.view.IInputContextCallback;
  * {@hide}
  */
  oneway interface IInputContext {
-    void getTextBeforeCursor(int length, int flags, int seq, IInputContextCallback callback); 
+    void getTextBeforeCursor(int length, int flags, ICharSequenceResultCallback callback);
 
-    void getTextAfterCursor(int length, int flags, int seq, IInputContextCallback callback);
-    
-    void getCursorCapsMode(int reqModes, int seq, IInputContextCallback callback);
-    
-    void getExtractedText(in ExtractedTextRequest request, int flags, int seq,
-            IInputContextCallback callback);
-    
-    void deleteSurroundingText(int leftLength, int rightLength);
+    void getTextAfterCursor(int length, int flags, ICharSequenceResultCallback callback);
+
+    void getCursorCapsMode(int reqModes, IIntResultCallback callback);
+
+    void getExtractedText(in ExtractedTextRequest request, int flags,
+            IExtractedTextResultCallback callback);
+
+    void deleteSurroundingText(int beforeLength, int afterLength);
+    void deleteSurroundingTextInCodePoints(int beforeLength, int afterLength);
 
     void setComposingText(CharSequence text, int newCursorPosition);
 
@@ -60,9 +64,7 @@ import com.android.internal.view.IInputContextCallback;
     void beginBatchEdit();
     
     void endBatchEdit();
-    
-    void reportFullscreenMode(boolean enabled);
-    
+
     void sendKeyEvent(in KeyEvent event);
     
     void clearMetaKeyStates(int states);
@@ -71,8 +73,10 @@ import com.android.internal.view.IInputContextCallback;
 
     void setComposingRegion(int start, int end);
 
-    void getSelectedText(int flags, int seq, IInputContextCallback callback);
+    void getSelectedText(int flags, ICharSequenceResultCallback callback);
 
-    void requestUpdateCursorAnchorInfo(in int cursorUpdateMode, int seq,
-            IInputContextCallback callback);
+    void requestUpdateCursorAnchorInfo(int cursorUpdateMode, IIntResultCallback callback);
+
+    void commitContent(in InputContentInfo inputContentInfo, int flags, in Bundle opts,
+            IIntResultCallback callback);
 }

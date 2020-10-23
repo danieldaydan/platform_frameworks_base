@@ -1,5 +1,4 @@
-/* //device/libs/android_runtime/android_server_AlarmManagerService.cpp
-**
+/*
 ** Copyright 2006, The Android Open Source Project
 **
 ** Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +16,10 @@
 
 #define LOG_TAG "AlarmManagerService"
 
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 #include "jni.h"
+#include <android-base/file.h>
+#include <android-base/unique_fd.h>
 #include <utils/Log.h>
 #include <utils/misc.h>
 #include <utils/String8.h>
@@ -37,13 +38,29 @@
 #include <errno.h>
 #include <unistd.h>
 #include <linux/ioctl.h>
-#include <linux/android_alarm.h>
 #include <linux/rtc.h>
 
+#include <array>
+#include <limits>
 #include <memory>
 
 namespace android {
 
+static constexpr int ANDROID_ALARM_TIME_CHANGE_MASK = 1 << 16;
+
+/**
+ * The AlarmManager alarm constants:
+ *
+ *   RTC_WAKEUP
+ *   RTC
+ *   REALTIME_WAKEUP
+ *   REALTIME
+ *   SYSTEMTIME (only defined in old alarm driver header, possibly unused?)
+ *
+ * We also need an extra CLOCK_REALTIME fd which exists specifically to be
+ * canceled on RTC changes.
+ */
+static const size_t ANDROID_ALARM_TYPE_COUNT = 5;
 static const size_t N_ANDROID_TIMERFDS = ANDROID_ALARM_TYPE_COUNT + 1;
 static const clockid_t android_alarm_to_clockid[N_ANDROID_TIMERFDS] = {
     CLOCK_REALTIME_ALARM,
@@ -53,98 +70,40 @@ static const clockid_t android_alarm_to_clockid[N_ANDROID_TIMERFDS] = {
     CLOCK_MONOTONIC,
     CLOCK_REALTIME,
 };
-/* to match the legacy alarm driver implementation, we need an extra
-   CLOCK_REALTIME fd which exists specifically to be canceled on RTC changes */
+
+typedef std::array<int, N_ANDROID_TIMERFDS> TimerFds;
 
 class AlarmImpl
 {
 public:
-    AlarmImpl(int *fds, size_t n_fds);
-    virtual ~AlarmImpl();
-
-    virtual int set(int type, struct timespec *ts) = 0;
-    virtual int setTime(struct timeval *tv) = 0;
-    virtual int waitForAlarm() = 0;
-
-protected:
-    int *fds;
-    size_t n_fds;
-};
-
-class AlarmImplAlarmDriver : public AlarmImpl
-{
-public:
-    AlarmImplAlarmDriver(int fd) : AlarmImpl(&fd, 1) { }
+    AlarmImpl(const TimerFds &fds, int epollfd, const std::string& rtc_dev) :
+        fds{fds}, epollfd{epollfd}, rtc_dev{rtc_dev} { }
+    ~AlarmImpl();
 
     int set(int type, struct timespec *ts);
     int setTime(struct timeval *tv);
     int waitForAlarm();
-};
-
-class AlarmImplTimerFd : public AlarmImpl
-{
-public:
-    AlarmImplTimerFd(int fds[N_ANDROID_TIMERFDS], int epollfd, int rtc_id) :
-        AlarmImpl(fds, N_ANDROID_TIMERFDS), epollfd(epollfd), rtc_id(rtc_id) { }
-    ~AlarmImplTimerFd();
-
-    int set(int type, struct timespec *ts);
-    int setTime(struct timeval *tv);
-    int waitForAlarm();
+    int getTime(int type, struct itimerspec *spec);
 
 private:
-    int epollfd;
-    int rtc_id;
+    const TimerFds fds;
+    const int epollfd;
+    std::string rtc_dev;
 };
-
-AlarmImpl::AlarmImpl(int *fds_, size_t n_fds) : fds(new int[n_fds]),
-        n_fds(n_fds)
-{
-    memcpy(fds, fds_, n_fds * sizeof(fds[0]));
-}
 
 AlarmImpl::~AlarmImpl()
 {
-    for (size_t i = 0; i < n_fds; i++) {
-        close(fds[i]);
+    for (auto fd : fds) {
+        epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
     }
-    delete [] fds;
-}
 
-int AlarmImplAlarmDriver::set(int type, struct timespec *ts)
-{
-    return ioctl(fds[0], ANDROID_ALARM_SET(type), ts);
-}
-
-int AlarmImplAlarmDriver::setTime(struct timeval *tv)
-{
-    struct timespec ts;
-    int res;
-
-    ts.tv_sec = tv->tv_sec;
-    ts.tv_nsec = tv->tv_usec * 1000;
-    res = ioctl(fds[0], ANDROID_ALARM_SET_RTC, &ts);
-    if (res < 0)
-        ALOGV("ANDROID_ALARM_SET_RTC ioctl failed: %s\n", strerror(errno));
-    return res;
-}
-
-int AlarmImplAlarmDriver::waitForAlarm()
-{
-    return ioctl(fds[0], ANDROID_ALARM_WAIT);
-}
-
-AlarmImplTimerFd::~AlarmImplTimerFd()
-{
-    for (size_t i = 0; i < N_ANDROID_TIMERFDS; i++) {
-        epoll_ctl(epollfd, EPOLL_CTL_DEL, fds[i], NULL);
-    }
     close(epollfd);
 }
 
-int AlarmImplTimerFd::set(int type, struct timespec *ts)
+int AlarmImpl::set(int type, struct timespec *ts)
 {
-    if (type > ANDROID_ALARM_TYPE_COUNT) {
+    if (static_cast<size_t>(type) > ANDROID_ALARM_TYPE_COUNT) {
         errno = EINVAL;
         return -1;
     }
@@ -162,40 +121,36 @@ int AlarmImplTimerFd::set(int type, struct timespec *ts)
     return timerfd_settime(fds[type], TFD_TIMER_ABSTIME, &spec, NULL);
 }
 
-int AlarmImplTimerFd::setTime(struct timeval *tv)
+int AlarmImpl::getTime(int type, struct itimerspec *spec)
 {
-    struct rtc_time rtc;
-    struct tm tm, *gmtime_res;
-    int fd;
-    int res;
-
-    res = settimeofday(tv, NULL);
-    if (res < 0) {
-        ALOGV("settimeofday() failed: %s\n", strerror(errno));
+    if (static_cast<size_t>(type) > ANDROID_ALARM_TYPE_COUNT) {
+        errno = EINVAL;
         return -1;
     }
 
-    if (rtc_id < 0) {
-        ALOGV("Not setting RTC because wall clock RTC was not found");
-        errno = ENODEV;
+    return timerfd_gettime(fds[type], spec);
+}
+
+int AlarmImpl::setTime(struct timeval *tv)
+{
+    if (settimeofday(tv, NULL) == -1) {
+        ALOGV("settimeofday() failed: %s", strerror(errno));
         return -1;
     }
 
-    android::String8 rtc_dev = String8::format("/dev/rtc%d", rtc_id);
-    fd = open(rtc_dev.string(), O_RDWR);
-    if (fd < 0) {
-        ALOGV("Unable to open %s: %s\n", rtc_dev.string(), strerror(errno));
-        return res;
+    android::base::unique_fd fd{open(rtc_dev.c_str(), O_RDWR)};
+    if (!fd.ok()) {
+        ALOGE("Unable to open %s: %s", rtc_dev.c_str(), strerror(errno));
+        return -1;
     }
 
-    gmtime_res = gmtime_r(&tv->tv_sec, &tm);
-    if (!gmtime_res) {
-        ALOGV("gmtime_r() failed: %s\n", strerror(errno));
-        res = -1;
-        goto done;
+    struct tm tm;
+    if (!gmtime_r(&tv->tv_sec, &tm)) {
+        ALOGV("gmtime_r() failed: %s", strerror(errno));
+        return -1;
     }
 
-    memset(&rtc, 0, sizeof(rtc));
+    struct rtc_time rtc = {};
     rtc.tm_sec = tm.tm_sec;
     rtc.tm_min = tm.tm_min;
     rtc.tm_hour = tm.tm_hour;
@@ -205,15 +160,15 @@ int AlarmImplTimerFd::setTime(struct timeval *tv)
     rtc.tm_wday = tm.tm_wday;
     rtc.tm_yday = tm.tm_yday;
     rtc.tm_isdst = tm.tm_isdst;
-    res = ioctl(fd, RTC_SET_TIME, &rtc);
-    if (res < 0)
-        ALOGV("RTC_SET_TIME ioctl failed: %s\n", strerror(errno));
-done:
-    close(fd);
-    return res;
+    if (ioctl(fd, RTC_SET_TIME, &rtc) == -1) {
+        ALOGV("RTC_SET_TIME ioctl failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
 }
 
-int AlarmImplTimerFd::waitForAlarm()
+int AlarmImpl::waitForAlarm()
 {
     epoll_event events[N_ANDROID_TIMERFDS];
 
@@ -227,7 +182,9 @@ int AlarmImplTimerFd::waitForAlarm()
         uint32_t alarm_idx = events[i].data.u32;
         uint64_t unused;
         ssize_t err = read(fds[alarm_idx], &unused, sizeof(unused));
-        if (err < 0) {
+        // Worth evaluating even if read fails with EAGAIN, since epoll_wait
+        // returned. (see b/78560047#comment34)
+        if (err < 0 && errno != EAGAIN) {
             if (alarm_idx == ANDROID_ALARM_TYPE_COUNT && errno == ECANCELED) {
                 result |= ANDROID_ALARM_TIME_CHANGE_MASK;
             } else {
@@ -244,22 +201,20 @@ int AlarmImplTimerFd::waitForAlarm()
 static jint android_server_AlarmManagerService_setKernelTime(JNIEnv*, jobject, jlong nativeData, jlong millis)
 {
     AlarmImpl *impl = reinterpret_cast<AlarmImpl *>(nativeData);
-    struct timeval tv;
-    int ret;
 
-    if (millis <= 0 || millis / 1000LL >= INT_MAX) {
+    if (millis <= 0 || millis / 1000LL >= std::numeric_limits<time_t>::max()) {
         return -1;
     }
 
-    tv.tv_sec = (time_t) (millis / 1000LL);
-    tv.tv_usec = (suseconds_t) ((millis % 1000LL) * 1000LL);
+    struct timeval tv;
+    tv.tv_sec = (millis / 1000LL);
+    tv.tv_usec = ((millis % 1000LL) * 1000LL);
 
-    ALOGD("Setting time of day to sec=%d\n", (int) tv.tv_sec);
+    ALOGD("Setting time of day to sec=%ld", tv.tv_sec);
 
-    ret = impl->setTime(&tv);
-
-    if(ret < 0) {
-        ALOGW("Unable to set rtc to %ld: %s\n", tv.tv_sec, strerror(errno));
+    int ret = impl->setTime(&tv);
+    if (ret < 0) {
+        ALOGW("Unable to set rtc to %ld: %s", tv.tv_sec, strerror(errno));
         ret = -1;
     }
     return ret;
@@ -283,95 +238,47 @@ static jint android_server_AlarmManagerService_setKernelTimezone(JNIEnv*, jobjec
     return 0;
 }
 
-static jlong init_alarm_driver()
+static void log_timerfd_create_error(clockid_t id)
 {
-    int fd = open("/dev/alarm", O_RDWR);
-    if (fd < 0) {
-        ALOGV("opening alarm driver failed: %s", strerror(errno));
-        return 0;
-    }
-
-    AlarmImpl *ret = new AlarmImplAlarmDriver(fd);
-    return reinterpret_cast<jlong>(ret);
-}
-
-static const char rtc_sysfs[] = "/sys/class/rtc";
-
-static bool rtc_is_hctosys(unsigned int rtc_id)
-{
-    android::String8 hctosys_path = String8::format("%s/rtc%u/hctosys",
-            rtc_sysfs, rtc_id);
-
-    FILE *file = fopen(hctosys_path.string(), "re");
-    if (!file) {
-        ALOGE("failed to open %s: %s", hctosys_path.string(), strerror(errno));
-        return false;
-    }
-
-    unsigned int hctosys;
-    bool ret = false;
-    int err = fscanf(file, "%u", &hctosys);
-    if (err == EOF)
-        ALOGE("failed to read from %s: %s", hctosys_path.string(),
-                strerror(errno));
-    else if (err == 0)
-        ALOGE("%s did not have expected contents", hctosys_path.string());
-    else
-        ret = hctosys;
-
-    fclose(file);
-    return ret;
-}
-
-static int wall_clock_rtc()
-{
-    std::unique_ptr<DIR, int(*)(DIR*)> dir(opendir(rtc_sysfs), closedir);
-    if (!dir.get()) {
-        ALOGE("failed to open %s: %s", rtc_sysfs, strerror(errno));
-        return -1;
-    }
-
-    struct dirent *dirent;
-    while (errno = 0, dirent = readdir(dir.get())) {
-        unsigned int rtc_id;
-        int matched = sscanf(dirent->d_name, "rtc%u", &rtc_id);
-
-        if (matched < 0)
+    if (errno == EINVAL) {
+        switch (id) {
+        case CLOCK_REALTIME_ALARM:
+        case CLOCK_BOOTTIME_ALARM:
+            ALOGE("kernel missing required commits:");
+            ALOGE("https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=6cffe00f7d4e24679eae6b7aae4caaf915288256");
+            ALOGE("https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=11ffa9d6065f344a9bd769a2452f26f2f671e5f8");
+            LOG_ALWAYS_FATAL("kernel does not support timerfd_create() with alarm timers");
             break;
-        else if (matched != 1)
-            continue;
 
-        if (rtc_is_hctosys(rtc_id)) {
-            ALOGV("found wall clock RTC %u", rtc_id);
-            return rtc_id;
+        case CLOCK_BOOTTIME:
+            ALOGE("kernel missing required commit:");
+            ALOGE("https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=4a2378a943f09907fb1ae35c15de917f60289c14");
+            LOG_ALWAYS_FATAL("kernel does not support timerfd_create(CLOCK_BOOTTIME)");
+            break;
+
+        default:
+            break;
         }
     }
 
-    if (errno == 0)
-        ALOGW("no wall clock RTC found");
-    else
-        ALOGE("failed to enumerate RTCs: %s", strerror(errno));
-
-    return -1;
+    ALOGE("timerfd_create(%u) failed: %s", id, strerror(errno));
 }
 
-static jlong init_timerfd()
+static jlong android_server_AlarmManagerService_init(JNIEnv*, jobject)
 {
     int epollfd;
-    int fds[N_ANDROID_TIMERFDS];
+    TimerFds fds;
 
-    epollfd = epoll_create(N_ANDROID_TIMERFDS);
+    epollfd = epoll_create(fds.size());
     if (epollfd < 0) {
-        ALOGV("epoll_create(%zu) failed: %s", N_ANDROID_TIMERFDS,
-                strerror(errno));
+        ALOGE("epoll_create(%zu) failed: %s", fds.size(), strerror(errno));
         return 0;
     }
 
-    for (size_t i = 0; i < N_ANDROID_TIMERFDS; i++) {
-        fds[i] = timerfd_create(android_alarm_to_clockid[i], 0);
+    for (size_t i = 0; i < fds.size(); i++) {
+        fds[i] = timerfd_create(android_alarm_to_clockid[i], TFD_NONBLOCK);
         if (fds[i] < 0) {
-            ALOGV("timerfd_create(%u) failed: %s",  android_alarm_to_clockid[i],
-                    strerror(errno));
+            log_timerfd_create_error(android_alarm_to_clockid[i]);
             close(epollfd);
             for (size_t j = 0; j < i; j++) {
                 close(fds[j]);
@@ -380,45 +287,61 @@ static jlong init_timerfd()
         }
     }
 
-    AlarmImpl *ret = new AlarmImplTimerFd(fds, epollfd, wall_clock_rtc());
+    // Find the wall clock RTC. We expect this always to be /dev/rtc0, but
+    // check the /dev/rtc symlink first so that legacy devices that don't use
+    // rtc0 can add a symlink rather than need to carry a local patch to this
+    // code.
+    //
+    // TODO: if you're reading this in a world where all devices are using the
+    // GKI, you can remove the readlink and just assume /dev/rtc0.
+    std::string dev_rtc;
+    if (!android::base::Readlink("/dev/rtc", &dev_rtc)) {
+        dev_rtc = "/dev/rtc0";
+    }
 
-    for (size_t i = 0; i < N_ANDROID_TIMERFDS; i++) {
+    std::unique_ptr<AlarmImpl> alarm{new AlarmImpl(fds, epollfd, dev_rtc)};
+
+    for (size_t i = 0; i < fds.size(); i++) {
         epoll_event event;
         event.events = EPOLLIN | EPOLLWAKEUP;
         event.data.u32 = i;
 
         int err = epoll_ctl(epollfd, EPOLL_CTL_ADD, fds[i], &event);
         if (err < 0) {
-            ALOGV("epoll_ctl(EPOLL_CTL_ADD) failed: %s", strerror(errno));
-            delete ret;
+            ALOGE("epoll_ctl(EPOLL_CTL_ADD) failed: %s", strerror(errno));
             return 0;
         }
     }
 
-    struct itimerspec spec;
-    memset(&spec, 0, sizeof(spec));
+    struct itimerspec spec = {};
     /* 0 = disarmed; the timerfd doesn't need to be armed to get
        RTC change notifications, just set up as cancelable */
 
     int err = timerfd_settime(fds[ANDROID_ALARM_TYPE_COUNT],
             TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &spec, NULL);
     if (err < 0) {
-        ALOGV("timerfd_settime() failed: %s", strerror(errno));
-        delete ret;
+        ALOGE("timerfd_settime() failed: %s", strerror(errno));
         return 0;
     }
 
-    return reinterpret_cast<jlong>(ret);
+    return reinterpret_cast<jlong>(alarm.release());
 }
 
-static jlong android_server_AlarmManagerService_init(JNIEnv*, jobject)
+static jlong android_server_AlarmManagerService_getNextAlarm(JNIEnv*, jobject, jlong nativeData, jint type)
 {
-    jlong ret = init_alarm_driver();
-    if (ret) {
-        return ret;
+    AlarmImpl *impl = reinterpret_cast<AlarmImpl *>(nativeData);
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof(spec));
+    const int result = impl->getTime(type, &spec);
+    if (result < 0)
+    {
+        ALOGE("timerfd_gettime() failed for fd %d: %s\n", static_cast<int>(type), strerror(errno));
+        return result;
     }
-
-    return init_timerfd();
+    struct timespec nextTimespec = spec.it_value;
+    long long millis = nextTimespec.tv_sec * 1000LL;
+    millis += (nextTimespec.tv_nsec / 1000000LL);
+    return static_cast<jlong>(millis);
 }
 
 static void android_server_AlarmManagerService_close(JNIEnv*, jobject, jlong nativeData)
@@ -427,20 +350,21 @@ static void android_server_AlarmManagerService_close(JNIEnv*, jobject, jlong nat
     delete impl;
 }
 
-static void android_server_AlarmManagerService_set(JNIEnv*, jobject, jlong nativeData, jint type, jlong seconds, jlong nanoseconds)
+static jint android_server_AlarmManagerService_set(JNIEnv*, jobject, jlong nativeData, jint type, jlong seconds, jlong nanoseconds)
 {
     AlarmImpl *impl = reinterpret_cast<AlarmImpl *>(nativeData);
     struct timespec ts;
     ts.tv_sec = seconds;
     ts.tv_nsec = nanoseconds;
 
-    int result = impl->set(type, &ts);
+    const int result = impl->set(type, &ts);
     if (result < 0)
     {
         ALOGE("Unable to set alarm to %lld.%09lld: %s\n",
               static_cast<long long>(seconds),
               static_cast<long long>(nanoseconds), strerror(errno));
     }
+    return result >= 0 ? 0 : errno;
 }
 
 static jint android_server_AlarmManagerService_waitForAlarm(JNIEnv*, jobject, jlong nativeData)
@@ -466,10 +390,11 @@ static const JNINativeMethod sMethods[] = {
      /* name, signature, funcPtr */
     {"init", "()J", (void*)android_server_AlarmManagerService_init},
     {"close", "(J)V", (void*)android_server_AlarmManagerService_close},
-    {"set", "(JIJJ)V", (void*)android_server_AlarmManagerService_set},
+    {"set", "(JIJJ)I", (void*)android_server_AlarmManagerService_set},
     {"waitForAlarm", "(J)I", (void*)android_server_AlarmManagerService_waitForAlarm},
     {"setKernelTime", "(JJ)I", (void*)android_server_AlarmManagerService_setKernelTime},
     {"setKernelTimezone", "(JI)I", (void*)android_server_AlarmManagerService_setKernelTimezone},
+    {"getNextAlarm", "(JI)J", (void*)android_server_AlarmManagerService_getNextAlarm},
 };
 
 int register_android_server_AlarmManagerService(JNIEnv* env)

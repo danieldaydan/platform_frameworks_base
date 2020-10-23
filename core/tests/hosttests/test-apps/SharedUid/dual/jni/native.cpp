@@ -15,14 +15,17 @@
  */
 
 #define LOG_TAG "pmtestdual native.cpp"
-#include <utils/Log.h>
+#include <android/log.h>
 
 #include <stdio.h>
 
 #include "jni.h"
 
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
 static jint
-add(JNIEnv *env, jobject thiz, jint a, jint b) {
+add(JNIEnv */* env */, jobject /* thiz */, jint a, jint b) {
 int result = a + b;
     ALOGI("%d + %d = %d", a, b, result);
     return result;
@@ -82,7 +85,7 @@ typedef union {
     void* venv;
 } UnionJNIEnvToVoid;
 
-jint JNI_OnLoad(JavaVM* vm, void* reserved)
+jint JNI_OnLoad(JavaVM* vm, void* /* reserved */)
 {
     UnionJNIEnvToVoid uenv;
     uenv.venv = NULL;

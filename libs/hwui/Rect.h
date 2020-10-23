@@ -14,25 +14,24 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_HWUI_RECT_H
-#define ANDROID_HWUI_RECT_H
+#pragma once
 
-#include <cmath>
-#include <algorithm>
-#include <SkRect.h>
+#include "Vertex.h"
 
 #include <utils/Log.h>
 
-#include "Vertex.h"
+#include <SkRect.h>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <ostream>
 
 namespace android {
 namespace uirenderer {
 
 #define RECT_STRING "%5.2f %5.2f %5.2f %5.2f"
-#define RECT_ARGS(r) \
-    (r).left, (r).top, (r).right, (r).bottom
-#define SK_RECT_ARGS(r) \
-    (r).left(), (r).top(), (r).right(), (r).bottom()
+#define RECT_ARGS(r) (r).left, (r).top, (r).right, (r).bottom
+#define SK_RECT_ARGS(r) (r).left(), (r).top(), (r).right(), (r).bottom()
 
 ///////////////////////////////////////////////////////////////////////////////
 // Structs
@@ -51,45 +50,32 @@ public:
     // we don't provide copy-ctor and operator= on purpose
     // because we want the compiler generated versions
 
-    inline Rect():
-            left(0),
-            top(0),
-            right(0),
-            bottom(0) {
-    }
+    inline Rect() : left(0), top(0), right(0), bottom(0) {}
 
-    inline Rect(float left, float top, float right, float bottom):
-            left(left),
-            top(top),
-            right(right),
-            bottom(bottom) {
-    }
+    inline Rect(float left, float top, float right, float bottom)
+            : left(left), top(top), right(right), bottom(bottom) {}
 
-    inline Rect(float width, float height):
-            left(0.0f),
-            top(0.0f),
-            right(width),
-            bottom(height) {
-    }
+    inline Rect(float width, float height) : left(0.0f), top(0.0f), right(width), bottom(height) {}
 
-    inline Rect(const SkRect& rect):
-            left(rect.fLeft),
-            top(rect.fTop),
-            right(rect.fRight),
-            bottom(rect.fBottom) {
-    }
+    inline Rect(const SkIRect& rect) // NOLINT(google-explicit-constructor)
+            :
+            left(rect.fLeft)
+            , top(rect.fTop)
+            , right(rect.fRight)
+            , bottom(rect.fBottom) {}
 
-    friend int operator==(const Rect& a, const Rect& b) {
-        return !memcmp(&a, &b, sizeof(a));
-    }
+    inline Rect(const SkRect& rect) // NOLINT(google-explicit-constructor)
+            :
+            left(rect.fLeft)
+            , top(rect.fTop)
+            , right(rect.fRight)
+            , bottom(rect.fBottom) {}
 
-    friend int operator!=(const Rect& a, const Rect& b) {
-        return memcmp(&a, &b, sizeof(a));
-    }
+    friend int operator==(const Rect& a, const Rect& b) { return !memcmp(&a, &b, sizeof(a)); }
 
-    inline void clear() {
-        left = top = right = bottom = 0.0f;
-    }
+    friend int operator!=(const Rect& a, const Rect& b) { return memcmp(&a, &b, sizeof(a)); }
+
+    inline void clear() { left = top = right = bottom = 0.0f; }
 
     inline bool isEmpty() const {
         // this is written in such way this it'll handle NANs to return
@@ -97,9 +83,7 @@ public:
         return !((left < right) && (top < bottom));
     }
 
-    inline void setEmpty() {
-        left = top = right = bottom = 0.0f;
-    }
+    inline void setEmpty() { left = top = right = bottom = 0.0f; }
 
     inline void set(float left, float top, float right, float bottom) {
         this->left = left;
@@ -108,51 +92,44 @@ public:
         this->bottom = bottom;
     }
 
-    inline void set(const Rect& r) {
-        set(r.left, r.top, r.right, r.bottom);
-    }
+    inline void set(const Rect& r) { set(r.left, r.top, r.right, r.bottom); }
 
-    inline void set(const SkIRect& r) {
-        set(r.left(), r.top(), r.right(), r.bottom());
-    }
+    inline void set(const SkIRect& r) { set(r.left(), r.top(), r.right(), r.bottom()); }
 
-    inline float getWidth() const {
-        return right - left;
-    }
+    inline float getWidth() const { return right - left; }
 
-    inline float getHeight() const {
-        return bottom - top;
-    }
+    inline float getHeight() const { return bottom - top; }
 
     bool intersects(float l, float t, float r, float b) const {
-        return !intersectWith(l, t, r, b).isEmpty();
+        float tempLeft = std::max(left, l);
+        float tempTop = std::max(top, t);
+        float tempRight = std::min(right, r);
+        float tempBottom = std::min(bottom, b);
+
+        return ((tempLeft < tempRight) && (tempTop < tempBottom));  // !isEmpty
     }
 
-    bool intersects(const Rect& r) const {
-        return intersects(r.left, r.top, r.right, r.bottom);
+    bool intersects(const Rect& r) const { return intersects(r.left, r.top, r.right, r.bottom); }
+
+    /**
+     * This method is named 'doIntersect' instead of 'intersect' so as not to be confused with
+     * SkRect::intersect / android.graphics.Rect#intersect behavior, which do not modify the object
+     * if the intersection of the rects would be empty.
+     */
+    void doIntersect(float l, float t, float r, float b) {
+        left = std::max(left, l);
+        top = std::max(top, t);
+        right = std::min(right, r);
+        bottom = std::min(bottom, b);
     }
 
-    bool intersect(float l, float t, float r, float b) {
-        Rect tmp(l, t, r, b);
-        intersectWith(tmp);
-        if (!tmp.isEmpty()) {
-            set(tmp);
-            return true;
-        }
-        return false;
-    }
-
-    bool intersect(const Rect& r) {
-        return intersect(r.left, r.top, r.right, r.bottom);
-    }
+    void doIntersect(const Rect& r) { doIntersect(r.left, r.top, r.right, r.bottom); }
 
     inline bool contains(float l, float t, float r, float b) const {
         return l >= left && t >= top && r <= right && b <= bottom;
     }
 
-    inline bool contains(const Rect& r) const {
-        return contains(r.left, r.top, r.right, r.bottom);
-    }
+    inline bool contains(const Rect& r) const { return contains(r.left, r.top, r.right, r.bottom); }
 
     bool unionWith(const Rect& r) {
         if (r.left < r.right && r.top < r.bottom) {
@@ -180,9 +157,7 @@ public:
         bottom += dy;
     }
 
-    void inset(float delta) {
-        outset(-delta);
-    }
+    void inset(float delta) { outset(-delta); }
 
     void outset(float delta) {
         left -= delta;
@@ -246,52 +221,46 @@ public:
         bottom = ceilf(bottom);
     }
 
-    void expandToCoverVertex(float x, float y) {
+    /*
+     * Similar to unionWith, except this makes the assumption that both rects are non-empty
+     * to avoid both emptiness checks.
+     */
+    void expandToCover(const Rect& other) {
+        left = std::min(left, other.left);
+        top = std::min(top, other.top);
+        right = std::max(right, other.right);
+        bottom = std::max(bottom, other.bottom);
+    }
+
+    void expandToCover(float x, float y) {
         left = std::min(left, x);
         top = std::min(top, y);
         right = std::max(right, x);
         bottom = std::max(bottom, y);
     }
 
-    void expandToCoverRect(float otherLeft, float otherTop, float otherRight, float otherBottom) {
-        left = std::min(left, otherLeft);
-        top = std::min(top, otherTop);
-        right = std::max(right, otherRight);
-        bottom = std::max(bottom, otherBottom);
-    }
+    SkRect toSkRect() const { return SkRect::MakeLTRB(left, top, right, bottom); }
 
-    SkRect toSkRect() const {
-        return SkRect::MakeLTRB(left, top, right, bottom);
-    }
-
-    SkIRect toSkIRect() const {
-        return SkIRect::MakeLTRB(left, top, right, bottom);
-    }
+    SkIRect toSkIRect() const { return SkIRect::MakeLTRB(left, top, right, bottom); }
 
     void dump(const char* label = nullptr) const {
-        ALOGD("%s[l=%f t=%f r=%f b=%f]", label ? label : "Rect", left, top, right, bottom);
+        ALOGD("%s[l=%.2f t=%.2f r=%.2f b=%.2f]", label ? label : "Rect", left, top, right, bottom);
     }
 
-private:
-    void intersectWith(Rect& tmp) const {
-        tmp.left = std::max(left, tmp.left);
-        tmp.top = std::max(top, tmp.top);
-        tmp.right = std::min(right, tmp.right);
-        tmp.bottom = std::min(bottom, tmp.bottom);
+    friend std::ostream& operator<<(std::ostream& os, const Rect& rect) {
+        if (rect.isEmpty()) {
+            // Print empty, but continue, since empty rects may still have useful coordinate info
+            os << "(empty)";
+        }
+
+        if (rect.left == 0 && rect.top == 0) {
+            return os << "[" << rect.right << " x " << rect.bottom << "]";
+        }
+
+        return os << "[" << rect.left << " " << rect.top << " " << rect.right << " " << rect.bottom
+                  << "]";
     }
+};  // class Rect
 
-    Rect intersectWith(float l, float t, float r, float b) const {
-        Rect tmp;
-        tmp.left = std::max(left, l);
-        tmp.top = std::max(top, t);
-        tmp.right = std::min(right, r);
-        tmp.bottom = std::min(bottom, b);
-        return tmp;
-    }
-
-}; // class Rect
-
-}; // namespace uirenderer
-}; // namespace android
-
-#endif // ANDROID_HWUI_RECT_H
+}  // namespace uirenderer
+}  // namespace android

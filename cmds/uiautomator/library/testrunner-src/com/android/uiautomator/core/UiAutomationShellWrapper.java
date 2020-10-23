@@ -2,7 +2,6 @@ package com.android.uiautomator.core;
 
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.app.ActivityManager;
-import android.app.ActivityManagerNative;
 import android.app.IActivityController;
 import android.app.IActivityManager;
 import android.app.UiAutomation;
@@ -41,18 +40,18 @@ public class UiAutomationShellWrapper {
      * actions such as dialing 911 or posting messages to public forums, etc.
      *
      * @param isSet True to set as monkey test. False to set as regular functional test (default).
-     * @see {@link ActivityManager#isUserAMonkey()}
+     * @see ActivityManager#isUserAMonkey()
      */
     public void setRunAsMonkey(boolean isSet) {
-        IActivityManager am = ActivityManagerNative.getDefault();
+        IActivityManager am = ActivityManager.getService();
         if (am == null) {
             throw new RuntimeException("Can't manage monkey status; is the system running?");
         }
         try {
             if (isSet) {
-                am.setActivityController(new DummyActivityController());
+                am.setActivityController(new NoOpActivityController(), true);
             } else {
-                am.setActivityController(null);
+                am.setActivityController(null, true);
             }
         } catch (RemoteException e) {
             throw new RuntimeException(e);
@@ -81,9 +80,9 @@ public class UiAutomationShellWrapper {
     }
 
     /**
-     * Dummy, no interference, activity controller.
+     * No-op, no interference, activity controller.
      */
-    private class DummyActivityController extends IActivityController.Stub {
+    private class NoOpActivityController extends IActivityController.Stub {
         @Override
         public boolean activityStarting(Intent intent, String pkg) throws RemoteException {
             /* do nothing and let activity proceed normally */

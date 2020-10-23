@@ -16,12 +16,20 @@
 
 package android.media.tv;
 
+import android.annotation.CallbackExecutor;
+import android.annotation.IntDef;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.annotation.RequiresPermission;
 import android.annotation.SystemApi;
+import android.annotation.SystemService;
+import android.annotation.TestApi;
+import android.content.Context;
+import android.content.Intent;
 import android.graphics.Rect;
 import android.media.PlaybackParams;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -44,16 +52,37 @@ import android.view.View;
 
 import com.android.internal.util.Preconditions;
 
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 
 /**
  * Central system API to the overall TV input framework (TIF) architecture, which arbitrates
  * interaction between applications and the selected TV inputs.
+ *
+ * <p>There are three primary parties involved in the TV input framework (TIF) architecture:
+ *
+ * <ul>
+ * <li>The <strong>TV input manager</strong> as expressed by this class is the central point of the
+ * system that manages interaction between all other parts. It is expressed as the client-side API
+ * here which exists in each application context and communicates with a global system service that
+ * manages the interaction across all processes.
+ * <li>A <strong>TV input</strong> implemented by {@link TvInputService} represents an input source
+ * of TV, which can be a pass-through input such as HDMI, or a tuner input which provides broadcast
+ * TV programs. The system binds to the TV input per application’s request.
+ * on implementing TV inputs.
+ * <li><strong>Applications</strong> talk to the TV input manager to list TV inputs and check their
+ * status. Once an application find the input to use, it uses {@link TvView} or
+ * {@link TvRecordingClient} for further interaction such as watching and recording broadcast TV
+ * programs.
+ * </ul>
  */
+@SystemService(Context.TV_INPUT_SERVICE)
 public final class TvInputManager {
     private static final String TAG = "TvInputManager";
 
@@ -76,87 +105,264 @@ public final class TvInputManager {
      */
     public static final int DVB_DEVICE_FRONTEND = DVB_DEVICE_END;
 
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({DVB_DEVICE_DEMUX, DVB_DEVICE_DVR, DVB_DEVICE_FRONTEND})
+    public @interface DvbDeviceType {}
+
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({VIDEO_UNAVAILABLE_REASON_UNKNOWN, VIDEO_UNAVAILABLE_REASON_TUNING,
+        VIDEO_UNAVAILABLE_REASON_WEAK_SIGNAL, VIDEO_UNAVAILABLE_REASON_BUFFERING,
+        VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY, VIDEO_UNAVAILABLE_REASON_INSUFFICIENT_RESOURCE,
+        VIDEO_UNAVAILABLE_REASON_CAS_INSUFFICIENT_OUTPUT_PROTECTION,
+        VIDEO_UNAVAILABLE_REASON_CAS_PVR_RECORDING_NOT_ALLOWED,
+        VIDEO_UNAVAILABLE_REASON_CAS_PVR_RECORDING_NOT_ALLOWED,
+        VIDEO_UNAVAILABLE_REASON_CAS_NO_LICENSE, VIDEO_UNAVAILABLE_REASON_CAS_LICENSE_EXPIRED,
+        VIDEO_UNAVAILABLE_REASON_CAS_NEED_ACTIVATION, VIDEO_UNAVAILABLE_REASON_CAS_NEED_PAIRING,
+        VIDEO_UNAVAILABLE_REASON_CAS_NO_CARD, VIDEO_UNAVAILABLE_REASON_CAS_CARD_MUTE,
+        VIDEO_UNAVAILABLE_REASON_CAS_CARD_INVALID, VIDEO_UNAVAILABLE_REASON_CAS_BLACKOUT,
+        VIDEO_UNAVAILABLE_REASON_CAS_REBOOTING, VIDEO_UNAVAILABLE_REASON_CAS_UNKNOWN})
+    public @interface VideoUnavailableReason {}
+
     static final int VIDEO_UNAVAILABLE_REASON_START = 0;
-    static final int VIDEO_UNAVAILABLE_REASON_END = 4;
+    static final int VIDEO_UNAVAILABLE_REASON_END = 18;
 
     /**
-     * A generic reason. Video is not available due to an unspecified error.
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable due to
+     * an unspecified error.
      */
     public static final int VIDEO_UNAVAILABLE_REASON_UNKNOWN = VIDEO_UNAVAILABLE_REASON_START;
     /**
-     * Video is not available because the TV input is in the middle of tuning to a new channel.
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the corresponding TV input is in the middle of tuning to a new channel.
      */
     public static final int VIDEO_UNAVAILABLE_REASON_TUNING = 1;
     /**
-     * Video is not available due to the weak TV signal.
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable due to
+     * weak TV signal.
      */
     public static final int VIDEO_UNAVAILABLE_REASON_WEAK_SIGNAL = 2;
     /**
-     * Video is not available because the TV input stopped the playback temporarily to buffer more
-     * data.
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the corresponding TV input has stopped playback temporarily to buffer more data.
      */
     public static final int VIDEO_UNAVAILABLE_REASON_BUFFERING = 3;
     /**
-     * Video is not available because the current program is audio-only.
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the current TV program is audio-only.
      */
-    public static final int VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY = VIDEO_UNAVAILABLE_REASON_END;
+    public static final int VIDEO_UNAVAILABLE_REASON_AUDIO_ONLY = 4;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the source is not physically connected, for example the HDMI cable is not connected.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_NOT_CONNECTED = 5;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the resource is not enough to meet requirement.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_INSUFFICIENT_RESOURCE = 6;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the output protection level enabled on the device is not sufficient to meet the requirements
+     * in the license policy.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_INSUFFICIENT_OUTPUT_PROTECTION = 7;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the PVR record is not allowed by the license policy.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_PVR_RECORDING_NOT_ALLOWED = 8;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * no license keys have been provided.
+     * @hide
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_NO_LICENSE = 9;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * Using a license in whhich the keys have expired.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_LICENSE_EXPIRED = 10;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the device need be activated.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_NEED_ACTIVATION = 11;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * the device need be paired.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_NEED_PAIRING = 12;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * smart card is missed.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_NO_CARD = 13;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * smart card is muted.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_CARD_MUTE = 14;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * smart card is invalid.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_CARD_INVALID = 15;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * of a geographical blackout.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_BLACKOUT = 16;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * CAS system is rebooting.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_REBOOTING = 17;
+    /**
+     * Reason for {@link TvInputService.Session#notifyVideoUnavailable(int)} and
+     * {@link TvView.TvInputCallback#onVideoUnavailable(String, int)}: Video is unavailable because
+     * of unknown CAS error.
+     */
+    public static final int VIDEO_UNAVAILABLE_REASON_CAS_UNKNOWN = VIDEO_UNAVAILABLE_REASON_END;
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({TIME_SHIFT_STATUS_UNKNOWN, TIME_SHIFT_STATUS_UNSUPPORTED,
+            TIME_SHIFT_STATUS_UNAVAILABLE, TIME_SHIFT_STATUS_AVAILABLE})
+    public @interface TimeShiftStatus {}
 
     /**
-     * Status prior to calling {@link TvInputService.Session#notifyTimeShiftStatusChanged}.
+     * Status for {@link TvInputService.Session#notifyTimeShiftStatusChanged(int)} and
+     * {@link TvView.TvInputCallback#onTimeShiftStatusChanged(String, int)}: Unknown status. Also
+     * the status prior to calling {@code notifyTimeShiftStatusChanged}.
      */
     public static final int TIME_SHIFT_STATUS_UNKNOWN = 0;
 
     /**
-     * The TV input does not support time shifting.
+     * Status for {@link TvInputService.Session#notifyTimeShiftStatusChanged(int)} and
+     * {@link TvView.TvInputCallback#onTimeShiftStatusChanged(String, int)}: The current TV input
+     * does not support time shifting.
      */
     public static final int TIME_SHIFT_STATUS_UNSUPPORTED = 1;
 
     /**
-     * Time shifting is currently not available but might work again later.
+     * Status for {@link TvInputService.Session#notifyTimeShiftStatusChanged(int)} and
+     * {@link TvView.TvInputCallback#onTimeShiftStatusChanged(String, int)}: Time shifting is
+     * currently unavailable but might work again later.
      */
     public static final int TIME_SHIFT_STATUS_UNAVAILABLE = 2;
 
     /**
-     * Time shifting is currently available. In this status, the application assumes it can
-     * pause/resume playback, seek to a specified time position and set playback rate and audio
-     * mode.
+     * Status for {@link TvInputService.Session#notifyTimeShiftStatusChanged(int)} and
+     * {@link TvView.TvInputCallback#onTimeShiftStatusChanged(String, int)}: Time shifting is
+     * currently available. In this status, the application assumes it can pause/resume playback,
+     * seek to a specified time position and set playback rate and audio mode.
      */
     public static final int TIME_SHIFT_STATUS_AVAILABLE = 3;
 
+    /**
+     * Value returned by {@link TvInputService.Session#onTimeShiftGetCurrentPosition()} and
+     * {@link TvInputService.Session#onTimeShiftGetStartPosition()} when time shifting has not
+     * yet started.
+     */
     public static final long TIME_SHIFT_INVALID_TIME = Long.MIN_VALUE;
 
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({RECORDING_ERROR_UNKNOWN, RECORDING_ERROR_INSUFFICIENT_SPACE,
+            RECORDING_ERROR_RESOURCE_BUSY})
+    public @interface RecordingError {}
+
+    static final int RECORDING_ERROR_START = 0;
+    static final int RECORDING_ERROR_END = 2;
+
     /**
-     * The TV input is connected.
+     * Error for {@link TvInputService.RecordingSession#notifyError(int)} and
+     * {@link TvRecordingClient.RecordingCallback#onError(int)}: The requested operation cannot be
+     * completed due to a problem that does not fit under any other error codes, or the error code
+     * for the problem is defined on the higher version than application's
+     * <code>android:targetSdkVersion</code>.
+     */
+    public static final int RECORDING_ERROR_UNKNOWN = RECORDING_ERROR_START;
+
+    /**
+     * Error for {@link TvInputService.RecordingSession#notifyError(int)} and
+     * {@link TvRecordingClient.RecordingCallback#onError(int)}: Recording cannot proceed due to
+     * insufficient storage space.
+     */
+    public static final int RECORDING_ERROR_INSUFFICIENT_SPACE = 1;
+
+    /**
+     * Error for {@link TvInputService.RecordingSession#notifyError(int)} and
+     * {@link TvRecordingClient.RecordingCallback#onError(int)}: Recording cannot proceed because
+     * a required recording resource was not able to be allocated.
+     */
+    public static final int RECORDING_ERROR_RESOURCE_BUSY = RECORDING_ERROR_END;
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef({INPUT_STATE_CONNECTED, INPUT_STATE_CONNECTED_STANDBY, INPUT_STATE_DISCONNECTED})
+    public @interface InputState {}
+
+    /**
+     * State for {@link #getInputState(String)} and
+     * {@link TvInputCallback#onInputStateChanged(String, int)}: The input source is connected.
      *
      * <p>This state indicates that a source device is connected to the input port and is in the
-     * normal operation mode. It is mostly relevant to hardware inputs such as HDMI input. This is
-     * the default state for any hardware inputs where their states are unknown. Non-hardware inputs
-     * are considered connected all the time.
-     *
-     * @see #getInputState
-     * @see TvInputManager.TvInputCallback#onInputStateChanged
+     * normal operation mode. It is mostly relevant to hardware inputs such as HDMI input.
+     * Non-hardware inputs are considered connected all the time.
      */
     public static final int INPUT_STATE_CONNECTED = 0;
+
     /**
-     * The TV input is connected but in standby mode.
+     * State for {@link #getInputState(String)} and
+     * {@link TvInputCallback#onInputStateChanged(String, int)}: The input source is connected but
+     * in standby mode.
      *
      * <p>This state indicates that a source device is connected to the input port but is in standby
-     * mode. It is mostly relevant to hardware inputs such as HDMI input.
-     *
-     * @see #getInputState
-     * @see TvInputManager.TvInputCallback#onInputStateChanged
+     * or low power mode. It is mostly relevant to hardware inputs such as HDMI input and Component
+     * inputs.
      */
     public static final int INPUT_STATE_CONNECTED_STANDBY = 1;
+
     /**
-     * The TV input is disconnected.
+     * State for {@link #getInputState(String)} and
+     * {@link TvInputCallback#onInputStateChanged(String, int)}: The input source is disconnected.
      *
      * <p>This state indicates that a source device is disconnected from the input port. It is
      * mostly relevant to hardware inputs such as HDMI input.
      *
-     * @see #getInputState
-     * @see TvInputManager.TvInputCallback#onInputStateChanged
      */
     public static final int INPUT_STATE_DISCONNECTED = 2;
+
+    /**
+     * An unknown state of the client pid gets from the TvInputManager. Client gets this value when
+     * query through {@link getClientPid(String sessionId)} fails.
+     *
+     * @hide
+     */
+    public static final int UNKNOWN_CLIENT_PID = -1;
 
     /**
      * Broadcast intent action when the user blocked content ratings change. For use with the
@@ -217,6 +423,21 @@ public final class TvInputManager {
     public static final String META_DATA_CONTENT_RATING_SYSTEMS =
             "android.media.tv.metadata.CONTENT_RATING_SYSTEMS";
 
+    /**
+     * Activity action to set up channel sources i.e.&nbsp;TV inputs of type
+     * {@link TvInputInfo#TYPE_TUNER}. When invoked, the system will display an appropriate UI for
+     * the user to initiate the individual setup flow provided by
+     * {@link android.R.attr#setupActivity} of each TV input service.
+     */
+    public static final String ACTION_SETUP_INPUTS = "android.media.tv.action.SETUP_INPUTS";
+
+    /**
+     * Activity action to display the recording schedules. When invoked, the system will display an
+     * appropriate UI to browse the schedules.
+     */
+    public static final String ACTION_VIEW_RECORDING_SCHEDULES =
+            "android.media.tv.action.VIEW_RECORDING_SCHEDULES";
+
     private final ITvInputManager mService;
 
     private final Object mLock = new Object();
@@ -244,7 +465,6 @@ public final class TvInputManager {
      * Interface used to receive the created session.
      * @hide
      */
-    @SystemApi
     public abstract static class SessionCallback {
         /**
          * This is called after {@link TvInputManager#createSession} has been processed.
@@ -360,9 +580,7 @@ public final class TvInputManager {
          * @param top Top position.
          * @param right Right position.
          * @param bottom Bottom position.
-         * @hide
          */
-        @SystemApi
         public void onLayoutSurface(Session session, int left, int top, int right, int bottom) {
         }
 
@@ -372,9 +590,7 @@ public final class TvInputManager {
          * @param session A {@link TvInputManager.Session} associated with this callback
          * @param eventType The type of the event.
          * @param eventArgs Optional arguments of the event.
-         * @hide
          */
-        @SystemApi
         public void onSessionEvent(Session session, String eventType, Bundle eventArgs) {
         }
 
@@ -393,28 +609,52 @@ public final class TvInputManager {
         }
 
         /**
-         * This is called when the start playback position is changed.
-         *
-         * <p>The start playback position of the time shifted program should be adjusted when the TV
-         * input cannot retain the whole recorded program due to some reason (e.g. limitation on
-         * storage space). This is necessary to prevent the application from allowing the user to
-         * seek to a time position that is not reachable.
+         * This is called when the start position for time shifting has changed.
          *
          * @param session A {@link TvInputManager.Session} associated with this callback.
-         * @param timeMs The start playback position of the time shifted program, in milliseconds
-         *            since the epoch.
+         * @param timeMs The start position for time shifting, in milliseconds since the epoch.
          */
         public void onTimeShiftStartPositionChanged(Session session, long timeMs) {
         }
 
         /**
-         * This is called when the current playback position is changed.
+         * This is called when the current position for time shifting is changed.
          *
          * @param session A {@link TvInputManager.Session} associated with this callback.
-         * @param timeMs The current playback position of the time shifted program, in milliseconds
-         *            since the epoch.
+         * @param timeMs The current position for time shifting, in milliseconds since the epoch.
          */
         public void onTimeShiftCurrentPositionChanged(Session session, long timeMs) {
+        }
+
+        // For the recording session only
+        /**
+         * This is called when the recording session has been tuned to the given channel and is
+         * ready to start recording.
+         *
+         * @param channelUri The URI of a channel.
+         */
+        void onTuned(Session session, Uri channelUri) {
+        }
+
+        // For the recording session only
+        /**
+         * This is called when the current recording session has stopped recording and created a
+         * new data entry in the {@link TvContract.RecordedPrograms} table that describes the newly
+         * recorded program.
+         *
+         * @param recordedProgramUri The URI for the newly recorded program.
+         **/
+        void onRecordingStopped(Session session, Uri recordedProgramUri) {
+        }
+
+        // For the recording session only
+        /**
+         * This is called when an issue has occurred. It may be called at any time after the current
+         * recording session is created until it is released.
+         *
+         * @param error The error code.
+         */
+        void onError(Session session, @TvInputManager.RecordingError int error) {
         }
     }
 
@@ -565,6 +805,36 @@ public final class TvInputManager {
                 }
             });
         }
+
+        // For the recording session only
+        void postTuned(final Uri channelUri) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mSessionCallback.onTuned(mSession, channelUri);
+                }
+            });
+        }
+
+        // For the recording session only
+        void postRecordingStopped(final Uri recordedProgramUri) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mSessionCallback.onRecordingStopped(mSession, recordedProgramUri);
+                }
+            });
+        }
+
+        // For the recording session only
+        void postError(final int error) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mSessionCallback.onError(mSession, error);
+                }
+            });
+        }
     }
 
     /**
@@ -574,7 +844,7 @@ public final class TvInputManager {
         /**
          * This is called when the state of a given TV input is changed.
          *
-         * @param inputId The id of the TV input.
+         * @param inputId The ID of the TV input.
          * @param state State of the TV input. The value is one of the following:
          * <ul>
          * <li>{@link TvInputManager#INPUT_STATE_CONNECTED}
@@ -582,7 +852,7 @@ public final class TvInputManager {
          * <li>{@link TvInputManager#INPUT_STATE_DISCONNECTED}
          * </ul>
          */
-        public void onInputStateChanged(String inputId, int state) {
+        public void onInputStateChanged(String inputId, @InputState int state) {
         }
 
         /**
@@ -591,7 +861,7 @@ public final class TvInputManager {
          * <p>Normally it happens when the user installs a new TV input package that implements
          * {@link TvInputService} interface.
          *
-         * @param inputId The id of the TV input.
+         * @param inputId The ID of the TV input.
          */
         public void onInputAdded(String inputId) {
         }
@@ -602,7 +872,7 @@ public final class TvInputManager {
          * <p>Normally it happens when the user uninstalls the previously installed TV input
          * package.
          *
-         * @param inputId The id of the TV input.
+         * @param inputId The ID of the TV input.
          */
         public void onInputRemoved(String inputId) {
         }
@@ -613,11 +883,21 @@ public final class TvInputManager {
          * <p>Normally it happens when a previously installed TV input package is re-installed or
          * the media on which a newer version of the package exists becomes available/unavailable.
          *
-         * @param inputId The id of the TV input.
-         * @hide
+         * @param inputId The ID of the TV input.
          */
-        @SystemApi
         public void onInputUpdated(String inputId) {
+        }
+
+        /**
+         * This is called when the information about an existing TV input has been updated.
+         *
+         * <p>Because the system automatically creates a <code>TvInputInfo</code> object for each TV
+         * input based on the information collected from the <code>AndroidManifest.xml</code>, this
+         * method is only called back when such information has changed dynamically.
+         *
+         * @param inputInfo The <code>TvInputInfo</code> object that contains new information.
+         */
+        public void onTvInputInfoUpdated(TvInputInfo inputInfo) {
         }
     }
 
@@ -632,15 +912,6 @@ public final class TvInputManager {
 
         public TvInputCallback getCallback() {
             return mCallback;
-        }
-
-        public void postInputStateChanged(final String inputId, final int state) {
-            mHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    mCallback.onInputStateChanged(inputId, state);
-                }
-            });
         }
 
         public void postInputAdded(final String inputId) {
@@ -669,15 +940,43 @@ public final class TvInputManager {
                 }
             });
         }
+
+        public void postInputStateChanged(final String inputId, final int state) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onInputStateChanged(inputId, state);
+                }
+            });
+        }
+
+        public void postTvInputInfoUpdated(final TvInputInfo inputInfo) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onTvInputInfoUpdated(inputInfo);
+                }
+            });
+        }
     }
 
     /**
      * Interface used to receive events from Hardware objects.
+     *
      * @hide
      */
     @SystemApi
     public abstract static class HardwareCallback {
+        /**
+         * This is called when {@link Hardware} is no longer available for the client.
+         */
         public abstract void onReleased();
+
+        /**
+         * This is called when the underlying {@link TvStreamConfig} has been changed.
+         *
+         * @param configs The new {@link TvStreamConfig}s.
+         */
         public abstract void onStreamConfigChanged(TvStreamConfig[] configs);
     }
 
@@ -701,6 +1000,8 @@ public final class TvInputManager {
                     if (token != null) {
                         session = new Session(token, channel, mService, mUserId, seq,
                                 mSessionCallbackRecordMap);
+                    } else {
+                        mSessionCallbackRecordMap.delete(seq);
                     }
                     record.postSessionCreated(session);
                 }
@@ -876,18 +1177,44 @@ public final class TvInputManager {
                     record.postTimeShiftCurrentPositionChanged(timeMs);
                 }
             }
-        };
-        ITvInputManagerCallback managerCallback = new ITvInputManagerCallback.Stub() {
+
             @Override
-            public void onInputStateChanged(String inputId, int state) {
-                synchronized (mLock) {
-                    mStateMap.put(inputId, state);
-                    for (TvInputCallbackRecord record : mCallbackRecords) {
-                        record.postInputStateChanged(inputId, state);
+            public void onTuned(int seq, Uri channelUri) {
+                synchronized (mSessionCallbackRecordMap) {
+                    SessionCallbackRecord record = mSessionCallbackRecordMap.get(seq);
+                    if (record == null) {
+                        Log.e(TAG, "Callback not found for seq " + seq);
+                        return;
                     }
+                    record.postTuned(channelUri);
                 }
             }
 
+            @Override
+            public void onRecordingStopped(Uri recordedProgramUri, int seq) {
+                synchronized (mSessionCallbackRecordMap) {
+                    SessionCallbackRecord record = mSessionCallbackRecordMap.get(seq);
+                    if (record == null) {
+                        Log.e(TAG, "Callback not found for seq " + seq);
+                        return;
+                    }
+                    record.postRecordingStopped(recordedProgramUri);
+                }
+            }
+
+            @Override
+            public void onError(int error, int seq) {
+                synchronized (mSessionCallbackRecordMap) {
+                    SessionCallbackRecord record = mSessionCallbackRecordMap.get(seq);
+                    if (record == null) {
+                        Log.e(TAG, "Callback not found for seq " + seq);
+                        return;
+                    }
+                    record.postError(error);
+                }
+            }
+        };
+        ITvInputManagerCallback managerCallback = new ITvInputManagerCallback.Stub() {
             @Override
             public void onInputAdded(String inputId) {
                 synchronized (mLock) {
@@ -916,6 +1243,25 @@ public final class TvInputManager {
                     }
                 }
             }
+
+            @Override
+            public void onInputStateChanged(String inputId, int state) {
+                synchronized (mLock) {
+                    mStateMap.put(inputId, state);
+                    for (TvInputCallbackRecord record : mCallbackRecords) {
+                        record.postInputStateChanged(inputId, state);
+                    }
+                }
+            }
+
+            @Override
+            public void onTvInputInfoUpdated(TvInputInfo inputInfo) {
+                synchronized (mLock) {
+                    for (TvInputCallbackRecord record : mCallbackRecords) {
+                        record.postTvInputInfoUpdated(inputInfo);
+                    }
+                }
+            }
         };
         try {
             if (mService != null) {
@@ -929,7 +1275,7 @@ public final class TvInputManager {
                 }
             }
         } catch (RemoteException e) {
-            Log.e(TAG, "TvInputManager initialization failed", e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -942,7 +1288,7 @@ public final class TvInputManager {
         try {
             return mService.getTvInputList(mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -958,7 +1304,33 @@ public final class TvInputManager {
         try {
             return mService.getTvInputInfo(inputId, mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Updates the <code>TvInputInfo</code> for an existing TV input. A TV input service
+     * implementation may call this method to pass the application and system an up-to-date
+     * <code>TvInputInfo</code> object that describes itself.
+     *
+     * <p>The system automatically creates a <code>TvInputInfo</code> object for each TV input,
+     * based on the information collected from the <code>AndroidManifest.xml</code>, thus it is not
+     * necessary to call this method unless such information has changed dynamically.
+     * Use {@link TvInputInfo.Builder} to build a new <code>TvInputInfo</code> object.
+     *
+     * <p>Attempting to change information about a TV input that the calling package does not own
+     * does nothing.
+     *
+     * @param inputInfo The <code>TvInputInfo</code> object that contains new information.
+     * @throws IllegalArgumentException if the argument is {@code null}.
+     * @see TvInputCallback#onTvInputInfoUpdated(TvInputInfo)
+     */
+    public void updateTvInputInfo(@NonNull TvInputInfo inputInfo) {
+        Preconditions.checkNotNull(inputInfo);
+        try {
+            mService.updateTvInputInfo(inputInfo, mUserId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -972,9 +1344,10 @@ public final class TvInputManager {
      * <li>{@link #INPUT_STATE_DISCONNECTED}
      * </ul>
      *
-     * @param inputId The id of the TV input.
+     * @param inputId The ID of the TV input.
      * @throws IllegalArgumentException if the argument is {@code null}.
      */
+    @InputState
     public int getInputState(@NonNull String inputId) {
         Preconditions.checkNotNull(inputId);
         synchronized (mLock) {
@@ -1029,7 +1402,7 @@ public final class TvInputManager {
         try {
             return mService.isParentalControlsEnabled(mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1042,11 +1415,12 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.MODIFY_PARENTAL_CONTROLS)
     public void setParentalControlsEnabled(boolean enabled) {
         try {
             mService.setParentalControlsEnabled(enabled, mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1061,7 +1435,7 @@ public final class TvInputManager {
         try {
             return mService.isRatingBlocked(rating.flattenToString(), mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1069,9 +1443,7 @@ public final class TvInputManager {
      * Returns the list of blocked content ratings.
      *
      * @return the list of content ratings blocked by the user.
-     * @hide
      */
-    @SystemApi
     public List<TvContentRating> getBlockedRatings() {
         try {
             List<TvContentRating> ratings = new ArrayList<>();
@@ -1080,7 +1452,7 @@ public final class TvInputManager {
             }
             return ratings;
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1093,12 +1465,13 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.MODIFY_PARENTAL_CONTROLS)
     public void addBlockedRating(@NonNull TvContentRating rating) {
         Preconditions.checkNotNull(rating);
         try {
             mService.addBlockedRating(rating.flattenToString(), mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1111,12 +1484,13 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.MODIFY_PARENTAL_CONTROLS)
     public void removeBlockedRating(@NonNull TvContentRating rating) {
         Preconditions.checkNotNull(rating);
         try {
             mService.removeBlockedRating(rating.flattenToString(), mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1125,11 +1499,70 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.READ_CONTENT_RATING_SYSTEMS)
     public List<TvContentRatingSystemInfo> getTvContentRatingSystemList() {
         try {
             return mService.getTvContentRatingSystemList(mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notifies the TV input of the given preview program that the program's browsable state is
+     * disabled.
+     * @hide
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.NOTIFY_TV_INPUTS)
+    public void notifyPreviewProgramBrowsableDisabled(String packageName, long programId) {
+        Intent intent = new Intent();
+        intent.setAction(TvContract.ACTION_PREVIEW_PROGRAM_BROWSABLE_DISABLED);
+        intent.putExtra(TvContract.EXTRA_PREVIEW_PROGRAM_ID, programId);
+        intent.setPackage(packageName);
+        try {
+            mService.sendTvInputNotifyIntent(intent, mUserId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notifies the TV input of the given watch next program that the program's browsable state is
+     * disabled.
+     * @hide
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.NOTIFY_TV_INPUTS)
+    public void notifyWatchNextProgramBrowsableDisabled(String packageName, long programId) {
+        Intent intent = new Intent();
+        intent.setAction(TvContract.ACTION_WATCH_NEXT_PROGRAM_BROWSABLE_DISABLED);
+        intent.putExtra(TvContract.EXTRA_WATCH_NEXT_PROGRAM_ID, programId);
+        intent.setPackage(packageName);
+        try {
+            mService.sendTvInputNotifyIntent(intent, mUserId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Notifies the TV input of the given preview program that the program is added to watch next.
+     * @hide
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.NOTIFY_TV_INPUTS)
+    public void notifyPreviewProgramAddedToWatchNext(String packageName, long previewProgramId,
+            long watchNextProgramId) {
+        Intent intent = new Intent();
+        intent.setAction(TvContract.ACTION_PREVIEW_PROGRAM_ADDED_TO_WATCH_NEXT);
+        intent.putExtra(TvContract.EXTRA_PREVIEW_PROGRAM_ID, previewProgramId);
+        intent.putExtra(TvContract.EXTRA_WATCH_NEXT_PROGRAM_ID, watchNextProgramId);
+        intent.setPackage(packageName);
+        try {
+            mService.sendTvInputNotifyIntent(intent, mUserId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1139,14 +1572,48 @@ public final class TvInputManager {
      * <p>The number of sessions that can be created at the same time is limited by the capability
      * of the given TV input.
      *
-     * @param inputId The id of the TV input.
+     * @param inputId The ID of the TV input.
      * @param callback A callback used to receive the created session.
      * @param handler A {@link Handler} that the session creation will be delivered to.
      * @hide
      */
-    @SystemApi
     public void createSession(@NonNull String inputId, @NonNull final SessionCallback callback,
             @NonNull Handler handler) {
+        createSessionInternal(inputId, false, callback, handler);
+    }
+
+    /**
+     * Get a the client pid when creating the session with the session id provided.
+     *
+     * @param sessionId a String of session id that is used to query the client pid.
+     * @return the client pid when created the session. Returns {@link #UNKNOWN_CLIENT_PID}
+     *         if the call fails.
+     *
+     * @hide
+     */
+    @RequiresPermission(android.Manifest.permission.TUNER_RESOURCE_ACCESS)
+    public int getClientPid(@NonNull String sessionId) {
+        return getClientPidInternal(sessionId);
+    };
+
+    /**
+     * Creates a recording {@link Session} for a given TV input.
+     *
+     * <p>The number of sessions that can be created at the same time is limited by the capability
+     * of the given TV input.
+     *
+     * @param inputId The ID of the TV input.
+     * @param callback A callback used to receive the created session.
+     * @param handler A {@link Handler} that the session creation will be delivered to.
+     * @hide
+     */
+    public void createRecordingSession(@NonNull String inputId,
+            @NonNull final SessionCallback callback, @NonNull Handler handler) {
+        createSessionInternal(inputId, true, callback, handler);
+    }
+
+    private void createSessionInternal(String inputId, boolean isRecordingSession,
+            SessionCallback callback, Handler handler) {
         Preconditions.checkNotNull(inputId);
         Preconditions.checkNotNull(callback);
         Preconditions.checkNotNull(handler);
@@ -1155,11 +1622,22 @@ public final class TvInputManager {
             int seq = mNextSeq++;
             mSessionCallbackRecordMap.put(seq, record);
             try {
-                mService.createSession(mClient, inputId, seq, mUserId);
+                mService.createSession(mClient, inputId, isRecordingSession, seq, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
+    }
+
+    private int getClientPidInternal(String sessionId) {
+        Preconditions.checkNotNull(sessionId);
+        int clientPid = UNKNOWN_CLIENT_PID;
+        try {
+            clientPid = mService.getClientPid(sessionId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+        return clientPid;
     }
 
     /**
@@ -1171,35 +1649,37 @@ public final class TvInputManager {
      * here. This method is designed to be used with {@link #captureFrame} in
      * capture scenarios specifically and not suitable for any other use.
      *
-     * @param inputId the id of the TV input.
+     * @param inputId The ID of the TV input.
      * @return List of {@link TvStreamConfig} which is available for capturing
      *   of the given TV input.
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.CAPTURE_TV_INPUT)
     public List<TvStreamConfig> getAvailableTvStreamConfigList(String inputId) {
         try {
             return mService.getAvailableTvStreamConfigList(inputId, mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
     /**
      * Take a snapshot of the given TV input into the provided Surface.
      *
-     * @param inputId the id of the TV input.
+     * @param inputId The ID of the TV input.
      * @param surface the {@link Surface} to which the snapshot is captured.
      * @param config the {@link TvStreamConfig} which is used for capturing.
      * @return true when the {@link Surface} is ready to be captured.
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.CAPTURE_TV_INPUT)
     public boolean captureFrame(String inputId, Surface surface, TvStreamConfig config) {
         try {
             return mService.captureFrame(inputId, surface, config, mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1209,11 +1689,12 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.CAPTURE_TV_INPUT)
     public boolean isSingleSessionActive() {
         try {
             return mService.isSingleSessionActive(mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1223,92 +1704,251 @@ public final class TvInputManager {
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.TV_INPUT_HARDWARE)
     public List<TvInputHardwareInfo> getHardwareList() {
         try {
             return mService.getHardwareList();
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
     /**
-     * Returns acquired TvInputManager.Hardware object for given deviceId.
+     * Acquires {@link Hardware} object for the given device ID.
      *
-     * If there are other Hardware object acquired for the same deviceId, calling this method will
-     * preempt the previously acquired object and report {@link HardwareCallback#onReleased} to the
-     * old object.
+     * <p>A subsequent call to this method on the same {@code deviceId} will release the currently
+     * acquired Hardware.
+     *
+     * @param deviceId The device ID to acquire Hardware for.
+     * @param callback A callback to receive updates on Hardware.
+     * @param info The TV input which will use the acquired Hardware.
+     * @return Hardware on success, {@code null} otherwise.
+     *
+     * @hide
+     * @removed
+     */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.TV_INPUT_HARDWARE)
+    public Hardware acquireTvInputHardware(int deviceId, final HardwareCallback callback,
+            TvInputInfo info) {
+        return acquireTvInputHardware(deviceId, info, callback);
+    }
+
+    /**
+     * Acquires {@link Hardware} object for the given device ID.
+     *
+     * <p>A subsequent call to this method on the same {@code deviceId} could release the currently
+     * acquired Hardware if TunerResourceManager(TRM) detects higher priority from the current
+     * request.
+     *
+     * <p>If the client would like to provide information for the TRM to compare, use
+     * {@link #acquireTvInputHardware(int, TvInputInfo, HardwareCallback, String, int)} instead.
+     *
+     * <p>Otherwise default priority will be applied.
+     *
+     * @param deviceId The device ID to acquire Hardware for.
+     * @param info The TV input which will use the acquired Hardware.
+     * @param callback A callback to receive updates on Hardware.
+     * @return Hardware on success, {@code null} otherwise.
      *
      * @hide
      */
     @SystemApi
-    public Hardware acquireTvInputHardware(int deviceId, final HardwareCallback callback,
-            TvInputInfo info) {
+    @RequiresPermission(android.Manifest.permission.TV_INPUT_HARDWARE)
+    public Hardware acquireTvInputHardware(int deviceId, @NonNull TvInputInfo info,
+            @NonNull final HardwareCallback callback) {
+        Preconditions.checkNotNull(info);
+        Preconditions.checkNotNull(callback);
+        return acquireTvInputHardwareInternal(deviceId, info, null,
+                TvInputService.PRIORITY_HINT_USE_CASE_TYPE_LIVE, new Executor() {
+                    public void execute(Runnable r) {
+                        r.run();
+                    }
+                }, callback);
+    }
+
+    /**
+     * Acquires {@link Hardware} object for the given device ID.
+     *
+     * <p>A subsequent call to this method on the same {@code deviceId} could release the currently
+     * acquired Hardware if TunerResourceManager(TRM) detects higher priority from the current
+     * request.
+     *
+     * @param deviceId The device ID to acquire Hardware for.
+     * @param info The TV input which will use the acquired Hardware.
+     * @param tvInputSessionId a String returned to TIS when the session was created.
+     *        {@see TvInputService#onCreateSession(String, String)}. If null, the client will be
+     *        treated as a background app.
+     * @param priorityHint The use case of the client. {@see TvInputService#PriorityHintUseCaseType}
+     * @param executor the executor on which the listener would be invoked.
+     * @param callback A callback to receive updates on Hardware.
+     * @return Hardware on success, {@code null} otherwise. When the TRM decides to not grant
+     *         resource, null is returned and the {@link IllegalStateException} is thrown with
+     *         "No enough resources".
+     *
+     * @hide
+     */
+    @SystemApi
+    @Nullable
+    @RequiresPermission(android.Manifest.permission.TV_INPUT_HARDWARE)
+    public Hardware acquireTvInputHardware(int deviceId, @NonNull TvInputInfo info,
+            @Nullable String tvInputSessionId,
+            @TvInputService.PriorityHintUseCaseType int priorityHint,
+            @NonNull @CallbackExecutor Executor executor,
+            @NonNull final HardwareCallback callback) {
+        Preconditions.checkNotNull(info);
+        Preconditions.checkNotNull(callback);
+        return acquireTvInputHardwareInternal(deviceId, info, tvInputSessionId, priorityHint,
+                executor, callback);
+    }
+
+    /**
+     * API to add a hardware device in the TvInputHardwareManager for CTS testing
+     * purpose.
+     *
+     * @param deviceId Id of the adding hardware device.
+     *
+     * @hide
+     */
+    @TestApi
+    public void addHardwareDevice(int deviceId) {
         try {
-            return new Hardware(
+            mService.addHardwareDevice(deviceId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * API to remove a hardware device in the TvInputHardwareManager for CTS testing
+     * purpose.
+     *
+     * @param deviceId Id of the removing hardware device.
+     *
+     * @hide
+     */
+    @TestApi
+    public void removeHardwareDevice(int deviceId) {
+        try {
+            mService.removeHardwareDevice(deviceId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    private Hardware acquireTvInputHardwareInternal(int deviceId, TvInputInfo info,
+            String tvInputSessionId, int priorityHint,
+            Executor executor, final HardwareCallback callback) {
+        try {
+            ITvInputHardware hardware =
                     mService.acquireTvInputHardware(deviceId, new ITvInputHardwareCallback.Stub() {
                 @Override
                 public void onReleased() {
-                    callback.onReleased();
+                            final long identity = Binder.clearCallingIdentity();
+                            try {
+                                executor.execute(() -> callback.onReleased());
+                            } finally {
+                                Binder.restoreCallingIdentity(identity);
+                            }
                 }
 
                 @Override
                 public void onStreamConfigChanged(TvStreamConfig[] configs) {
-                    callback.onStreamConfigChanged(configs);
+                            final long identity = Binder.clearCallingIdentity();
+                            try {
+                                executor.execute(() -> callback.onStreamConfigChanged(configs));
+                            } finally {
+                                Binder.restoreCallingIdentity(identity);
+                            }
                 }
-            }, info, mUserId));
+                    }, info, mUserId, tvInputSessionId, priorityHint);
+            if (hardware == null) {
+                return null;
+            }
+            return new Hardware(hardware);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
     /**
      * Releases previously acquired hardware object.
      *
+     * @param deviceId The device ID this Hardware was acquired for
+     * @param hardware Hardware to release.
+     *
      * @hide
      */
     @SystemApi
+    @RequiresPermission(android.Manifest.permission.TV_INPUT_HARDWARE)
     public void releaseTvInputHardware(int deviceId, Hardware hardware) {
         try {
             mService.releaseTvInputHardware(deviceId, hardware.getInterface(), mUserId);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
     /**
-     * Returns the list of currently available DVB devices on the system.
+     * Returns the list of currently available DVB frontend devices on the system.
      *
      * @return the list of {@link DvbDeviceInfo} objects representing available DVB devices.
      * @hide
      */
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.DVB_DEVICE)
+    @NonNull
     public List<DvbDeviceInfo> getDvbDeviceList() {
         try {
             return mService.getDvbDeviceList();
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
         }
     }
 
     /**
-     * Returns a {@link ParcelFileDescriptor} of a specified DVB device for a given
-     * {@link DvbDeviceInfo}
+     * Returns a {@link ParcelFileDescriptor} of a specified DVB device of a given type for a given
+     * {@link DvbDeviceInfo}.
      *
      * @param info A {@link DvbDeviceInfo} to open a DVB device.
-     * @param device A DVB device. The DVB device can be {@link #DVB_DEVICE_DEMUX},
-     *            {@link #DVB_DEVICE_DVR} or {@link #DVB_DEVICE_FRONTEND}.
+     * @param deviceType A DVB device type.
      * @return a {@link ParcelFileDescriptor} of a specified DVB device for a given
-     *         {@link DvbDeviceInfo}, or {@code null} if the given {@link DvbDeviceInfo} was invalid
-     *         or the specified DVB device was busy with a previous request.
+     * {@link DvbDeviceInfo}, or {@code null} if the given {@link DvbDeviceInfo}
+     * failed to open.
+     * @throws IllegalArgumentException if {@code deviceType} is invalid or the device is not found.
+
+     * @see <a href="https://www.linuxtv.org/docs/dvbapi/dvbapi.html">Linux DVB API v3</a>
      * @hide
      */
-    public ParcelFileDescriptor openDvbDevice(DvbDeviceInfo info, int device) {
+    @SystemApi
+    @RequiresPermission(android.Manifest.permission.DVB_DEVICE)
+    @Nullable
+    public ParcelFileDescriptor openDvbDevice(@NonNull DvbDeviceInfo info,
+            @DvbDeviceType int deviceType) {
         try {
-            if (DVB_DEVICE_START > device || DVB_DEVICE_END < device) {
-                throw new IllegalArgumentException("Invalid DVB device: " + device);
+            if (DVB_DEVICE_START > deviceType || DVB_DEVICE_END < deviceType) {
+                throw new IllegalArgumentException("Invalid DVB device: " + deviceType);
             }
-            return mService.openDvbDevice(info, device);
+            return mService.openDvbDevice(info, deviceType);
         } catch (RemoteException e) {
-            throw new RuntimeException(e);
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /**
+     * Requests to make a channel browsable.
+     *
+     * <p>Once called, the system will review the request and make the channel browsable based on
+     * its policy. The first request from a package is guaranteed to be approved.
+     *
+     * @param channelUri The URI for the channel to be browsable.
+     * @hide
+     */
+    public void requestChannelBrowsable(Uri channelUri) {
+        try {
+            mService.requestChannelBrowsable(channelUri, mUserId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
         }
     }
 
@@ -1316,7 +1956,6 @@ public final class TvInputManager {
      * The Session provides the per-session functionality of TV inputs.
      * @hide
      */
-    @SystemApi
     public static final class Session {
         static final int DISPATCH_IN_PROGRESS = -1;
         static final int DISPATCH_NOT_HANDLED = 0;
@@ -1379,7 +2018,7 @@ public final class TvInputManager {
             try {
                 mService.releaseSession(mToken, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
 
             releaseInternal();
@@ -1399,7 +2038,7 @@ public final class TvInputManager {
             try {
                 mService.setMainSession(mToken, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1417,7 +2056,7 @@ public final class TvInputManager {
             try {
                 mService.setSurface(mToken, surface, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1428,9 +2067,7 @@ public final class TvInputManager {
          * @param format The new PixelFormat of the surface.
          * @param width The new width of the surface.
          * @param height The new height of the surface.
-         * @hide
          */
-        @SystemApi
         public void dispatchSurfaceChanged(int format, int width, int height) {
             if (mToken == null) {
                 Log.w(TAG, "The session has been already released");
@@ -1439,7 +2076,7 @@ public final class TvInputManager {
             try {
                 mService.dispatchSurfaceChanged(mToken, format, width, height, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1460,7 +2097,7 @@ public final class TvInputManager {
                 }
                 mService.setVolume(mToken, volume, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1478,9 +2115,7 @@ public final class TvInputManager {
          *
          * @param channelUri The URI of a channel.
          * @param params A set of extra parameters which might be handled with this tune event.
-         * @hide
          */
-        @SystemApi
         public void tune(@NonNull Uri channelUri, Bundle params) {
             Preconditions.checkNotNull(channelUri);
             if (mToken == null) {
@@ -1500,7 +2135,7 @@ public final class TvInputManager {
             try {
                 mService.tune(mToken, channelUri, params, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1517,7 +2152,7 @@ public final class TvInputManager {
             try {
                 mService.setCaptionEnabled(mToken, enabled, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1559,7 +2194,7 @@ public final class TvInputManager {
             try {
                 mService.selectTrack(mToken, type, trackId, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1607,7 +2242,7 @@ public final class TvInputManager {
          * Returns the selected track for a given type. Returns {@code null} if the information is
          * not available or any of the tracks for the given type is not selected.
          *
-         * @return the ID of the selected track.
+         * @return The ID of the selected track.
          * @see #selectTrack
          */
         @Nullable
@@ -1697,6 +2332,21 @@ public final class TvInputManager {
         }
 
         /**
+         * Plays a given recorded TV program.
+         */
+        void timeShiftPlay(Uri recordedProgramUri) {
+            if (mToken == null) {
+                Log.w(TAG, "The session has been already released");
+                return;
+            }
+            try {
+                mService.timeShiftPlay(mToken, recordedProgramUri, mUserId);
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+
+        /**
          * Pauses the playback. Call {@link #timeShiftResume()} to restart the playback.
          */
         void timeShiftPause() {
@@ -1707,7 +2357,7 @@ public final class TvInputManager {
             try {
                 mService.timeShiftPause(mToken, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1722,7 +2372,7 @@ public final class TvInputManager {
             try {
                 mService.timeShiftResume(mToken, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1743,7 +2393,7 @@ public final class TvInputManager {
             try {
                 mService.timeShiftSeekTo(mToken, timeMs, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1760,7 +2410,7 @@ public final class TvInputManager {
             try {
                 mService.timeShiftSetPlaybackParams(mToken, params, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1777,7 +2427,51 @@ public final class TvInputManager {
             try {
                 mService.timeShiftEnablePositionTracking(mToken, enable, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
+            }
+        }
+
+        /**
+         * Starts TV program recording in the current recording session.
+         *
+         * @param programUri The URI for the TV program to record as a hint, built by
+         *            {@link TvContract#buildProgramUri(long)}. Can be {@code null}.
+         */
+        void startRecording(@Nullable Uri programUri) {
+            startRecording(programUri, null);
+        }
+
+        /**
+         * Starts TV program recording in the current recording session.
+         *
+         * @param programUri The URI for the TV program to record as a hint, built by
+         *            {@link TvContract#buildProgramUri(long)}. Can be {@code null}.
+         * @param params A set of extra parameters which might be handled with this event.
+         */
+        void startRecording(@Nullable Uri programUri, @Nullable Bundle params) {
+            if (mToken == null) {
+                Log.w(TAG, "The session has been already released");
+                return;
+            }
+            try {
+                mService.startRecording(mToken, programUri, params, mUserId);
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+
+        /**
+         * Stops TV program recording in the current recording session.
+         */
+        void stopRecording() {
+            if (mToken == null) {
+                Log.w(TAG, "The session has been already released");
+                return;
+            }
+            try {
+                mService.stopRecording(mToken, mUserId);
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1789,9 +2483,7 @@ public final class TvInputManager {
          *            i.e. prefixed with a package name you own, so that different developers will
          *            not create conflicting commands.
          * @param data Any data to include with the command.
-         * @hide
          */
-        @SystemApi
         public void sendAppPrivateCommand(String action, Bundle data) {
             if (mToken == null) {
                 Log.w(TAG, "The session has been already released");
@@ -1800,7 +2492,7 @@ public final class TvInputManager {
             try {
                 mService.sendAppPrivateCommand(mToken, action, data, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1828,7 +2520,7 @@ public final class TvInputManager {
             try {
                 mService.createOverlayView(mToken, view.getWindowToken(), frame, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1846,7 +2538,7 @@ public final class TvInputManager {
             try {
                 mService.relayoutOverlayView(mToken, frame, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1861,7 +2553,7 @@ public final class TvInputManager {
             try {
                 mService.removeOverlayView(mToken, mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -1877,7 +2569,7 @@ public final class TvInputManager {
             try {
                 mService.unblockContent(mToken, unblockedRating.flattenToString(), mUserId);
             } catch (RemoteException e) {
-                throw new RuntimeException(e);
+                throw e.rethrowFromSystemServer();
             }
         }
 
@@ -2055,7 +2747,7 @@ public final class TvInputManager {
                 }
             }
             synchronized (mSessionCallbackRecordMap) {
-                mSessionCallbackRecordMap.remove(mSeq);
+                mSessionCallbackRecordMap.delete(mSeq);
             }
         }
 
@@ -2161,12 +2853,10 @@ public final class TvInputManager {
             }
         }
 
+        /** @removed */
+        @SystemApi
         public boolean dispatchKeyEventToHdmi(KeyEvent event) {
-            try {
-                return mInterface.dispatchKeyEventToHdmi(event);
-            } catch (RemoteException e) {
-                throw new RuntimeException(e);
-            }
+            return false;
         }
 
         public void overrideAudioSink(int audioType, String audioAddress, int samplingRate,

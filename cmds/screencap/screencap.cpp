@@ -24,6 +24,7 @@
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 
 #include <binder/ProcessState.h>
 
@@ -31,30 +32,37 @@
 #include <gui/ISurfaceComposer.h>
 
 #include <ui/DisplayInfo.h>
+#include <ui/GraphicTypes.h>
 #include <ui/PixelFormat.h>
+
+#include <system/graphics.h>
 
 // TODO: Fix Skia.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <SkImageEncoder.h>
 #include <SkData.h>
+#include <SkColorSpace.h>
 #pragma GCC diagnostic pop
 
 using namespace android;
 
-static uint32_t DEFAULT_DISPLAY_ID = ISurfaceComposer::eDisplayIdMain;
+#define COLORSPACE_UNKNOWN    0
+#define COLORSPACE_SRGB       1
+#define COLORSPACE_DISPLAY_P3 2
 
-static void usage(const char* pname)
+static void usage(const char* pname, PhysicalDisplayId displayId)
 {
     fprintf(stderr,
             "usage: %s [-hp] [-d display-id] [FILENAME]\n"
             "   -h: this message\n"
             "   -p: save the file as a png.\n"
-            "   -d: specify the display id to capture, default %d.\n"
+            "   -d: specify the physical display ID to capture (default: %"
+                    ANDROID_PHYSICAL_DISPLAY_ID_FORMAT ")\n"
+            "       see \"dumpsys SurfaceFlinger --display-id\" for valid display IDs.\n"
             "If FILENAME ends with .png it will be saved as a png.\n"
             "If FILENAME is not given, the results will be printed to stdout.\n",
-            pname, DEFAULT_DISPLAY_ID
-    );
+            pname, displayId);
 }
 
 static SkColorType flinger2skia(PixelFormat f)
@@ -67,39 +75,63 @@ static SkColorType flinger2skia(PixelFormat f)
     }
 }
 
-static status_t vinfoToPixelFormat(const fb_var_screeninfo& vinfo,
-        uint32_t* bytespp, uint32_t* f)
+static sk_sp<SkColorSpace> dataSpaceToColorSpace(ui::Dataspace d)
 {
-
-    switch (vinfo.bits_per_pixel) {
-        case 16:
-            *f = PIXEL_FORMAT_RGB_565;
-            *bytespp = 2;
-            break;
-        case 24:
-            *f = PIXEL_FORMAT_RGB_888;
-            *bytespp = 3;
-            break;
-        case 32:
-            // TODO: do better decoding of vinfo here
-            *f = PIXEL_FORMAT_RGBX_8888;
-            *bytespp = 4;
-            break;
+    switch (d) {
+        case ui::Dataspace::V0_SRGB:
+            return SkColorSpace::MakeSRGB();
+        case ui::Dataspace::DISPLAY_P3:
+            return SkColorSpace::MakeRGB(SkNamedTransferFn::kSRGB, SkNamedGamut::kDCIP3);
         default:
-            return BAD_VALUE;
+            return nullptr;
     }
-    return NO_ERROR;
+}
+
+static uint32_t dataSpaceToInt(ui::Dataspace d)
+{
+    switch (d) {
+        case ui::Dataspace::V0_SRGB:
+            return COLORSPACE_SRGB;
+        case ui::Dataspace::DISPLAY_P3:
+            return COLORSPACE_DISPLAY_P3;
+        default:
+            return COLORSPACE_UNKNOWN;
+    }
 }
 
 static status_t notifyMediaScanner(const char* fileName) {
-    String8 cmd("am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file://");
-    String8 fileUrl("\"");
-    fileUrl.append(fileName);
-    fileUrl.append("\"");
-    cmd.append(fileName);
-    cmd.append(" > /dev/null");
-    int result = system(cmd.string());
-    if (result < 0) {
+    std::string filePath("file://");
+    filePath.append(fileName);
+    char *cmd[] = {
+        (char*) "am",
+        (char*) "broadcast",
+        (char*) "-a",
+        (char*) "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+        (char*) "-d",
+        &filePath[0],
+        nullptr
+    };
+
+    int status;
+    int pid = fork();
+    if (pid < 0){
+       fprintf(stderr, "Unable to fork in order to send intent for media scanner.\n");
+       return UNKNOWN_ERROR;
+    }
+    if (pid == 0){
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd < 0){
+            fprintf(stderr, "Unable to open /dev/null for media scanner stdout redirection.\n");
+            exit(1);
+        }
+        dup2(fd, 1);
+        int result = execvp(cmd[0], cmd);
+        close(fd);
+        exit(result);
+    }
+    wait(&status);
+
+    if (status < 0) {
         fprintf(stderr, "Unable to broadcast intent for media scanner.\n");
         return UNKNOWN_ERROR;
     }
@@ -108,11 +140,14 @@ static status_t notifyMediaScanner(const char* fileName) {
 
 int main(int argc, char** argv)
 {
-    ProcessState::self()->startThreadPool();
+    std::optional<PhysicalDisplayId> displayId = SurfaceComposerClient::getInternalDisplayId();
+    if (!displayId) {
+        fprintf(stderr, "Failed to get token for internal display\n");
+        return 1;
+    }
 
     const char* pname = argv[0];
     bool png = false;
-    int32_t displayId = DEFAULT_DISPLAY_ID;
     int c;
     while ((c = getopt(argc, argv, "phd:")) != -1) {
         switch (c) {
@@ -120,11 +155,11 @@ int main(int argc, char** argv)
                 png = true;
                 break;
             case 'd':
-                displayId = atoi(optarg);
+                displayId = atoll(optarg);
                 break;
             case '?':
             case 'h':
-                usage(pname);
+                usage(pname, *displayId);
                 return 1;
         }
     }
@@ -147,104 +182,90 @@ int main(int argc, char** argv)
             png = true;
         }
     }
-    
+
     if (fd == -1) {
-        usage(pname);
+        usage(pname, *displayId);
         return 1;
     }
 
     void const* mapbase = MAP_FAILED;
     ssize_t mapsize = -1;
 
-    void const* base = NULL;
+    void* base = NULL;
     uint32_t w, s, h, f;
     size_t size = 0;
 
-    // Maps orientations from DisplayInfo to ISurfaceComposer
-    static const uint32_t ORIENTATION_MAP[] = {
-        ISurfaceComposer::eRotateNone, // 0 == DISPLAY_ORIENTATION_0
-        ISurfaceComposer::eRotate270, // 1 == DISPLAY_ORIENTATION_90
-        ISurfaceComposer::eRotate180, // 2 == DISPLAY_ORIENTATION_180
-        ISurfaceComposer::eRotate90, // 3 == DISPLAY_ORIENTATION_270
-    };
+    // setThreadPoolMaxThreadCount(0) actually tells the kernel it's
+    // not allowed to spawn any additional threads, but we still spawn
+    // a binder thread from userspace when we call startThreadPool().
+    // See b/36066697 for rationale
+    ProcessState::self()->setThreadPoolMaxThreadCount(0);
+    ProcessState::self()->startThreadPool();
 
-    ScreenshotClient screenshot;
-    sp<IBinder> display = SurfaceComposerClient::getBuiltInDisplay(displayId);
-    if (display == NULL) {
-        fprintf(stderr, "Unable to get handle for display %d\n", displayId);
+    ui::Dataspace outDataspace;
+    sp<GraphicBuffer> outBuffer;
+
+    status_t result = ScreenshotClient::capture(*displayId, &outDataspace, &outBuffer);
+    if (result != NO_ERROR) {
+        close(fd);
         return 1;
     }
 
-    Vector<DisplayInfo> configs;
-    SurfaceComposerClient::getDisplayConfigs(display, &configs);
-    int activeConfig = SurfaceComposerClient::getActiveConfig(display);
-    if (static_cast<size_t>(activeConfig) >= configs.size()) {
-        fprintf(stderr, "Active config %d not inside configs (size %zu)\n",
-                activeConfig, configs.size());
-        return 1;
-    }
-    uint8_t displayOrientation = configs[activeConfig].orientation;
-    uint32_t captureOrientation = ORIENTATION_MAP[displayOrientation];
+    result = outBuffer->lock(GraphicBuffer::USAGE_SW_READ_OFTEN, &base);
 
-    status_t result = screenshot.update(display, Rect(), 0, 0, 0, -1U,
-            false, captureOrientation);
-    if (result == NO_ERROR) {
-        base = screenshot.getPixels();
-        w = screenshot.getWidth();
-        h = screenshot.getHeight();
-        s = screenshot.getStride();
-        f = screenshot.getFormat();
-        size = screenshot.getSize();
-    } else {
-        const char* fbpath = "/dev/graphics/fb0";
-        int fb = open(fbpath, O_RDONLY);
-        if (fb >= 0) {
-            struct fb_var_screeninfo vinfo;
-            if (ioctl(fb, FBIOGET_VSCREENINFO, &vinfo) == 0) {
-                uint32_t bytespp;
-                if (vinfoToPixelFormat(vinfo, &bytespp, &f) == NO_ERROR) {
-                    size_t offset = (vinfo.xoffset + vinfo.yoffset*vinfo.xres) * bytespp;
-                    w = vinfo.xres;
-                    h = vinfo.yres;
-                    s = vinfo.xres;
-                    size = w*h*bytespp;
-                    mapsize = offset + size;
-                    mapbase = mmap(0, mapsize, PROT_READ, MAP_PRIVATE, fb, 0);
-                    if (mapbase != MAP_FAILED) {
-                        base = (void const *)((char const *)mapbase + offset);
-                    }
-                }
-            }
-            close(fb);
-        }
-    }
-
-    if (base != NULL) {
-        if (png) {
-            const SkImageInfo info = SkImageInfo::Make(w, h, flinger2skia(f),
-                                                       kPremul_SkAlphaType);
-            SkAutoTUnref<SkData> data(SkImageEncoder::EncodeData(info, base, s*bytesPerPixel(f),
-                    SkImageEncoder::kPNG_Type, SkImageEncoder::kDefaultQuality));
-            if (data.get()) {
-                write(fd, data->data(), data->size());
-            }
-            if (fn != NULL) {
-                notifyMediaScanner(fn);
-            }
+    if (base == nullptr || result != NO_ERROR) {
+        String8 reason;
+        if (result != NO_ERROR) {
+            reason.appendFormat(" Error Code: %d", result);
         } else {
-            write(fd, &w, 4);
-            write(fd, &h, 4);
-            write(fd, &f, 4);
-            size_t Bpp = bytesPerPixel(f);
-            for (size_t y=0 ; y<h ; y++) {
-                write(fd, base, w*Bpp);
-                base = (void *)((char *)base + s*Bpp);
-            }
+            reason = "Failed to write to buffer";
+        }
+        fprintf(stderr, "Failed to take screenshot (%s)\n", reason.c_str());
+        close(fd);
+        return 1;
+    }
+
+    w = outBuffer->getWidth();
+    h = outBuffer->getHeight();
+    s = outBuffer->getStride();
+    f = outBuffer->getPixelFormat();
+    size = s * h * bytesPerPixel(f);
+
+    if (png) {
+        const SkImageInfo info =
+            SkImageInfo::Make(w, h, flinger2skia(f), kPremul_SkAlphaType,
+                              dataSpaceToColorSpace(outDataspace));
+        SkPixmap pixmap(info, base, s * bytesPerPixel(f));
+        struct FDWStream final : public SkWStream {
+          size_t fBytesWritten = 0;
+          int fFd;
+          FDWStream(int f) : fFd(f) {}
+          size_t bytesWritten() const override { return fBytesWritten; }
+          bool write(const void* buffer, size_t size) override {
+            fBytesWritten += size;
+            return size == 0 || ::write(fFd, buffer, size) > 0;
+          }
+        } fdStream(fd);
+        (void)SkEncodeImage(&fdStream, pixmap, SkEncodedImageFormat::kPNG, 100);
+        if (fn != NULL) {
+            notifyMediaScanner(fn);
+        }
+    } else {
+        uint32_t c = dataSpaceToInt(outDataspace);
+        write(fd, &w, 4);
+        write(fd, &h, 4);
+        write(fd, &f, 4);
+        write(fd, &c, 4);
+        size_t Bpp = bytesPerPixel(f);
+        for (size_t y=0 ; y<h ; y++) {
+            write(fd, base, w*Bpp);
+            base = (void *)((char *)base + s*Bpp);
         }
     }
     close(fd);
     if (mapbase != MAP_FAILED) {
         munmap((void *)mapbase, mapsize);
     }
+
     return 0;
 }

@@ -14,26 +14,41 @@
  * limitations under the License.
  */
 
-#ifndef __ANDROID_R_H
-#define __ANDROID_R_H
+#ifndef TEST_DATA_SYSTEM_R_H_
+#define TEST_DATA_SYSTEM_R_H_
+
+#include <cstdint>
 
 namespace android {
-namespace R {
 
-namespace attr {
-    enum {
-        background  = 0x01010000, // default
-        foreground  = 0x01010001, // default
+struct R {
+  struct attr {
+    enum : uint32_t {
+      background = 0x01010000,  // default
+      foreground = 0x01010001,  // default
     };
-}
+  };
 
-namespace style {
-    enum {
-        Theme_One      = 0x01020000,   // default
+  struct style {
+    enum : uint32_t {
+      Theme_One = 0x01020000,  // default
     };
-}
+  };
 
-} // namespace R
-} // namespace android
+  struct integer {
+    enum : uint32_t {
+      number = 0x01030000,  // sv
+    };
+  };
 
-#endif // __ANDROID_R_H
+  struct string {
+    enum : uint32_t {
+      no = 0x01040009,
+      yes = 0x01040013,
+    };
+  };
+};
+
+}  // namespace android
+
+#endif  // TEST_DATA_SYSTEM_R_H_

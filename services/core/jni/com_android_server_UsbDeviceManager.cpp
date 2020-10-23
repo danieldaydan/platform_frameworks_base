@@ -18,9 +18,11 @@
 #include "utils/Log.h"
 
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIPlatformHelp.h>
+#include <nativehelper/ScopedUtfChars.h>
 #include "android_runtime/AndroidRuntime.h"
 #include "android_runtime/Log.h"
+#include "MtpDescriptors.h"
 
 #include <stdio.h>
 #include <asm/byteorder.h>
@@ -87,6 +89,7 @@ static jobject android_server_UsbDeviceManager_openAccessory(JNIEnv *env, jobjec
     }
     jobject fileDescriptor = jniCreateFileDescriptor(env, fd);
     if (fileDescriptor == NULL) {
+        close(fd);
         return NULL;
     }
     return env->NewObject(gParcelFileDescriptorOffsets.mClass,
@@ -118,6 +121,33 @@ static jint android_server_UsbDeviceManager_getAudioMode(JNIEnv* /* env */, jobj
     return result;
 }
 
+static jobject android_server_UsbDeviceManager_openControl(JNIEnv *env, jobject /* thiz */, jstring jFunction) {
+    ScopedUtfChars function(env, jFunction);
+    bool ptp = false;
+    int fd = -1;
+    if (!strcmp(function.c_str(), "ptp")) {
+        ptp = true;
+    }
+    if (!strcmp(function.c_str(), "mtp") || ptp) {
+        fd = TEMP_FAILURE_RETRY(open(ptp ? FFS_PTP_EP0 : FFS_MTP_EP0, O_RDWR));
+        if (fd < 0) {
+            ALOGE("could not open control for %s %s", function.c_str(), strerror(errno));
+            return NULL;
+        }
+        if (!writeDescriptors(fd, ptp)) {
+            close(fd);
+            return NULL;
+        }
+    }
+
+    jobject jifd = jniCreateFileDescriptor(env, fd);
+    if (jifd == NULL) {
+        // OutOfMemoryError will be pending.
+        close(fd);
+    }
+    return jifd;
+}
+
 static const JNINativeMethod method_table[] = {
     { "nativeGetAccessoryStrings",  "()[Ljava/lang/String;",
                                     (void*)android_server_UsbDeviceManager_getAccessoryStrings },
@@ -127,6 +157,8 @@ static const JNINativeMethod method_table[] = {
                                     (void*)android_server_UsbDeviceManager_isStartRequested },
     { "nativeGetAudioMode",         "()I",
                                     (void*)android_server_UsbDeviceManager_getAudioMode },
+    { "nativeOpenControl",          "(Ljava/lang/String;)Ljava/io/FileDescriptor;",
+                                    (void*)android_server_UsbDeviceManager_openControl },
 };
 
 int register_android_server_UsbDeviceManager(JNIEnv *env)

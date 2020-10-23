@@ -68,7 +68,7 @@ public class RestrictionEntry implements Parcelable {
 
     /**
      * Restriction of type "multi-select". Use this for presenting a multi-select list where more
-     * than one entry can be selected, such as for choosing specific titles to white-list.
+     * than one entry can be selected, such as for choosing specific titles to allowlist.
      * Call {@link #setChoiceEntries(String[])} and
      * {@link #setChoiceValues(String[])} to set the localized list entries to present to the user
      * and the corresponding values, respectively.
@@ -531,7 +531,7 @@ public class RestrictionEntry implements Parcelable {
         dest.writeParcelableArray(mRestrictions, 0);
     }
 
-    public static final Creator<RestrictionEntry> CREATOR = new Creator<RestrictionEntry>() {
+    public static final @android.annotation.NonNull Creator<RestrictionEntry> CREATOR = new Creator<RestrictionEntry>() {
         public RestrictionEntry createFromParcel(Parcel source) {
             return new RestrictionEntry(source);
         }

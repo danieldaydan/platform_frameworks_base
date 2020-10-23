@@ -16,6 +16,7 @@
 
 package com.android.bandwidthtest;
 
+import android.app.UiAutomation;
 import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo.State;
@@ -74,7 +75,13 @@ public class BandwidthTest extends InstrumentationTestCase {
         Log.v(LOG_TAG, "Initialized mConnectionUtil");
         mUid = Process.myUid();
         mTManager = (TelephonyManager)mContext.getSystemService(Context.TELEPHONY_SERVICE);
-        mDeviceId = mTManager.getDeviceId();
+        final UiAutomation uiAutomation = getInstrumentation().getUiAutomation();
+        try {
+            uiAutomation.adoptShellPermissionIdentity();
+            mDeviceId = mTManager.getDeviceId();
+        } finally {
+            uiAutomation.dropShellPermissionIdentity();
+        }
     }
 
     @Override
@@ -261,7 +268,7 @@ public class BandwidthTest extends InstrumentationTestCase {
         File snd_stat = new File (root_filepath + "tcp_snd");
         int tx = BandwidthTestUtil.parseIntValueFromFile(snd_stat);
         NetworkStats stats = new NetworkStats(SystemClock.elapsedRealtime(), 1);
-        stats.addValues(NetworkStats.IFACE_ALL, uid, NetworkStats.SET_DEFAULT,
+        stats.insertEntry(NetworkStats.IFACE_ALL, uid, NetworkStats.SET_DEFAULT,
                 NetworkStats.TAG_NONE, rx, 0, tx, 0, 0);
         return stats;
     }

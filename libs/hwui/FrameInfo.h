@@ -48,24 +48,30 @@ enum class FrameInfoIndex {
     SwapBuffers,
     FrameCompleted,
 
+    DequeueBufferDuration,
+    QueueBufferDuration,
+
+    GpuCompleted,
+
     // Must be the last value!
+    // Also must be kept in sync with FrameMetrics.java#FRAME_STATS_COUNT
     NumIndexes
 };
 
 extern const std::string FrameInfoNames[];
 
 namespace FrameInfoFlags {
-    enum {
-        WindowLayoutChanged = 1 << 0,
-        RTAnimation = 1 << 1,
-        SurfaceCanvas = 1 << 2,
-        SkippedFrame = 1 << 3,
-    };
+enum {
+    WindowLayoutChanged = 1 << 0,
+    RTAnimation = 1 << 1,
+    SurfaceCanvas = 1 << 2,
+    SkippedFrame = 1 << 3,
+};
 };
 
 class ANDROID_API UiFrameInfoBuilder {
 public:
-    UiFrameInfoBuilder(int64_t* buffer) : mBuffer(buffer) {
+    explicit UiFrameInfoBuilder(int64_t* buffer) : mBuffer(buffer) {
         memset(mBuffer, 0, UI_THREAD_FRAME_INFO_SIZE * sizeof(int64_t));
     }
 
@@ -87,9 +93,7 @@ public:
     }
 
 private:
-    inline int64_t& set(FrameInfoIndex index) {
-        return mBuffer[static_cast<int>(index)];
-    }
+    inline int64_t& set(FrameInfoIndex index) { return mBuffer[static_cast<int>(index)]; }
 
     int64_t* mBuffer;
 };
@@ -98,29 +102,23 @@ class FrameInfo {
 public:
     void importUiThreadInfo(int64_t* info);
 
-    void markSyncStart() {
-        set(FrameInfoIndex::SyncStart) = systemTime(CLOCK_MONOTONIC);
-    }
+    void markSyncStart() { set(FrameInfoIndex::SyncStart) = systemTime(SYSTEM_TIME_MONOTONIC); }
 
     void markIssueDrawCommandsStart() {
-        set(FrameInfoIndex::IssueDrawCommandsStart) = systemTime(CLOCK_MONOTONIC);
+        set(FrameInfoIndex::IssueDrawCommandsStart) = systemTime(SYSTEM_TIME_MONOTONIC);
     }
 
-    void markSwapBuffers() {
-        set(FrameInfoIndex::SwapBuffers) = systemTime(CLOCK_MONOTONIC);
-    }
+    void markSwapBuffers() { set(FrameInfoIndex::SwapBuffers) = systemTime(SYSTEM_TIME_MONOTONIC); }
 
-    void markFrameCompleted() {
-        set(FrameInfoIndex::FrameCompleted) = systemTime(CLOCK_MONOTONIC);
-    }
+    void markFrameCompleted() { set(FrameInfoIndex::FrameCompleted) = systemTime(SYSTEM_TIME_MONOTONIC); }
 
     void addFlag(int frameInfoFlag) {
         set(FrameInfoIndex::Flags) |= static_cast<uint64_t>(frameInfoFlag);
     }
 
-    inline int64_t operator[](FrameInfoIndex index) const {
-        return get(index);
-    }
+    const int64_t* data() const { return mFrameInfo; }
+
+    inline int64_t operator[](FrameInfoIndex index) const { return get(index); }
 
     inline int64_t operator[](int index) const {
         if (index < 0 || index >= static_cast<int>(FrameInfoIndex::NumIndexes)) return 0;
@@ -132,12 +130,10 @@ public:
         int64_t starttime = get(start);
         int64_t gap = endtime - starttime;
         gap = starttime > 0 ? gap : 0;
-        if (end > FrameInfoIndex::SyncQueued &&
-                start < FrameInfoIndex::SyncQueued) {
+        if (end > FrameInfoIndex::SyncQueued && start < FrameInfoIndex::SyncQueued) {
             // Need to subtract out the time spent in a stalled state
             // as this will be captured by the previous frame's info
-            int64_t offset = get(FrameInfoIndex::SyncStart)
-                    - get(FrameInfoIndex::SyncQueued);
+            int64_t offset = get(FrameInfoIndex::SyncStart) - get(FrameInfoIndex::SyncQueued);
             if (offset > 0) {
                 gap -= offset;
             }
@@ -149,9 +145,14 @@ public:
         return duration(FrameInfoIndex::IntendedVsync, FrameInfoIndex::FrameCompleted);
     }
 
-    inline int64_t& set(FrameInfoIndex index) {
-        return mFrameInfo[static_cast<int>(index)];
+    inline int64_t gpuDrawTime() const {
+        // GPU start time is approximated to the moment before swapBuffer is invoked.
+        // We could add an EGLSyncKHR fence at the beginning of the frame, but that is an overhead.
+        int64_t endTime = get(FrameInfoIndex::GpuCompleted);
+        return endTime > 0 ? endTime - get(FrameInfoIndex::SwapBuffers) : -1;
     }
+
+    inline int64_t& set(FrameInfoIndex index) { return mFrameInfo[static_cast<int>(index)]; }
 
     inline int64_t get(FrameInfoIndex index) const {
         if (index == FrameInfoIndex::NumIndexes) return 0;

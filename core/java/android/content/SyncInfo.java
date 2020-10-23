@@ -17,6 +17,8 @@
 package android.content;
 
 import android.accounts.Account;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Build;
 import android.os.Parcel;
 import android.os.Parcelable;
 
@@ -24,7 +26,15 @@ import android.os.Parcelable;
  * Information about the sync operation that is currently underway.
  */
 public class SyncInfo implements Parcelable {
+    /**
+     * Used when the caller receiving this object doesn't have permission to access the accounts
+     * on device.
+     * @See Manifest.permission.GET_ACCOUNTS
+     */
+    private static final Account REDACTED_ACCOUNT = new Account("*****", "*****");
+
     /** @hide */
+    @UnsupportedAppUsage
     public final int authorityId;
 
     /**
@@ -44,7 +54,19 @@ public class SyncInfo implements Parcelable {
      */
     public final long startTime;
 
+    /**
+     * Creates a SyncInfo object with an unusable Account. Used when the caller receiving this
+     * object doesn't have access to the accounts on the device.
+     * @See Manifest.permission.GET_ACCOUNTS
+     * @hide
+     */
+    public static SyncInfo createAccountRedacted(
+        int authorityId, String authority, long startTime) {
+            return new SyncInfo(authorityId, REDACTED_ACCOUNT, authority, startTime);
+    }
+
     /** @hide */
+    @UnsupportedAppUsage
     public SyncInfo(int authorityId, Account account, String authority, long startTime) {
         this.authorityId = authorityId;
         this.account = account;
@@ -74,6 +96,7 @@ public class SyncInfo implements Parcelable {
     }
 
     /** @hide */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     SyncInfo(Parcel parcel) {
         authorityId = parcel.readInt();
         account = parcel.readParcelable(Account.class.getClassLoader());
@@ -82,7 +105,8 @@ public class SyncInfo implements Parcelable {
     }
 
     /** @hide */
-    public static final Creator<SyncInfo> CREATOR = new Creator<SyncInfo>() {
+    @UnsupportedAppUsage
+    public static final @android.annotation.NonNull Creator<SyncInfo> CREATOR = new Creator<SyncInfo>() {
         public SyncInfo createFromParcel(Parcel in) {
             return new SyncInfo(in);
         }

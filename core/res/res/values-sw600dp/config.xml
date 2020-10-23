@@ -28,7 +28,7 @@
 
     <!-- see comment in values/config.xml -->
     <dimen name="config_prefDialogWidth">580dp</dimen>
-    
+
     <!-- If true, the screen can be rotated via the accelerometer in all 4
          rotations as the default behavior. -->
     <bool name="config_allowAllRotations">true</bool>
@@ -40,5 +40,16 @@
     <!-- Use a larger scaling span for larger screen devices. -->
     <dimen name="config_minScalingSpan">32mm</dimen>
 
+    <integer name="config_dockedStackDividerSnapMode">1</integer>
+
+    <!-- Controls whether the nav bar can move from the bottom to the side in landscape.
+         Only applies if the device display is not square. -->
+    <bool name="config_navBarCanMove">false</bool>
+
+    <!-- Set to true to enable the user switcher on the keyguard. -->
+    <bool name="config_keyguardUserSwitcher">true</bool>
+
+    <!-- If true, show multiuser switcher by default unless the user specifically disables it. -->
+    <bool name="config_showUserSwitcherByDefault">true</bool>
 </resources>
 

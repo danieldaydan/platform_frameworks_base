@@ -16,17 +16,22 @@
 
 package android.graphics.drawable;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.res.Resources;
+import android.content.res.Resources.Theme;
+import android.content.res.TypedArray;
+import android.graphics.Canvas;
+import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.util.AttributeSet;
+import android.view.Gravity;
+
 import com.android.internal.R;
 
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
-
-import android.content.res.Resources;
-import android.content.res.TypedArray;
-import android.content.res.Resources.Theme;
-import android.graphics.*;
-import android.view.Gravity;
-import android.util.AttributeSet;
 
 import java.io.IOException;
 
@@ -56,10 +61,11 @@ public class ClipDrawable extends DrawableWrapper {
 
     private final Rect mTmpRect = new Rect();
 
+    @UnsupportedAppUsage
     private ClipState mState;
 
     ClipDrawable() {
-        this(new ClipState(null), null);
+        this(new ClipState(null, null), null);
     }
 
     /**
@@ -72,7 +78,7 @@ public class ClipDrawable extends DrawableWrapper {
      *                   {@link #VERTICAL}
      */
     public ClipDrawable(Drawable drawable, int gravity, int orientation) {
-        this(new ClipState(null), null);
+        this(new ClipState(null, null), null);
 
         mState.mGravity = gravity;
         mState.mOrientation = orientation;
@@ -81,45 +87,23 @@ public class ClipDrawable extends DrawableWrapper {
     }
 
     @Override
-    public void inflate(Resources r, XmlPullParser parser, AttributeSet attrs, Theme theme)
+    public void inflate(@NonNull Resources r, @NonNull XmlPullParser parser,
+            @NonNull AttributeSet attrs, @Nullable Theme theme)
             throws XmlPullParserException, IOException {
+        final TypedArray a = obtainAttributes(r, theme, attrs, R.styleable.ClipDrawable);
+
+        // Inflation will advance the XmlPullParser and AttributeSet.
         super.inflate(r, parser, attrs, theme);
 
-        final TypedArray a = obtainAttributes(r, theme, attrs, R.styleable.ClipDrawable);
         updateStateFromTypedArray(a);
-        inflateChildDrawable(r, parser, attrs, theme);
         verifyRequiredAttributes(a);
         a.recycle();
     }
 
-    private void verifyRequiredAttributes(TypedArray a) throws XmlPullParserException {
-        // If we're not waiting on a theme, verify required attributes.
-        if (getDrawable() == null && (mState.mThemeAttrs == null
-                || mState.mThemeAttrs[R.styleable.ClipDrawable_drawable] == 0)) {
-            throw new XmlPullParserException(a.getPositionDescription()
-                    + ": <clip> tag requires a 'drawable' attribute or "
-                    + "child tag defining a drawable");
-        }
-    }
-
     @Override
-    void updateStateFromTypedArray(TypedArray a) {
-        super.updateStateFromTypedArray(a);
+    public void applyTheme(@NonNull Theme t) {
+        super.applyTheme(t);
 
-        final ClipState state = mState;
-        state.mOrientation = a.getInt(
-                R.styleable.ClipDrawable_clipOrientation, state.mOrientation);
-        state.mGravity = a.getInt(
-                R.styleable.ClipDrawable_gravity, state.mGravity);
-
-        final Drawable dr = a.getDrawable(R.styleable.ClipDrawable_drawable);
-        if (dr != null) {
-            setDrawable(dr);
-        }
-    }
-
-    @Override
-    public void applyTheme(Theme t) {
         final ClipState state = mState;
         if (state == null) {
             return;
@@ -131,15 +115,39 @@ public class ClipDrawable extends DrawableWrapper {
                 updateStateFromTypedArray(a);
                 verifyRequiredAttributes(a);
             } catch (XmlPullParserException e) {
-                throw new RuntimeException(e);
+                rethrowAsRuntimeException(e);
             } finally {
                 a.recycle();
             }
         }
+    }
 
-        // The drawable may have changed as a result of applying the theme, so
-        // apply the theme to the wrapped drawable last.
-        super.applyTheme(t);
+    private void verifyRequiredAttributes(@NonNull TypedArray a) throws XmlPullParserException {
+        // If we're not waiting on a theme, verify required attributes.
+        if (getDrawable() == null && (mState.mThemeAttrs == null
+                || mState.mThemeAttrs[R.styleable.ClipDrawable_drawable] == 0)) {
+            throw new XmlPullParserException(a.getPositionDescription()
+                    + ": <clip> tag requires a 'drawable' attribute or "
+                    + "child tag defining a drawable");
+        }
+    }
+
+    private void updateStateFromTypedArray(@NonNull TypedArray a) {
+        final ClipState state = mState;
+        if (state == null) {
+            return;
+        }
+
+        // Account for any configuration changes.
+        state.mChangingConfigurations |= a.getChangingConfigurations();
+
+        // Extract the theme attributes, if any.
+        state.mThemeAttrs = a.extractThemeAttrs();
+
+        state.mOrientation = a.getInt(
+                R.styleable.ClipDrawable_clipOrientation, state.mOrientation);
+        state.mGravity = a.getInt(
+                R.styleable.ClipDrawable_gravity, state.mGravity);
     }
 
     @Override
@@ -200,12 +208,20 @@ public class ClipDrawable extends DrawableWrapper {
         }
     }
 
+    @Override
+    DrawableWrapperState mutateConstantState() {
+        mState = new ClipState(mState, null);
+        return mState;
+    }
+
     static final class ClipState extends DrawableWrapper.DrawableWrapperState {
+        private int[] mThemeAttrs;
+
         int mOrientation = HORIZONTAL;
         int mGravity = Gravity.LEFT;
 
-        ClipState(ClipState orig) {
-            super(orig);
+        ClipState(ClipState orig, Resources res) {
+            super(orig, res);
 
             if (orig != null) {
                 mOrientation = orig.mOrientation;

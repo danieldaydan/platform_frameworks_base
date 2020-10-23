@@ -16,7 +16,9 @@
 
 package android.view;
 
+import android.annotation.NonNull;
 import android.graphics.Rect;
+import android.graphics.Region;
 import android.os.Bundle;
 import android.view.accessibility.AccessibilityEvent;
 
@@ -53,12 +55,36 @@ public interface ViewParent {
      */
     public void requestTransparentRegion(View child);
 
+
+    /**
+     * The target View has been invalidated, or has had a drawing property changed that
+     * requires the hierarchy to re-render.
+     *
+     * This method is called by the View hierarchy to signal ancestors that a View either needs to
+     * re-record its drawing commands, or drawing properties have changed. This is how Views
+     * schedule a drawing traversal.
+     *
+     * This signal is generally only dispatched for attached Views, since only they need to draw.
+     *
+     * @param child Direct child of this ViewParent containing target
+     * @param target The view that needs to redraw
+     */
+    default void onDescendantInvalidated(@NonNull View child, @NonNull View target) {
+        if (getParent() != null) {
+            // Note: should pass 'this' as default, but can't since we may not be a View
+            getParent().onDescendantInvalidated(child, target);
+        }
+    }
+
     /**
      * All or part of a child is dirty and needs to be redrawn.
      * 
      * @param child The child which is dirty
      * @param r The area within the child that is invalid
+     *
+     * @deprecated Use {@link #onDescendantInvalidated(View, View)} instead.
      */
+    @Deprecated
     public void invalidateChild(View child, Rect r);
 
     /**
@@ -80,7 +106,10 @@ public interface ViewParent {
      * @param r The area within the child that is invalid
      *
      * @return the parent of this ViewParent or null
+     *
+     * @deprecated Use {@link #onDescendantInvalidated(View, View)} instead.
      */
+    @Deprecated
     public ViewParent invalidateChildInParent(int[] location, Rect r);
 
     /**
@@ -147,6 +176,19 @@ public interface ViewParent {
     public View focusSearch(View v, int direction);
 
     /**
+     * Find the nearest keyboard navigation cluster in the specified direction.
+     * This does not actually give focus to that cluster.
+     *
+     * @param currentCluster The starting point of the search. Null means the current cluster is not
+     *                       found yet
+     * @param direction Direction to look
+     *
+     * @return The nearest keyboard navigation cluster in the specified direction, or null if none
+     *         can be found
+     */
+    View keyboardNavigationClusterSearch(View currentCluster, int direction);
+
+    /**
      * Change the z order of the child so it's on top of all other children.
      * This ordering change may affect layout, if this container
      * uses an order-dependent layout scheme (e.g., LinearLayout). Prior
@@ -169,17 +211,45 @@ public interface ViewParent {
     public void focusableViewAvailable(View v);
 
     /**
-     * Bring up a context menu for the specified view or its ancestors.
-     *
-     * <p>In most cases, a subclass does not need to override this.  However, if
+     * Shows the context menu for the specified view or its ancestors.
+     * <p>
+     * In most cases, a subclass does not need to override this. However, if
      * the subclass is added directly to the window manager (for example,
      * {@link ViewManager#addView(View, android.view.ViewGroup.LayoutParams)})
-     * then it should override this and show the context menu.</p>
-     * 
-     * @param originalView The source view where the context menu was first invoked
-     * @return true if a context menu was displayed
+     * then it should override this and show the context menu.
+     *
+     * @param originalView the source view where the context menu was first
+     *                     invoked
+     * @return {@code true} if the context menu was shown, {@code false}
+     *         otherwise
+     * @see #showContextMenuForChild(View, float, float)
      */
     public boolean showContextMenuForChild(View originalView);
+
+    /**
+     * Shows the context menu for the specified view or its ancestors anchored
+     * to the specified view-relative coordinate.
+     * <p>
+     * In most cases, a subclass does not need to override this. However, if
+     * the subclass is added directly to the window manager (for example,
+     * {@link ViewManager#addView(View, android.view.ViewGroup.LayoutParams)})
+     * then it should override this and show the context menu.
+     * <p>
+     * If a subclass overrides this method it should also override
+     * {@link #showContextMenuForChild(View)}.
+     *
+     * @param originalView the source view where the context menu was first
+     *                     invoked
+     * @param x the X coordinate in pixels relative to the original view to
+     *          which the menu should be anchored, or {@link Float#NaN} to
+     *          disable anchoring
+     * @param y the Y coordinate in pixels relative to the original view to
+     *          which the menu should be anchored, or {@link Float#NaN} to
+     *          disable anchoring
+     * @return {@code true} if the context menu was shown, {@code false}
+     *         otherwise
+     */
+    boolean showContextMenuForChild(View originalView, float x, float y);
 
     /**
      * Have the parent populate the specified context menu if it has anything to
@@ -243,14 +313,14 @@ public interface ViewParent {
      *            intercept touch events.
      */
     public void requestDisallowInterceptTouchEvent(boolean disallowIntercept);
-    
+
     /**
      * Called when a child of this group wants a particular rectangle to be
      * positioned onto the screen.  {@link ViewGroup}s overriding this can trust
      * that:
      * <ul>
      *   <li>child will be a direct child of this group</li>
-     *   <li>rectangle will be in the child's coordinates</li>
+     *   <li>rectangle will be in the child's content coordinates</li>
      * </ul>
      *
      * <p>{@link ViewGroup}s overriding this should uphold the contract:</p>
@@ -333,17 +403,19 @@ public interface ViewParent {
      * descendants has changed and that the structure of the subtree is
      * different.
      * @param child The direct child whose subtree has changed.
-     * @param source The descendant view that changed.
+     * @param source The descendant view that changed. May not be {@code null}.
      * @param changeType A bit mask of the types of changes that occurred. One
      *            or more of:
      *            <ul>
      *            <li>{@link AccessibilityEvent#CONTENT_CHANGE_TYPE_CONTENT_DESCRIPTION}
+     *            <li>{@link AccessibilityEvent#CONTENT_CHANGE_TYPE_STATE_DESCRIPTION}
      *            <li>{@link AccessibilityEvent#CONTENT_CHANGE_TYPE_SUBTREE}
      *            <li>{@link AccessibilityEvent#CONTENT_CHANGE_TYPE_TEXT}
      *            <li>{@link AccessibilityEvent#CONTENT_CHANGE_TYPE_UNDEFINED}
      *            </ul>
      */
-    public void notifySubtreeAccessibilityStateChanged(View child, View source, int changeType);
+    public void notifySubtreeAccessibilityStateChanged(
+            View child, @NonNull View source, int changeType);
 
     /**
      * Tells if this view parent can resolve the layout direction.
@@ -590,4 +662,31 @@ public interface ViewParent {
      * @return true if the action was consumed by this ViewParent
      */
     public boolean onNestedPrePerformAccessibilityAction(View target, int action, Bundle arguments);
+
+    /**
+     * Given a touchable region of a child, this method reduces region by the bounds of all views on
+     * top of the child for which {@link View#canReceivePointerEvents} returns {@code true}. This
+     * applies recursively for all views in the view hierarchy on top of this one.
+     *
+     * @param touchableRegion The touchable region we want to modify.
+     * @param view A child view of this ViewGroup which indicates the z-order of the touchable
+     *             region.
+     * @hide
+     */
+    default void subtractObscuredTouchableRegion(Region touchableRegion, View view) {
+    }
+
+    /**
+     * Unbuffered dispatch has been requested by a child of this view parent.
+     * This method is called by the View hierarchy to signal ancestors that a View needs to
+     * request unbuffered dispatch.
+     *
+     * @see View#requestUnbufferedDispatch(int)
+     * @hide
+     */
+    default void onDescendantUnbufferedRequested() {
+        if (getParent() != null) {
+            getParent().onDescendantUnbufferedRequested();
+        }
+    }
 }

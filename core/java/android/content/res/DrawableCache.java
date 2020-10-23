@@ -16,35 +16,32 @@
 
 package android.content.res;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.graphics.drawable.Drawable;
 
 /**
  * Class which can be used to cache Drawable resources against a theme.
  */
 class DrawableCache extends ThemedResourceCache<Drawable.ConstantState> {
-    private final Resources mResources;
 
-    /**
-     * Creates a cache for the given Resources instance.
-     *
-     * @param resources the resources to use when creating new instances
-     */
-    public DrawableCache(Resources resources) {
-        mResources = resources;
+    @UnsupportedAppUsage
+    DrawableCache() {
     }
 
     /**
      * If the resource is cached, creates and returns a new instance of it.
      *
      * @param key a key that uniquely identifies the drawable resource
+     * @param resources a Resources object from which to create new instances.
      * @param theme the theme where the resource will be used
      * @return a new instance of the resource, or {@code null} if not in
      *         the cache
      */
-    public Drawable getInstance(long key, Resources.Theme theme) {
+    @UnsupportedAppUsage
+    public Drawable getInstance(long key, Resources resources, Resources.Theme theme) {
         final Drawable.ConstantState entry = get(key, theme);
         if (entry != null) {
-            return entry.newDrawable(mResources, theme);
+            return entry.newDrawable(resources, theme);
         }
 
         return null;

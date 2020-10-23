@@ -25,7 +25,6 @@ import android.widget.Button;
 
 import com.android.frameworks.coretests.R;
 
-
 /**
  * Tests hiding and showing the list filter by hiding and showing an ancestor of the 
  * ListView
@@ -46,10 +45,10 @@ public class ListFilter extends ListActivity implements OnClickListener {
         getListView().setTextFilterEnabled(true);
         mFrame = findViewById(R.id.frame);
         
-        mHide = (Button) findViewById(R.id.hide);
+        mHide = findViewById(R.id.hide);
         mHide.setOnClickListener(this);
         
-        mShow = (Button) findViewById(R.id.show);
+        mShow = findViewById(R.id.show);
         mShow.setOnClickListener(this);
     }
     

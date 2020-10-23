@@ -67,7 +67,9 @@ public class LegacyResultMapper {
         /*
          * Attempt to look up the result from the cache if the parameters haven't changed
          */
-        if (mCachedRequest != null && legacyRequest.parameters.same(mCachedRequest.parameters)) {
+        if (mCachedRequest != null &&
+                legacyRequest.parameters.same(mCachedRequest.parameters) &&
+                legacyRequest.captureRequest.equals(mCachedRequest.captureRequest)) {
             result = new CameraMetadataNative(mCachedResult);
             cached = true;
         } else {
@@ -116,16 +118,18 @@ public class LegacyResultMapper {
 
         Rect activeArraySize = characteristics.get(
                 CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-        ZoomData zoomData = ParameterUtils.convertScalerCropRegion(activeArraySize,
-                request.get(CaptureRequest.SCALER_CROP_REGION), previewSize, params);
+        ZoomData zoomData = ParameterUtils.convertToLegacyZoom(activeArraySize,
+                request.get(CaptureRequest.SCALER_CROP_REGION),
+                request.get(CaptureRequest.CONTROL_ZOOM_RATIO),
+                previewSize, params);
 
         /*
          * colorCorrection
          */
         // colorCorrection.aberrationMode
         {
-            // Always hardcoded to FAST
-            result.set(COLOR_CORRECTION_ABERRATION_MODE, COLOR_CORRECTION_ABERRATION_MODE_FAST);
+            result.set(COLOR_CORRECTION_ABERRATION_MODE,
+                    request.get(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE));
         }
 
         /*
@@ -282,7 +286,7 @@ public class LegacyResultMapper {
          * noiseReduction.*
          */
         // noiseReduction.mode
-        result.set(NOISE_REDUCTION_MODE, NOISE_REDUCTION_MODE_FAST);
+        result.set(NOISE_REDUCTION_MODE, request.get(CaptureRequest.NOISE_REDUCTION_MODE));
 
         return result;
     }
@@ -513,6 +517,13 @@ public class LegacyResultMapper {
          */
         {
             m.set(SCALER_CROP_REGION, zoomData.reportedCrop);
+        }
+
+        /*
+         * control.zoomRatio
+         */
+        {
+            m.set(CONTROL_ZOOM_RATIO, zoomData.reportedZoomRatio);
         }
     }
 }

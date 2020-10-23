@@ -18,21 +18,15 @@
     <declare-styleable name="KeyButtonView">
         <!-- key code to send when pressed; if absent or 0, no key is sent -->
         <attr name="keyCode" format="integer" />
-        <!-- does this button generate longpress / repeat events? -->
-        <attr name="keyRepeat" format="boolean" />
+        <!-- Should this button play sound effects, default true -->
+        <attr name="playSound" format="boolean" />
         <attr name="android:contentDescription" />
     </declare-styleable>
-    <declare-styleable name="ToggleSlider">
+    <declare-styleable name="ToggleSliderView">
         <attr name="text" format="string" />
     </declare-styleable>
     <declare-styleable name="NotificationLinearLayout">
         <attr name="insetLeft" format="dimension" />
-    </declare-styleable>
-    <declare-styleable name="NotificationRowLayout">
-        <attr name="rowHeight" format="dimension" />
-    </declare-styleable>
-    <declare-styleable name="RecentsPanelView">
-        <attr name="recentItemLayout" format="reference" />
     </declare-styleable>
     <declare-styleable name="DeadZone">
         <attr name="minSize" format="dimension" />
@@ -41,8 +35,10 @@
         <attr name="decayTime" format="integer" />
         <attr name="orientation" />
     </declare-styleable>
+    <attr name="frameColor" format="color" />
     <declare-styleable name="BatteryMeterView">
-        <attr name="frameColor" format="color" />
+        <attr name="frameColor" />
+        <attr name="textAppearance" format="reference"/>
     </declare-styleable>
     <declare-styleable name="Clock">
         <attr name="amPmStyle" format="enum">
@@ -50,20 +46,25 @@
             <enum name="small" value="1" />
             <enum name="gone" value="2" />
         </attr>
+        <attr name="showDark" format="boolean" />
     </declare-styleable>
     <attr name="orientation">
         <enum name="horizontal" value="0" />
         <enum name="vertical" value="1" />
     </attr>
     <declare-styleable name="UserAvatarView">
+        <attr name="avatarPadding" format="dimension" />
         <attr name="frameWidth" format="dimension" />
         <attr name="framePadding" format="dimension" />
+        <!-- {@deprecated Use a statelist in frameColor instead.} -->
         <attr name="activeFrameColor" format="color" />
         <attr name="frameColor" />
+        <attr name="badgeDiameter" format="dimension" />
+        <attr name="badgeMargin" format="dimension" />
     </declare-styleable>
     <declare-styleable name="UserDetailItemView">
-        <attr name="regularFontFamily" format="string" />
-        <attr name="activatedFontFamily" format="string" />
+        <attr name="regularTextAppearance" format="string" />
+        <attr name="activatedTextAppearance" format="string" />
     </declare-styleable>
     <declare-styleable name="DateView">
         <attr name="datePattern" format="string" />
@@ -74,22 +75,91 @@
         <attr name="horizontalSpacing" format="dimension" />
     </declare-styleable>
 
-    <!-- Theme for icons in the status bar (light/dark). background/fillColor is used for dual tone
-         icons like wifi and signal, and singleToneColor is used for icons with only one tone.
+    <!-- Theme for icons in the status/nav bar (light/dark). background/fillColor is used for dual
+         tone icons like wifi and signal, and singleToneColor is used for icons with only one tone.
          Contract: Pixel with fillColor blended over backgroundColor blended over translucent should
          equal to singleToneColor blended over translucent. -->
     <declare-styleable name="TonedIcon">
         <attr name="backgroundColor" format="integer" />
         <attr name="fillColor" format="integer" />
         <attr name="singleToneColor" format="integer" />
+        <attr name="homeHandleColor" format="integer" />
     </declare-styleable>
 
     <declare-styleable name="StatusBarWindowView_Layout">
         <attr name="ignoreRightInset" format="boolean" />
     </declare-styleable>
 
-    <declare-styleable name="AlphaOptimizedImageView">
+    <declare-styleable name="AnimatedImageView">
         <attr name="hasOverlappingRendering" format="boolean" />
+    </declare-styleable>
+
+    <declare-styleable name="TunerSwitch">
+        <attr name="defValue" format="boolean" />
+        <attr name="metricsAction" format="integer" />
+    </declare-styleable>
+
+    <declare-styleable name="AutoReinflateContainer">
+        <attr name="android:layout" />
+    </declare-styleable>
+
+    <declare-styleable name="HybridNotificationTheme">
+        <attr name="hybridNotificationStyle" format="reference" />
+        <attr name="hybridNotificationTitleStyle" format="reference" />
+        <attr name="hybridNotificationTextStyle" format="reference" />
+    </declare-styleable>
+
+    <declare-styleable name="AutoSizingList">
+        <!-- Whether AutoSizingList will show only as many items as fit on screen and
+             remove extra items instead of scrolling. -->
+        <attr name="enableAutoSizing" format="boolean" />
+        <attr name="itemHeight" format="dimension" />
+    </declare-styleable>
+
+    <declare-styleable name="PluginInflateContainer">
+        <attr name="viewType" format="string" />
+    </declare-styleable>
+
+    <attr name="lightIconTheme" format="reference" />
+    <attr name="darkIconTheme" format="reference" />
+    <attr name="wallpaperTextColor" format="reference|color" />
+    <attr name="wallpaperTextColorSecondary" format="reference|color" />
+    <attr name="backgroundProtectedStyle" format="reference" />
+
+    <declare-styleable name="SmartReplyView">
+        <attr name="spacing" format="dimension" />
+        <attr name="singleLineButtonPaddingHorizontal" format="dimension" />
+        <attr name="doubleLineButtonPaddingHorizontal" format="dimension" />
+        <attr name="buttonStrokeWidth" format="dimension" />
+    </declare-styleable>
+
+    <!-- Used to style rotate suggestion button AVD animations -->
+    <attr name="rotateButtonStartAngle" format="float" />
+    <attr name="rotateButtonEndAngle" format="float" />
+    <attr name="rotateButtonScaleX" format="float" />
+
+    <!-- Used to style charging animation AVD animation -->
+    <attr name="chargingAnimColor" format="color" />
+
+    <!-- Size of shadows/elevations on keyguard -->
+    <attr name="shadowRadius" format="float" />
+
+    <!-- Used display CarrierText in Keyguard or QS Footer -->
+    <declare-styleable name="CarrierText">
+        <attr name="allCaps" format="boolean" />
+        <attr name="showMissingSim" format="boolean" />
+        <attr name="showAirplaneMode" format="boolean" />
+    </declare-styleable>
+
+    <declare-styleable name="CaptionsToggleImageButton">
+        <attr name="optedOut" format="boolean" />
+    </declare-styleable>
+
+    <declare-styleable name="IlluminationDrawable">
+        <attr name="highlight" format="integer" />
+        <attr name="cornerRadius" format="dimension" />
+        <attr name="rippleMinSize" format="dimension" />
+        <attr name="rippleMaxSize" format="dimension" />
     </declare-styleable>
 </resources>
 

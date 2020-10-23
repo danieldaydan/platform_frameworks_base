@@ -16,6 +16,11 @@
 
 package android.bluetooth;
 
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Parcel;
+import android.os.ParcelUuid;
+import android.os.Parcelable;
+
 import java.util.UUID;
 
 /**
@@ -25,7 +30,7 @@ import java.util.UUID;
  * characteristic, {@link BluetoothGattCharacteristic}. They can be used to describe
  * the characteristic's features or to control certain behaviours of the characteristic.
  */
-public class BluetoothGattDescriptor {
+public class BluetoothGattDescriptor implements Parcelable {
 
     /**
      * Value used to enable notification for a client configuration descriptor
@@ -53,7 +58,7 @@ public class BluetoothGattDescriptor {
     public static final int PERMISSION_READ_ENCRYPTED = 0x02;
 
     /**
-     * Descriptor permission: Allow reading with man-in-the-middle protection
+     * Descriptor permission: Allow reading with person-in-the-middle protection
      */
     public static final int PERMISSION_READ_ENCRYPTED_MITM = 0x04;
 
@@ -68,7 +73,7 @@ public class BluetoothGattDescriptor {
     public static final int PERMISSION_WRITE_ENCRYPTED = 0x20;
 
     /**
-     * Descriptor permission: Allow encrypted writes with man-in-the-middle
+     * Descriptor permission: Allow encrypted writes with person-in-the-middle
      * protection
      */
     public static final int PERMISSION_WRITE_ENCRYPTED_MITM = 0x40;
@@ -80,36 +85,43 @@ public class BluetoothGattDescriptor {
 
     /**
      * Descriptor permission: Allow signed write operations with
-     * man-in-the-middle protection
+     * person-in-the-middle protection
      */
     public static final int PERMISSION_WRITE_SIGNED_MITM = 0x100;
 
     /**
      * The UUID of this descriptor.
+     *
      * @hide
      */
     protected UUID mUuid;
 
     /**
      * Instance ID for this descriptor.
+     *
      * @hide
      */
+    @UnsupportedAppUsage
     protected int mInstance;
 
     /**
      * Permissions for this descriptor
+     *
      * @hide
      */
     protected int mPermissions;
 
     /**
      * Back-reference to the characteristic this descriptor belongs to.
+     *
      * @hide
      */
+    @UnsupportedAppUsage
     protected BluetoothGattCharacteristic mCharacteristic;
 
     /**
      * The value for this descriptor.
+     *
      * @hide
      */
     protected byte[] mValue;
@@ -134,20 +146,57 @@ public class BluetoothGattDescriptor {
      * @param permissions Permissions for this descriptor
      */
     /*package*/ BluetoothGattDescriptor(BluetoothGattCharacteristic characteristic, UUID uuid,
-                                    int instance, int permissions) {
+            int instance, int permissions) {
         initDescriptor(characteristic, uuid, instance, permissions);
     }
 
+    /**
+     * @hide
+     */
+    public BluetoothGattDescriptor(UUID uuid, int instance, int permissions) {
+        initDescriptor(null, uuid, instance, permissions);
+    }
+
     private void initDescriptor(BluetoothGattCharacteristic characteristic, UUID uuid,
-                                int instance, int permissions) {
+            int instance, int permissions) {
         mCharacteristic = characteristic;
         mUuid = uuid;
         mInstance = instance;
         mPermissions = permissions;
     }
 
+    @Override
+    public int describeContents() {
+        return 0;
+    }
+
+    @Override
+    public void writeToParcel(Parcel out, int flags) {
+        out.writeParcelable(new ParcelUuid(mUuid), 0);
+        out.writeInt(mInstance);
+        out.writeInt(mPermissions);
+    }
+
+    public static final @android.annotation.NonNull Parcelable.Creator<BluetoothGattDescriptor> CREATOR =
+            new Parcelable.Creator<BluetoothGattDescriptor>() {
+        public BluetoothGattDescriptor createFromParcel(Parcel in) {
+            return new BluetoothGattDescriptor(in);
+        }
+
+        public BluetoothGattDescriptor[] newArray(int size) {
+            return new BluetoothGattDescriptor[size];
+        }
+    };
+
+    private BluetoothGattDescriptor(Parcel in) {
+        mUuid = ((ParcelUuid) in.readParcelable(null)).getUuid();
+        mInstance = in.readInt();
+        mPermissions = in.readInt();
+    }
+
     /**
      * Returns the characteristic this descriptor belongs to.
+     *
      * @return The characteristic.
      */
     public BluetoothGattCharacteristic getCharacteristic() {
@@ -156,8 +205,10 @@ public class BluetoothGattDescriptor {
 
     /**
      * Set the back-reference to the associated characteristic
+     *
      * @hide
      */
+    @UnsupportedAppUsage
     /*package*/ void setCharacteristic(BluetoothGattCharacteristic characteristic) {
         mCharacteristic = characteristic;
     }
@@ -184,6 +235,15 @@ public class BluetoothGattDescriptor {
      */
     public int getInstanceId() {
         return mInstance;
+    }
+
+    /**
+     * Force the instance ID.
+     *
+     * @hide
+     */
+    public void setInstanceId(int instanceId) {
+        mInstance = instanceId;
     }
 
     /**
@@ -218,8 +278,8 @@ public class BluetoothGattDescriptor {
      * remote device.
      *
      * @param value New value for this descriptor
-     * @return true if the locally stored value has been set, false if the
-     *              requested value could not be stored locally.
+     * @return true if the locally stored value has been set, false if the requested value could not
+     * be stored locally.
      */
     public boolean setValue(byte[] value) {
         mValue = value;

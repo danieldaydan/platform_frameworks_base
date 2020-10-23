@@ -16,15 +16,15 @@
 
 package android.widget.listview;
 
-import android.util.InternalSelectionView;
-
 import android.app.Activity;
 import android.os.Bundle;
+import android.util.InternalSelectionView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.BaseAdapter;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.window.WindowMetricsHelper;
 
 /**
  * Most bodacious scenario yet!
@@ -66,7 +66,9 @@ public class AdjacentListsWithAdjacentISVsInside extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        final int desiredHeight = (int) (0.8 * getWindowManager().getDefaultDisplay().getHeight());
+        final int desiredHeight = (int) (0.8 * WindowMetricsHelper
+                .getBoundsExcludingNavigationBarAndCutout(
+                        getWindowManager().getCurrentWindowMetrics()).height());
 
         mLeftListView = new ListView(this);
         mLeftListView.setAdapter(new AdjacentISVAdapter(desiredHeight));
@@ -80,6 +82,7 @@ public class AdjacentListsWithAdjacentISVsInside extends Activity {
 
 
         setContentView(combineAdjacent(mLeftListView, mRightListView));
+        getWindow().getDecorView().restoreDefaultFocus();
     }
 
     private static View combineAdjacent(View... views) {

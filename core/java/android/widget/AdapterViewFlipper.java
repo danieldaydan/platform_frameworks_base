@@ -21,7 +21,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.TypedArray;
-import android.os.Handler;
 import android.os.Message;
 import android.util.AttributeSet;
 import android.util.Log;
@@ -70,6 +69,8 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
 
         final TypedArray a = context.obtainStyledAttributes(attrs,
                 com.android.internal.R.styleable.AdapterViewFlipper, defStyleAttr, defStyleRes);
+        saveAttributeDataForStyleable(context, com.android.internal.R.styleable.AdapterViewFlipper,
+                attrs, a, defStyleAttr, defStyleRes);
         mFlipInterval = a.getInt(
                 com.android.internal.R.styleable.AdapterViewFlipper_flipInterval, DEFAULT_INTERVAL);
         mAutoStart = a.getBoolean(
@@ -112,7 +113,7 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
         // home screen. Therefore, we register the receiver as the current
         // user not the one the context is for.
         getContext().registerReceiverAsUser(mReceiver, android.os.Process.myUserHandle(),
-                filter, null, mHandler);
+                filter, null, getHandler());
 
 
         if (mAutoStart) {
@@ -194,9 +195,8 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
        // if the flipper is currently flipping automatically, and showNext() is called
        // we should we should make sure to reset the timer
        if (mRunning) {
-           mHandler.removeMessages(FLIP_MSG);
-           Message msg = mHandler.obtainMessage(FLIP_MSG);
-           mHandler.sendMessageDelayed(msg, mFlipInterval);
+           removeCallbacks(mFlipRunnable);
+           postDelayed(mFlipRunnable, mFlipInterval);
        }
        super.showNext();
    }
@@ -210,9 +210,8 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
        // if the flipper is currently flipping automatically, and showPrevious() is called
        // we should we should make sure to reset the timer
        if (mRunning) {
-           mHandler.removeMessages(FLIP_MSG);
-           Message msg = mHandler.obtainMessage(FLIP_MSG);
-           mHandler.sendMessageDelayed(msg, mFlipInterval);
+           removeCallbacks(mFlipRunnable);
+           postDelayed(mFlipRunnable, mFlipInterval);
        }
        super.showPrevious();
    }
@@ -241,10 +240,9 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
         if (running != mRunning) {
             if (running) {
                 showOnly(mWhichChild, flipNow);
-                Message msg = mHandler.obtainMessage(FLIP_MSG);
-                mHandler.sendMessageDelayed(msg, mFlipInterval);
+                postDelayed(mFlipRunnable, mFlipInterval);
             } else {
-                mHandler.removeMessages(FLIP_MSG);
+                removeCallbacks(mFlipRunnable);
             }
             mRunning = running;
         }
@@ -277,15 +275,11 @@ public class AdapterViewFlipper extends AdapterViewAnimator {
         return mAutoStart;
     }
 
-    private final int FLIP_MSG = 1;
-
-    private final Handler mHandler = new Handler() {
+    private final Runnable mFlipRunnable = new Runnable() {
         @Override
-        public void handleMessage(Message msg) {
-            if (msg.what == FLIP_MSG) {
-                if (mRunning) {
-                    showNext();
-                }
+        public void run() {
+            if (mRunning) {
+                showNext();
             }
         }
     };

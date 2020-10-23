@@ -26,9 +26,9 @@
 #include <input/Input.h>
 #include <utils/Looper.h>
 #include <utils/TypeHelpers.h>
-#include <ScopedLocalRef.h>
+#include <nativehelper/ScopedLocalRef.h>
 
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 #include "android_os_MessageQueue.h"
 #include "android_view_KeyEvent.h"
 #include "android_view_MotionEvent.h"
@@ -176,8 +176,8 @@ void InputQueue::enqueueEvent(InputEvent* event) {
     Mutex::Autolock _l(mLock);
     mPendingEvents.push(event);
     if (mPendingEvents.size() == 1) {
-        char dummy = 0;
-        int res = TEMP_FAILURE_RETRY(write(mDispatchWriteFd, &dummy, sizeof(dummy)));
+        char payload = '\0';
+        int res = TEMP_FAILURE_RETRY(write(mDispatchWriteFd, &payload, sizeof(payload)));
         if (res < 0 && errno != EAGAIN) {
             ALOGW("Failed writing to dispatch fd: %s", strerror(errno));
         }

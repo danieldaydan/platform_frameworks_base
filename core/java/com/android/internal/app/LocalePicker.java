@@ -16,18 +16,21 @@
 
 package com.android.internal.app;
 
-import com.android.internal.R;
-
-import android.app.ActivityManagerNative;
+import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.app.ActivityManager;
 import android.app.IActivityManager;
 import android.app.ListFragment;
 import android.app.backup.BackupManager;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.os.Bundle;
+import android.os.LocaleList;
 import android.os.RemoteException;
 import android.provider.Settings;
+import android.sysprop.LocalizationProperties;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -36,15 +39,21 @@ import android.widget.ArrayAdapter;
 import android.widget.ListView;
 import android.widget.TextView;
 
+import com.android.internal.R;
+
 import java.text.Collator;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
-import java.util.ArrayList;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 public class LocalePicker extends ListFragment {
     private static final String TAG = "LocalePicker";
     private static final boolean DEBUG = false;
+    private static final String[] pseudoLocales = { "en-XA", "ar-XB" };
 
     public static interface LocaleSelectionListener {
         // You can add any argument if you really need it...
@@ -57,7 +66,7 @@ public class LocalePicker extends ListFragment {
         static final Collator sCollator = Collator.getInstance();
 
         String label;
-        Locale locale;
+        final Locale locale;
 
         public LocaleInfo(String label, Locale locale) {
             this.label = label;
@@ -68,6 +77,7 @@ public class LocalePicker extends ListFragment {
             return label;
         }
 
+        @UnsupportedAppUsage
         public Locale getLocale() {
             return locale;
         }
@@ -83,18 +93,51 @@ public class LocalePicker extends ListFragment {
         }
     }
 
+    public static String[] getSystemAssetLocales() {
+        return Resources.getSystem().getAssets().getLocales();
+    }
+
+    public static String[] getSupportedLocales(Context context) {
+        String[] allLocales = context.getResources().getStringArray(R.array.supported_locales);
+
+        Predicate<String> localeFilter = getLocaleFilter();
+        if (localeFilter == null) {
+            return allLocales;
+        }
+
+        List<String> result = new ArrayList<>(allLocales.length);
+        for (String locale : allLocales) {
+            if (localeFilter.test(locale)) {
+                result.add(locale);
+            }
+        }
+
+        int localeCount = result.size();
+        return (localeCount == allLocales.length) ? allLocales
+                : result.toArray(new String[localeCount]);
+    }
+
+    @Nullable
+    private static Predicate<String> getLocaleFilter() {
+        try {
+            return LocalizationProperties.locale_filter()
+                    .map(filter -> Pattern.compile(filter).asPredicate())
+                    .orElse(null);
+        } catch (SecurityException e) {
+            Log.e(TAG, "Failed to read locale filter.", e);
+        } catch (PatternSyntaxException e) {
+            Log.e(TAG, "Bad locale filter format (\"" + e.getPattern() + "\"), skipping.");
+        }
+
+        return null;
+    }
+
     public static List<LocaleInfo> getAllAssetLocales(Context context, boolean isInDeveloperMode) {
         final Resources resources = context.getResources();
 
-        final String[] locales = Resources.getSystem().getAssets().getLocales();
+        final String[] locales = getSystemAssetLocales();
         List<String> localeList = new ArrayList<String>(locales.length);
         Collections.addAll(localeList, locales);
-
-        // Don't show the pseudolocales unless we're in developer mode. http://b/17190407.
-        if (!isInDeveloperMode) {
-            localeList.remove("ar-XB");
-            localeList.remove("en-XA");
-        }
 
         Collections.sort(localeList);
         final String[] specialLocaleCodes = resources.getStringArray(R.array.special_locale_codes);
@@ -105,6 +148,10 @@ public class LocalePicker extends ListFragment {
             final Locale l = Locale.forLanguageTag(locale.replace('_', '-'));
             if (l == null || "und".equals(l.getLanguage())
                     || l.getLanguage().isEmpty() || l.getCountry().isEmpty()) {
+                continue;
+            }
+            // Don't show the pseudolocales unless we're in developer mode. http://b/17190407.
+            if (!isInDeveloperMode && LocaleList.isPseudoLocale(l)) {
                 continue;
             }
 
@@ -240,20 +287,74 @@ public class LocalePicker extends ListFragment {
     /**
      * Requests the system to update the system locale. Note that the system looks halted
      * for a while during the Locale migration, so the caller need to take care of it.
+     *
+     * @see #updateLocales(LocaleList)
      */
+    @UnsupportedAppUsage
     public static void updateLocale(Locale locale) {
-        try {
-            IActivityManager am = ActivityManagerNative.getDefault();
-            Configuration config = am.getConfiguration();
+        updateLocales(new LocaleList(locale));
+    }
 
-            config.setLocale(locale);
+    /**
+     * Requests the system to update the list of system locales.
+     * Note that the system looks halted for a while during the Locale migration,
+     * so the caller need to take care of it.
+     */
+    @UnsupportedAppUsage
+    public static void updateLocales(LocaleList locales) {
+        if (locales != null) {
+            locales = removeExcludedLocales(locales);
+        }
+        // Note: the empty list case is covered by Configuration.setLocales().
+
+        try {
+            final IActivityManager am = ActivityManager.getService();
+            final Configuration config = am.getConfiguration();
+
+            config.setLocales(locales);
             config.userSetLocale = true;
 
-            am.updateConfiguration(config);
+            am.updatePersistentConfiguration(config);
             // Trigger the dirty bit for the Settings Provider.
             BackupManager.dataChanged("com.android.providers.settings");
         } catch (RemoteException e) {
             // Intentionally left blank
+        }
+    }
+
+    @NonNull
+    private static LocaleList removeExcludedLocales(@NonNull LocaleList locales) {
+        Predicate<String> localeFilter = getLocaleFilter();
+        if (localeFilter == null) {
+            return locales;
+        }
+
+        int localeCount = locales.size();
+        ArrayList<Locale> filteredLocales = new ArrayList<>(localeCount);
+        for (int i = 0; i < localeCount; ++i) {
+            Locale locale = locales.get(i);
+            if (localeFilter.test(locale.toString())) {
+                filteredLocales.add(locale);
+            }
+        }
+
+        return (localeCount == filteredLocales.size()) ? locales
+                : new LocaleList(filteredLocales.toArray(new Locale[0]));
+    }
+
+    /**
+     * Get the locale list.
+     *
+     * @return The locale list.
+     */
+    @UnsupportedAppUsage
+    public static LocaleList getLocales() {
+        try {
+            return ActivityManager.getService()
+                    .getConfiguration().getLocales();
+        } catch (RemoteException e) {
+            // If something went wrong
+            return LocaleList.getDefault();
         }
     }
 }

@@ -16,15 +16,14 @@
 
 package android.widget.scroll;
 
-import com.android.frameworks.coretests.R;
-
 import android.app.Activity;
-import android.os.Bundle;
-import android.widget.EditText;
-import android.widget.TextView;
-import android.widget.Button;
-import android.view.View;
 import android.graphics.Rect;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+
+import com.android.frameworks.coretests.R;
 
 public class RequestRectangleVisibleWithInternalScroll extends Activity {
 
@@ -53,11 +52,11 @@ public class RequestRectangleVisibleWithInternalScroll extends Activity {
 
         setContentView(R.layout.scroll_to_rect_with_internal_scroll);
 
-        mTextBlob = (TextView) findViewById(R.id.blob);
+        mTextBlob = findViewById(R.id.blob);
         mTextBlob.scrollBy(0, scrollYofBlob);
 
 
-        mScrollToBlob = (Button) findViewById(R.id.scrollToBlob);
+        mScrollToBlob = findViewById(R.id.scrollToBlob);
         mScrollToBlob.setOnClickListener(new View.OnClickListener() {
 
             public void onClick(View v) {

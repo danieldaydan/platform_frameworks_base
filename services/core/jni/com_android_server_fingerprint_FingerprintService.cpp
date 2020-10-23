@@ -16,7 +16,7 @@
 
 #define LOG_TAG "Fingerprint-JNI"
 
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 #include <inttypes.h>
 
 #include <android_runtime/AndroidRuntime.h>
@@ -235,7 +235,7 @@ static jint nativeOpenHal(JNIEnv* env, jobject clazz) {
         return 0;
     }
 
-    // Sanity check - remove
+    // Soundness check - remove
     if (gContext.device->notify != hal_notify_callback) {
         ALOGE("NOTIFY not set properly: %p != %p", gContext.device->notify, hal_notify_callback);
     }

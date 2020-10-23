@@ -16,32 +16,38 @@
 
 package android.graphics.drawable;
 
-import org.xmlpull.v1.XmlPullParser;
-import org.xmlpull.v1.XmlPullParserException;
-
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.content.pm.ActivityInfo.Config;
 import android.content.res.ColorStateList;
 import android.content.res.Resources;
+import android.content.res.Resources.Theme;
 import android.content.res.TypedArray;
-import android.graphics.Bitmap;
+import android.graphics.BlendMode;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
 import android.graphics.Insets;
 import android.graphics.Outline;
 import android.graphics.PixelFormat;
-import android.graphics.PorterDuff;
 import android.graphics.Rect;
+import android.graphics.Xfermode;
 import android.util.AttributeSet;
+import android.util.DisplayMetrics;
 import android.view.View;
 
+import com.android.internal.R;
+
+import org.xmlpull.v1.XmlPullParser;
+import org.xmlpull.v1.XmlPullParserException;
+
 import java.io.IOException;
-import java.util.Collection;
 
 /**
  * Drawable container with only one child element.
  */
 public abstract class DrawableWrapper extends Drawable implements Drawable.Callback {
+    @UnsupportedAppUsage
     private DrawableWrapperState mState;
     private Drawable mDrawable;
     private boolean mMutated;
@@ -59,7 +65,7 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
      */
     public DrawableWrapper(@Nullable Drawable dr) {
         mState = null;
-        mDrawable = dr;
+        setDrawable(dr);
     }
 
     /**
@@ -71,6 +77,16 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         if (mState != null && mState.mDrawableState != null) {
             final Drawable dr = mState.mDrawableState.newDrawable(res);
             setDrawable(dr);
+        }
+    }
+
+    /**
+     * @hide
+     */
+    @Override
+    public void setXfermode(Xfermode mode) {
+        if (mDrawable != null) {
+            mDrawable.setXfermode(mode);
         }
     }
 
@@ -112,7 +128,67 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         return mDrawable;
     }
 
-    void updateStateFromTypedArray(TypedArray a) {
+    @Override
+    public void inflate(@NonNull Resources r, @NonNull XmlPullParser parser,
+            @NonNull AttributeSet attrs, @Nullable Theme theme)
+            throws XmlPullParserException, IOException {
+        super.inflate(r, parser, attrs, theme);
+
+        final DrawableWrapperState state = mState;
+        if (state == null) {
+            return;
+        }
+
+        // The density may have changed since the last update. This will
+        // apply scaling to any existing constant state properties.
+        final int densityDpi = r.getDisplayMetrics().densityDpi;
+        final int targetDensity = densityDpi == 0 ? DisplayMetrics.DENSITY_DEFAULT : densityDpi;
+        state.setDensity(targetDensity);
+        state.mSrcDensityOverride = mSrcDensityOverride;
+
+        final TypedArray a = obtainAttributes(r, theme, attrs, R.styleable.DrawableWrapper);
+        updateStateFromTypedArray(a);
+        a.recycle();
+
+        inflateChildDrawable(r, parser, attrs, theme);
+    }
+
+    @Override
+    public void applyTheme(@NonNull Theme t) {
+        super.applyTheme(t);
+
+        // If we load the drawable later as part of updating from the typed
+        // array, it will already be themed correctly. So, we can theme the
+        // local drawable first.
+        if (mDrawable != null && mDrawable.canApplyTheme()) {
+            mDrawable.applyTheme(t);
+        }
+
+        final DrawableWrapperState state = mState;
+        if (state == null) {
+            return;
+        }
+
+        final int densityDpi = t.getResources().getDisplayMetrics().densityDpi;
+        final int density = densityDpi == 0 ? DisplayMetrics.DENSITY_DEFAULT : densityDpi;
+        state.setDensity(density);
+
+        if (state.mThemeAttrs != null) {
+            final TypedArray a = t.resolveAttributes(
+                    state.mThemeAttrs, R.styleable.DrawableWrapper);
+            updateStateFromTypedArray(a);
+            a.recycle();
+        }
+    }
+
+    /**
+     * Updates constant state properties from the provided typed array.
+     * <p>
+     * Implementing subclasses should call through to the super method first.
+     *
+     * @param a the typed array rom which properties should be read
+     */
+    private void updateStateFromTypedArray(@NonNull TypedArray a) {
         final DrawableWrapperState state = mState;
         if (state == null) {
             return;
@@ -124,20 +200,8 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         // Extract the theme attributes, if any.
         state.mThemeAttrs = a.extractThemeAttrs();
 
-        // TODO: Consider using R.styleable.DrawableWrapper_drawable
-    }
-
-    @Override
-    public void applyTheme(Resources.Theme t) {
-        super.applyTheme(t);
-
-        final DrawableWrapperState state = mState;
-        if (state == null) {
-            return;
-        }
-
-        if (mDrawable != null && mDrawable.canApplyTheme()) {
-            mDrawable.applyTheme(t);
+        if (a.hasValueOrEmpty(R.styleable.DrawableWrapper_drawable)) {
+            setDrawable(a.getDrawable(R.styleable.DrawableWrapper_drawable));
         }
     }
 
@@ -147,7 +211,7 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
-    public void invalidateDrawable(Drawable who) {
+    public void invalidateDrawable(@NonNull Drawable who) {
         final Callback callback = getCallback();
         if (callback != null) {
             callback.invalidateDrawable(this);
@@ -155,7 +219,7 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
-    public void scheduleDrawable(Drawable who, Runnable what, long when) {
+    public void scheduleDrawable(@NonNull Drawable who, @NonNull Runnable what, long when) {
         final Callback callback = getCallback();
         if (callback != null) {
             callback.scheduleDrawable(this, what, when);
@@ -163,7 +227,7 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
-    public void unscheduleDrawable(Drawable who, Runnable what) {
+    public void unscheduleDrawable(@NonNull Drawable who, @NonNull Runnable what) {
         final Callback callback = getCallback();
         if (callback != null) {
             callback.unscheduleDrawable(this, what);
@@ -178,7 +242,7 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
-    public int getChangingConfigurations() {
+    public @Config int getChangingConfigurations() {
         return super.getChangingConfigurations()
                 | (mState != null ? mState.getChangingConfigurations() : 0)
                 | mDrawable.getChangingConfigurations();
@@ -189,7 +253,6 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         return mDrawable != null && mDrawable.getPadding(padding);
     }
 
-    /** @hide */
     @Override
     public Insets getOpticalInsets() {
         return mDrawable != null ? mDrawable.getOpticalInsets() : Insets.NONE;
@@ -245,6 +308,15 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
+    public ColorFilter getColorFilter() {
+        final Drawable drawable = getDrawable();
+        if (drawable != null) {
+            return drawable.getColorFilter();
+        }
+        return super.getColorFilter();
+    }
+
+    @Override
     public void setTintList(@Nullable ColorStateList tint) {
         if (mDrawable != null) {
             mDrawable.setTintList(tint);
@@ -252,9 +324,9 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     @Override
-    public void setTintMode(@Nullable PorterDuff.Mode tintMode) {
+    public void setTintBlendMode(@NonNull BlendMode blendMode) {
         if (mDrawable != null) {
-            mDrawable.setTintMode(tintMode);
+            mDrawable.setTintBlendMode(blendMode);
         }
     }
 
@@ -273,6 +345,12 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         return mDrawable != null && mDrawable.isStateful();
     }
 
+    /** @hide */
+    @Override
+    public boolean hasFocusStateSpecified() {
+        return mDrawable != null && mDrawable.hasFocusStateSpecified();
+    }
+
     @Override
     protected boolean onStateChange(int[] state) {
         if (mDrawable != null && mDrawable.isStateful()) {
@@ -283,6 +361,13 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
             return changed;
         }
         return false;
+    }
+
+    @Override
+    public void jumpToCurrentState() {
+        if (mDrawable != null) {
+            mDrawable.jumpToCurrentState();
+        }
     }
 
     @Override
@@ -371,8 +456,9 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
      * child element will take precedence over any other child elements or
      * explicit drawable attribute.
      */
-    void inflateChildDrawable(Resources r, XmlPullParser parser, AttributeSet attrs,
-            Resources.Theme theme) throws XmlPullParserException, IOException {
+    private void inflateChildDrawable(@NonNull Resources r, @NonNull XmlPullParser parser,
+            @NonNull AttributeSet attrs, @Nullable Theme theme)
+            throws XmlPullParserException, IOException {
         // Seek to the first child element.
         Drawable dr = null;
         int type;
@@ -380,7 +466,8 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
                 && (type != XmlPullParser.END_TAG || parser.getDepth() > outerDepth)) {
             if (type == XmlPullParser.START_TAG) {
-                dr = Drawable.createFromXmlInner(r, parser, attrs, theme);
+                dr = Drawable.createFromXmlInnerForDensity(r, parser, attrs,
+                        mState.mSrcDensityOverride, theme);
             }
         }
 
@@ -390,17 +477,70 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
     }
 
     abstract static class DrawableWrapperState extends Drawable.ConstantState {
-        int[] mThemeAttrs;
-        int mChangingConfigurations;
+        private int[] mThemeAttrs;
+
+        @Config int mChangingConfigurations;
+        int mDensity = DisplayMetrics.DENSITY_DEFAULT;
+
+        /**
+         * The density to use when looking up resources from
+         * {@link Resources#getDrawableForDensity(int, int, Theme)}.
+         * A value of 0 means there is no override and the system density will be used.
+         * @hide
+         */
+        int mSrcDensityOverride = 0;
 
         Drawable.ConstantState mDrawableState;
 
-        DrawableWrapperState(DrawableWrapperState orig) {
+        DrawableWrapperState(@Nullable DrawableWrapperState orig, @Nullable Resources res) {
             if (orig != null) {
                 mThemeAttrs = orig.mThemeAttrs;
                 mChangingConfigurations = orig.mChangingConfigurations;
                 mDrawableState = orig.mDrawableState;
+                mSrcDensityOverride = orig.mSrcDensityOverride;
             }
+
+            final int density;
+            if (res != null) {
+                density = res.getDisplayMetrics().densityDpi;
+            } else if (orig != null) {
+                density = orig.mDensity;
+            } else {
+                density = 0;
+            }
+
+            mDensity = density == 0 ? DisplayMetrics.DENSITY_DEFAULT : density;
+        }
+
+        /**
+         * Sets the constant state density.
+         * <p>
+         * If the density has been previously set, dispatches the change to
+         * subclasses so that density-dependent properties may be scaled as
+         * necessary.
+         *
+         * @param targetDensity the new constant state density
+         */
+        public final void setDensity(int targetDensity) {
+            if (mDensity != targetDensity) {
+                final int sourceDensity = mDensity;
+                mDensity = targetDensity;
+
+                onDensityChanged(sourceDensity, targetDensity);
+            }
+        }
+
+        /**
+         * Called when the constant state density changes.
+         * <p>
+         * Subclasses with density-dependent constant state properties should
+         * override this method and scale their properties as necessary.
+         *
+         * @param sourceDensity the previous constant state density
+         * @param targetDensity the new constant state density
+         */
+        void onDensityChanged(int sourceDensity, int targetDensity) {
+            // Stub method.
         }
 
         @Override
@@ -411,24 +551,15 @@ public abstract class DrawableWrapper extends Drawable implements Drawable.Callb
         }
 
         @Override
-        public int addAtlasableBitmaps(Collection<Bitmap> atlasList) {
-            final Drawable.ConstantState state = mDrawableState;
-            if (state != null) {
-                return state.addAtlasableBitmaps(atlasList);
-            }
-            return 0;
-        }
-
-        @Override
         public Drawable newDrawable() {
             return newDrawable(null);
         }
 
         @Override
-        public abstract Drawable newDrawable(Resources res);
+        public abstract Drawable newDrawable(@Nullable Resources res);
 
         @Override
-        public int getChangingConfigurations() {
+        public @Config int getChangingConfigurations() {
             return mChangingConfigurations
                     | (mDrawableState != null ? mDrawableState.getChangingConfigurations() : 0);
         }

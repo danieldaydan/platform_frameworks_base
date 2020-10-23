@@ -57,7 +57,9 @@ public class MainInteractionSession extends VoiceInteractionSession
     Button mCompleteButton;
     Button mAbortButton;
 
+    Bundle mAssistData;
     AssistStructure mAssistStructure;
+    AssistContent mAssistContent;
 
     static final int STATE_IDLE = 0;
     static final int STATE_LAUNCHING = 1;
@@ -73,6 +75,7 @@ public class MainInteractionSession extends VoiceInteractionSession
     CharSequence mPendingPrompt;
     Request mPendingRequest;
     int mCurrentTask = -1;
+    int mShowFlags;
 
     MainInteractionSession(Context context) {
         super(context);
@@ -88,6 +91,7 @@ public class MainInteractionSession extends VoiceInteractionSession
     @Override
     public void onShow(Bundle args, int showFlags) {
         super.onShow(args, showFlags);
+        mShowFlags = showFlags;
         Log.i(TAG, "onShow: flags=0x" + Integer.toHexString(showFlags) + " args=" + args);
         mState = STATE_IDLE;
         mStartIntent = args != null ? (Intent)args.getParcelable("intent") : null;
@@ -167,21 +171,15 @@ public class MainInteractionSession extends VoiceInteractionSession
     public void onHandleAssist(Bundle assistBundle) {
     }
 
-    @Override
-    public void onHandleAssist(Bundle data, AssistStructure structure, AssistContent content) {
-        mAssistStructure = structure;
-        if (mAssistStructure != null) {
-            if (mAssistVisualizer != null) {
-                mAssistVisualizer.setAssistStructure(mAssistStructure);
-            }
-        } else {
-            if (mAssistVisualizer != null) {
-                mAssistVisualizer.clearAssistData();
-            }
-        }
+    private void logAssistContentAndData(AssistContent content, Bundle data) {
         if (content != null) {
             Log.i(TAG, "Assist intent: " + content.getIntent());
+            Log.i(TAG, "Assist intent from app: " + content.isAppProvidedIntent());
             Log.i(TAG, "Assist clipdata: " + content.getClipData());
+            Log.i(TAG, "Assist structured data: " + content.getStructuredData());
+            Log.i(TAG, "Assist web uri: " + content.getWebUri());
+            Log.i(TAG, "Assist web uri from app: " + content.isAppProvidedWebUri());
+            Log.i(TAG, "Assist extras: " + content.getExtras());
         }
         if (data != null) {
             Uri referrer = data.getParcelable(Intent.EXTRA_REFERRER);
@@ -192,20 +190,52 @@ public class MainInteractionSession extends VoiceInteractionSession
     }
 
     @Override
+    public void onHandleAssist(Bundle data, AssistStructure structure, AssistContent content) {
+        mAssistData = data;
+        mAssistStructure = structure;
+        mAssistContent = content;
+        if (mAssistVisualizer != null) {
+            if (mAssistStructure != null) {
+                mAssistVisualizer.setAssistStructure(mAssistStructure);
+            } else {
+                mAssistVisualizer.clearAssistData();
+            }
+        }
+        logAssistContentAndData(content, data);
+    }
+
+    @Override
+    public void onHandleAssistSecondary(final Bundle data, final AssistStructure structure,
+            final AssistContent content, int index, int count) {
+        Log.i(TAG, "Got secondary activity assist data " + index + " of " + count);
+        Log.i(TAG, "Showing assist structure after a few seconds...");
+        mContentView.postDelayed(new Runnable() {
+            public void run() {
+                onHandleAssist(data, structure, content);
+            }
+        }, 2000 * index);
+    }
+
+    @Override
     public void onHandleScreenshot(Bitmap screenshot) {
-        if (screenshot != null) {
-            mScreenshot.setImageBitmap(screenshot);
-            mScreenshot.setAdjustViewBounds(true);
-            mScreenshot.setMaxWidth(screenshot.getWidth() / 3);
-            mScreenshot.setMaxHeight(screenshot.getHeight() / 3);
-            mFullScreenshot.setImageBitmap(screenshot);
-        } else {
-            mScreenshot.setImageDrawable(null);
-            mFullScreenshot.setImageDrawable(null);
+        if (mScreenshot != null) {
+            if (screenshot != null) {
+                mScreenshot.setImageBitmap(screenshot);
+                mScreenshot.setAdjustViewBounds(true);
+                mScreenshot.setMaxWidth(screenshot.getWidth() / 3);
+                mScreenshot.setMaxHeight(screenshot.getHeight() / 3);
+                mFullScreenshot.setImageBitmap(screenshot);
+            } else {
+                mScreenshot.setImageDrawable(null);
+                mFullScreenshot.setImageDrawable(null);
+            }
         }
     }
 
     void updateState() {
+        if (mTopContent == null) {
+            return;
+        }
         if (mState == STATE_IDLE) {
             mTopContent.setVisibility(View.VISIBLE);
             mBottomContent.setVisibility(View.GONE);
@@ -229,6 +259,7 @@ public class MainInteractionSession extends VoiceInteractionSession
     public void onClick(View v) {
         if (v == mTreeButton) {
             if (mAssistVisualizer != null) {
+                logAssistContentAndData(mAssistContent, mAssistData);
                 mAssistVisualizer.logTree();
             }
         } else if (v == mTextButton) {
@@ -311,6 +342,8 @@ public class MainInteractionSession extends VoiceInteractionSession
         if (mState != STATE_IDLE) {
             outInsets.contentInsets.top = mBottomContent.getTop();
             outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_CONTENT;
+        } else if ((mShowFlags & SHOW_SOURCE_ACTIVITY) != 0) {
+            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_CONTENT;
         }
     }
 
@@ -355,7 +388,7 @@ public class MainInteractionSession extends VoiceInteractionSession
             mPendingPrompt = prompt.getVisualPrompt();
         }
     }
-      
+
     @Override
     public void onRequestConfirmation(ConfirmationRequest request) {
         Log.i(TAG, "onConfirm: prompt=" + request.getVoicePrompt() + " extras="

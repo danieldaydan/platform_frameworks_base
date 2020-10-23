@@ -15,42 +15,41 @@
      limitations under the License.
 -->
 <!-- extends FrameLayout -->
-<com.android.systemui.qs.QSDetailItems xmlns:android="http://schemas.android.com/apk/res/android"
+<com.android.systemui.qs.QSDetailItems
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:sysui="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:paddingTop="16dp"
-    android:paddingStart="16dp"
+    android:paddingStart="@dimen/qs_detail_padding_start"
     android:paddingEnd="16dp">
 
-    <LinearLayout
+    <com.android.systemui.qs.AutoSizingList
         android:id="@android:id/list"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical" />
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        sysui:itemHeight="@dimen/qs_detail_item_height"
+        style="@style/AutoSizingList"/>
 
     <LinearLayout
         android:id="@android:id/empty"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         android:layout_gravity="center"
-        android:gravity="center_horizontal"
-        android:orientation="vertical" >
+        android:gravity="center"
+        android:orientation="vertical">
 
         <ImageView
             android:id="@android:id/icon"
             android:layout_width="56dp"
-            android:layout_height="56dp" />
+            android:layout_height="56dp"
+            android:tint="?android:attr/textColorSecondary" />
 
         <TextView
             android:id="@android:id/title"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:textAppearance="@style/TextAppearance.QS.DetailEmpty" />
+            android:textAppearance="@style/TextAppearance.QS.DetailEmpty"/>
     </LinearLayout>
-
-    <View
-        android:id="@+id/min_height_spacer"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"/>
 </com.android.systemui.qs.QSDetailItems>

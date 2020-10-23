@@ -16,11 +16,15 @@
 
 package android.inputmethodservice;
 
+import android.annotation.MainThread;
+import android.annotation.NonNull;
 import android.app.Service;
 import android.content.Intent;
 import android.os.IBinder;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputContentInfo;
 import android.view.inputmethod.InputMethod;
 import android.view.inputmethod.InputMethodSession;
 
@@ -59,6 +63,7 @@ public abstract class AbstractInputMethodService extends Service
          * back to {@link AbstractInputMethodService#onCreateInputMethodSessionInterface()
          * AbstractInputMethodService.onCreateInputMethodSessionInterface()}.
          */
+        @MainThread
         public void createSession(SessionCallback callback) {
             callback.sessionCreated(onCreateInputMethodSessionInterface());
         }
@@ -68,6 +73,7 @@ public abstract class AbstractInputMethodService extends Service
          * {@link AbstractInputMethodSessionImpl#revokeSelf()
          * AbstractInputMethodSessionImpl.setEnabled()} method.
          */
+        @MainThread
         public void setSessionEnabled(InputMethodSession session, boolean enabled) {
             ((AbstractInputMethodSessionImpl)session).setEnabled(enabled);
         }
@@ -77,6 +83,7 @@ public abstract class AbstractInputMethodService extends Service
          * {@link AbstractInputMethodSessionImpl#revokeSelf()
          * AbstractInputMethodSessionImpl.revokeSelf()} method.
          */
+        @MainThread
         public void revokeSession(InputMethodSession session) {
             ((AbstractInputMethodSessionImpl)session).revokeSelf();
         }
@@ -208,7 +215,7 @@ public abstract class AbstractInputMethodService extends Service
      *
      * @param event The motion event being received.
      * @return True if the event was handled in this function, false otherwise.
-     * @see View#onTrackballEvent
+     * @see android.view.View#onTrackballEvent(MotionEvent)
      */
     public boolean onTrackballEvent(MotionEvent event) {
         return false;
@@ -219,9 +226,44 @@ public abstract class AbstractInputMethodService extends Service
      *
      * @param event The motion event being received.
      * @return True if the event was handled in this function, false otherwise.
-     * @see View#onGenericMotionEvent
+     * @see android.view.View#onGenericMotionEvent(MotionEvent)
      */
     public boolean onGenericMotionEvent(MotionEvent event) {
         return false;
+    }
+
+    /**
+     * Allow the receiver of {@link InputContentInfo} to obtain a temporary read-only access
+     * permission to the content.
+     *
+     * <p>Default implementation does nothing.</p>
+     *
+     * @param inputContentInfo Content to be temporarily exposed from the input method to the
+     * application.
+     * This cannot be {@code null}.
+     * @param inputConnection {@link InputConnection} with which
+     * {@link InputConnection#commitContent(InputContentInfo, int, android.os.Bundle)} will be
+     * called.
+     * @return {@code false} if we cannot allow a temporary access permission.
+     * @hide
+     */
+    public void exposeContent(@NonNull InputContentInfo inputContentInfo,
+            @NonNull InputConnection inputConnection) {
+        return;
+    }
+
+    /**
+     * Called when the user took some actions that should be taken into consideration to update the
+     * MRU list for input method rotation.
+     *
+     * @hide
+     */
+    public void notifyUserActionIfNecessary() {
+    }
+
+    /** @hide */
+    @Override
+    public final boolean isUiContext() {
+        return true;
     }
 }

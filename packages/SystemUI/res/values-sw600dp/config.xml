@@ -26,15 +26,13 @@
     <!-- The number of columns that the top level tiles span in the QuickSettings -->
     <integer name="quick_settings_user_time_settings_tile_span">1</integer>
 
-    <!-- The maximum count of notifications on Keyguard. The rest will be collapsed in an overflow
-         card. -->
-    <integer name="keyguard_max_notification_count">5</integer>
+    <!-- Nav bar button default ordering/layout -->
+    <string name="config_navBarLayout" translatable="false">left;back,home,recent;right</string>
 
-    <!-- Set to true to enable the user switcher on the keyguard. -->
-    <bool name="config_keyguardUserSwitcher">true</bool>
+    <!-- Animation duration when using long press on recents to dock -->
+    <integer name="long_press_dock_anim_duration">290</integer>
 
-    <!-- Transposes the search bar layout in landscape. -->
-    <bool name="recents_has_transposed_search_bar">true</bool>
-    <!-- Transposes the nav bar in landscape (only used for purposes of layout). -->
-    <bool name="recents_has_transposed_nav_bar">false</bool>
+    <!-- orientation of the dead zone when touches have recently occurred elsewhere on screen -->
+    <integer name="navigation_bar_deadzone_orientation">0</integer>
+
 </resources>

@@ -16,7 +16,7 @@
 
 #include "DamageAccumulator.h"
 
-#include <cutils/log.h>
+#include <log/log.h>
 
 #include "RenderNode.h"
 #include "utils/MathUtils.h"
@@ -45,7 +45,7 @@ struct DirtyStack {
 };
 
 DamageAccumulator::DamageAccumulator() {
-    mHead = (DirtyStack*) mAllocator.alloc(sizeof(DirtyStack));
+    mHead = mAllocator.create_trivial<DirtyStack>();
     memset(mHead, 0, sizeof(DirtyStack));
     // Create a root that we will not pop off
     mHead->prev = mHead;
@@ -57,17 +57,18 @@ static void computeTransformImpl(const DirtyStack* currentFrame, Matrix4* outMat
         computeTransformImpl(currentFrame->prev, outMatrix);
     }
     switch (currentFrame->type) {
-    case TransformRenderNode:
-        currentFrame->renderNode->applyViewPropertyTransforms(*outMatrix);
-        break;
-    case TransformMatrix4:
-        outMatrix->multiply(*currentFrame->matrix4);
-        break;
-    case TransformNone:
-        // nothing to be done
-        break;
-    default:
-        LOG_ALWAYS_FATAL("Tried to compute transform with an invalid type: %d", currentFrame->type);
+        case TransformRenderNode:
+            currentFrame->renderNode->applyViewPropertyTransforms(*outMatrix);
+            break;
+        case TransformMatrix4:
+            outMatrix->multiply(*currentFrame->matrix4);
+            break;
+        case TransformNone:
+            // nothing to be done
+            break;
+        default:
+            LOG_ALWAYS_FATAL("Tried to compute transform with an invalid type: %d",
+                             currentFrame->type);
     }
 }
 
@@ -78,7 +79,7 @@ void DamageAccumulator::computeCurrentTransform(Matrix4* outMatrix) const {
 
 void DamageAccumulator::pushCommon() {
     if (!mHead->next) {
-        DirtyStack* nextFrame = (DirtyStack*) mAllocator.alloc(sizeof(DirtyStack));
+        DirtyStack* nextFrame = mAllocator.create_trivial<DirtyStack>();
         nextFrame->next = nullptr;
         nextFrame->prev = mHead;
         mHead->next = nextFrame;
@@ -104,37 +105,59 @@ void DamageAccumulator::popTransform() {
     DirtyStack* dirtyFrame = mHead;
     mHead = mHead->prev;
     switch (dirtyFrame->type) {
-    case TransformRenderNode:
-        applyRenderNodeTransform(dirtyFrame);
-        break;
-    case TransformMatrix4:
-        applyMatrix4Transform(dirtyFrame);
-        break;
-    case TransformNone:
-        mHead->pendingDirty.join(dirtyFrame->pendingDirty);
-        break;
-    default:
-        LOG_ALWAYS_FATAL("Tried to pop an invalid type: %d", dirtyFrame->type);
+        case TransformRenderNode:
+            applyRenderNodeTransform(dirtyFrame);
+            break;
+        case TransformMatrix4:
+            applyMatrix4Transform(dirtyFrame);
+            break;
+        case TransformNone:
+            mHead->pendingDirty.join(dirtyFrame->pendingDirty);
+            break;
+        default:
+            LOG_ALWAYS_FATAL("Tried to pop an invalid type: %d", dirtyFrame->type);
     }
 }
 
 static inline void mapRect(const Matrix4* matrix, const SkRect& in, SkRect* out) {
     if (in.isEmpty()) return;
     Rect temp(in);
-    matrix->mapRect(temp);
-    out->join(RECT_ARGS(temp));
+    if (CC_LIKELY(!matrix->isPerspective())) {
+        matrix->mapRect(temp);
+    } else {
+        // Don't attempt to calculate damage for a perspective transform
+        // as the numbers this works with can break the perspective
+        // calculations. Just give up and expand to DIRTY_MIN/DIRTY_MAX
+        temp.set(DIRTY_MIN, DIRTY_MIN, DIRTY_MAX, DIRTY_MAX);
+    }
+    out->join({RECT_ARGS(temp)});
 }
 
 void DamageAccumulator::applyMatrix4Transform(DirtyStack* frame) {
     mapRect(frame->matrix4, frame->pendingDirty, &mHead->pendingDirty);
 }
 
+static inline void applyMatrix(const SkMatrix* transform, SkRect* rect) {
+    if (transform && !transform->isIdentity()) {
+        if (CC_LIKELY(!transform->hasPerspective())) {
+            transform->mapRect(rect);
+        } else {
+            // Don't attempt to calculate damage for a perspective transform
+            // as the numbers this works with can break the perspective
+            // calculations. Just give up and expand to DIRTY_MIN/DIRTY_MAX
+            rect->setLTRB(DIRTY_MIN, DIRTY_MIN, DIRTY_MAX, DIRTY_MAX);
+        }
+    }
+}
+
 static inline void mapRect(const RenderProperties& props, const SkRect& in, SkRect* out) {
     if (in.isEmpty()) return;
-    const SkMatrix* transform = props.getTransformMatrix();
     SkRect temp(in);
-    if (transform && !transform->isIdentity()) {
-        transform->mapRect(&temp);
+    applyMatrix(props.getTransformMatrix(), &temp);
+    if (props.getStaticMatrix()) {
+        applyMatrix(props.getStaticMatrix(), &temp);
+    } else if (props.getAnimationMatrix()) {
+        applyMatrix(props.getAnimationMatrix(), &temp);
     }
     temp.offset(props.getLeft(), props.getTop());
     out->join(temp);
@@ -154,8 +177,7 @@ static DirtyStack* findProjectionReceiver(DirtyStack* frame) {
     if (frame) {
         while (frame->prev != frame) {
             frame = frame->prev;
-            if (frame->type == TransformRenderNode
-                    && frame->renderNode->hasProjectionReceiver()) {
+            if (frame->type == TransformRenderNode && frame->renderNode->hasProjectionReceiver()) {
                 return frame;
             }
         }
@@ -187,7 +209,7 @@ void DamageAccumulator::applyRenderNodeTransform(DirtyStack* frame) {
 
     // Perform clipping
     if (props.getClipDamageToBounds() && !frame->pendingDirty.isEmpty()) {
-        if (!frame->pendingDirty.intersect(0, 0, props.getWidth(), props.getHeight())) {
+        if (!frame->pendingDirty.intersect(SkRect::MakeIWH(props.getWidth(), props.getHeight()))) {
             frame->pendingDirty.setEmpty();
         }
     }
@@ -211,7 +233,7 @@ void DamageAccumulator::applyRenderNodeTransform(DirtyStack* frame) {
 }
 
 void DamageAccumulator::dirty(float left, float top, float right, float bottom) {
-    mHead->pendingDirty.join(left, top, right, bottom);
+    mHead->pendingDirty.join({left, top, right, bottom});
 }
 
 void DamageAccumulator::peekAtDirty(SkRect* dest) const {
@@ -219,7 +241,8 @@ void DamageAccumulator::peekAtDirty(SkRect* dest) const {
 }
 
 void DamageAccumulator::finish(SkRect* totalDirty) {
-    LOG_ALWAYS_FATAL_IF(mHead->prev != mHead, "Cannot finish, mismatched push/pop calls! %p vs. %p", mHead->prev, mHead);
+    LOG_ALWAYS_FATAL_IF(mHead->prev != mHead, "Cannot finish, mismatched push/pop calls! %p vs. %p",
+                        mHead->prev, mHead);
     // Root node never has a transform, so this is the fully mapped dirty rect
     *totalDirty = mHead->pendingDirty;
     totalDirty->roundOut(totalDirty);

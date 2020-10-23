@@ -15,24 +15,25 @@
  */
 package com.android.internal.widget;
 
-import com.android.internal.R;
-
-import android.util.TypedValue;
-import android.view.ContextThemeWrapper;
-import android.widget.ActionMenuPresenter;
-import android.widget.ActionMenuView;
-
 import android.animation.Animator;
 import android.animation.AnimatorSet;
 import android.animation.ObjectAnimator;
 import android.animation.TimeInterpolator;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.content.res.TypedArray;
 import android.util.AttributeSet;
+import android.util.TypedValue;
+import android.view.ContextThemeWrapper;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.animation.DecelerateInterpolator;
+import android.widget.ActionMenuPresenter;
+import android.widget.ActionMenuView;
+
+import com.android.internal.R;
 
 public abstract class AbsActionBarView extends ViewGroup {
     private static final TimeInterpolator sAlphaInterpolator = new DecelerateInterpolator();
@@ -52,6 +53,9 @@ public abstract class AbsActionBarView extends ViewGroup {
     protected int mContentHeight;
 
     protected Animator mVisibilityAnim;
+
+    private boolean mEatingTouch;
+    private boolean mEatingHover;
 
     public AbsActionBarView(Context context) {
         this(context, null);
@@ -95,6 +99,57 @@ public abstract class AbsActionBarView extends ViewGroup {
         if (mActionMenuPresenter != null) {
             mActionMenuPresenter.onConfigurationChanged(newConfig);
         }
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent ev) {
+        // ActionBarViews always eat touch events, but should still respect the touch event dispatch
+        // contract. If the normal View implementation doesn't want the events, we'll just silently
+        // eat the rest of the gesture without reporting the events to the default implementation
+        // since that's what it expects.
+
+        final int action = ev.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            mEatingTouch = false;
+        }
+
+        if (!mEatingTouch) {
+            final boolean handled = super.onTouchEvent(ev);
+            if (action == MotionEvent.ACTION_DOWN && !handled) {
+                mEatingTouch = true;
+            }
+        }
+
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            mEatingTouch = false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public boolean onHoverEvent(MotionEvent ev) {
+        // Same deal as onTouchEvent() above. Eat all hover events, but still
+        // respect the touch event dispatch contract.
+
+        final int action = ev.getActionMasked();
+        if (action == MotionEvent.ACTION_HOVER_ENTER) {
+            mEatingHover = false;
+        }
+
+        if (!mEatingHover) {
+            final boolean handled = super.onHoverEvent(ev);
+            if (action == MotionEvent.ACTION_HOVER_ENTER && !handled) {
+                mEatingHover = true;
+            }
+        }
+
+        if (action == MotionEvent.ACTION_HOVER_EXIT
+                || action == MotionEvent.ACTION_CANCEL) {
+            mEatingHover = false;
+        }
+
+        return true;
     }
 
     /**
@@ -239,6 +294,7 @@ public abstract class AbsActionBarView extends ViewGroup {
         return isOverflowReserved() && getVisibility() == VISIBLE;
     }
 
+    @UnsupportedAppUsage
     public void dismissPopupMenus() {
         if (mActionMenuPresenter != null) {
             mActionMenuPresenter.dismissPopupMenus();

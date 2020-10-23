@@ -55,7 +55,7 @@ enum {
 class BpMountService: public BpInterface<IMountService>
 {
 public:
-    BpMountService(const sp<IBinder>& impl)
+    explicit BpMountService(const sp<IBinder>& impl)
         : BpInterface<IMountService>(impl)
     {
     }
@@ -443,7 +443,7 @@ public:
     }
 
     void mountObb(const String16& rawPath, const String16& canonicalPath, const String16& key,
-            const sp<IObbActionListener>& token, int32_t nonce)
+            const sp<IObbActionListener>& token, int32_t nonce, const sp<ObbInfo>& obbInfo)
     {
         Parcel data, reply;
         data.writeInterfaceToken(IMountService::getInterfaceDescriptor());
@@ -452,6 +452,7 @@ public:
         data.writeString16(key);
         data.writeStrongBinder(IInterface::asBinder(token));
         data.writeInt32(nonce);
+        obbInfo->writeToParcel(&data);
         if (remote()->transact(TRANSACTION_mountObb, data, &reply) != NO_ERROR) {
             ALOGD("mountObb could not contact remote\n");
             return;
@@ -553,7 +554,7 @@ public:
     }
 };
 
-IMPLEMENT_META_INTERFACE(MountService, "IMountService")
+IMPLEMENT_META_INTERFACE(MountService, "android.os.storage.IStorageManager")
 
 // ----------------------------------------------------------------------
 

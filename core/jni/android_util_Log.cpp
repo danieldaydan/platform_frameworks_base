@@ -18,13 +18,14 @@
 #define LOG_NAMESPACE "log.tag."
 #define LOG_TAG "Log_println"
 
+#include <android-base/macros.h>
 #include <assert.h>
-#include <cutils/properties.h>
+#include <log/log.h>               // For LOGGER_ENTRY_MAX_PAYLOAD.
 #include <utils/Log.h>
 #include <utils/String8.h>
 
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 #include "utils/misc.h"
 #include "core_jni_helpers.h"
 #include "android_util_Log.h"
@@ -56,16 +57,7 @@ static jboolean android_util_Log_isLoggable(JNIEnv* env, jobject clazz, jstring 
         return false;
     }
 
-    jboolean result = false;
-    if ((strlen(chars)+sizeof(LOG_NAMESPACE)) > PROPERTY_KEY_MAX) {
-        char buf2[200];
-        snprintf(buf2, sizeof(buf2), "Log tag \"%s\" exceeds limit of %zu characters\n",
-                chars, PROPERTY_KEY_MAX - sizeof(LOG_NAMESPACE));
-
-        jniThrowException(env, "java/lang/IllegalArgumentException", buf2);
-    } else {
-        result = isLoggable(chars, level);
-    }
+    jboolean result = isLoggable(chars, level);
 
     env->ReleaseStringUTFChars(tag, chars);
     return result;
@@ -109,12 +101,23 @@ static jint android_util_Log_println_native(JNIEnv* env, jobject clazz,
 }
 
 /*
+ * In class android.util.Log:
+ *  private static native int logger_entry_max_payload_native()
+ */
+static jint android_util_Log_logger_entry_max_payload_native(JNIEnv* env ATTRIBUTE_UNUSED,
+                                                             jobject clazz ATTRIBUTE_UNUSED)
+{
+    return static_cast<jint>(LOGGER_ENTRY_MAX_PAYLOAD);
+}
+
+/*
  * JNI registration.
  */
 static const JNINativeMethod gMethods[] = {
     /* name, signature, funcPtr */
     { "isLoggable",      "(Ljava/lang/String;I)Z", (void*) android_util_Log_isLoggable },
     { "println_native",  "(IILjava/lang/String;Ljava/lang/String;)I", (void*) android_util_Log_println_native },
+    { "logger_entry_max_payload_native",  "()I", (void*) android_util_Log_logger_entry_max_payload_native },
 };
 
 int register_android_util_Log(JNIEnv* env)

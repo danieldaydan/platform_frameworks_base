@@ -16,18 +16,28 @@
 
 package android.text.format;
 
-import android.test.suitebuilder.annotation.SmallTest;
-import android.test.suitebuilder.annotation.Suppress;
-import android.text.format.Time;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+import android.platform.test.annotations.Presubmit;
 import android.util.Log;
 import android.util.TimeFormatException;
 
-import junit.framework.TestCase;
+import androidx.test.filters.SmallTest;
+import androidx.test.filters.Suppress;
+import androidx.test.runner.AndroidJUnit4;
 
-public class TimeTest extends TestCase {
+import org.junit.Test;
+import org.junit.runner.RunWith;
 
-    @SmallTest
-    public void testNormalize0() throws Exception {
+@Presubmit
+@SmallTest
+@RunWith(AndroidJUnit4.class)
+public class TimeTest {
+
+    @Test
+    public void testNormalize0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.parse("20060432T010203");
         t.normalize(false /* use isDst */);
@@ -175,8 +185,8 @@ public class TimeTest extends TestCase {
             new DateTest(2007, 10, 5, 2, 0, 60, 2007, 10, 5, 3, 0),
     };
 
-    @SmallTest
-    public void testNormalize1() throws Exception {
+    @Test
+    public void testNormalize1() {
         Time local = new Time("America/Los_Angeles");
 
         int len = dayTests.length;
@@ -266,70 +276,70 @@ public class TimeTest extends TestCase {
         }
     }
 
-    @SmallTest
-    public void testSwitchTimezone0() throws Exception {
+    @Test
+    public void testSwitchTimezone0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.parse("20061005T120000");
         t.switchTimezone("America/Los_Angeles");
         // System.out.println("got: " + t);
     }
 
-    @SmallTest
-    public void testCtor0() throws Exception {
+    @Test
+    public void testCtor0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         assertEquals(Time.TIMEZONE_UTC, t.timezone);
     }
 
-    @SmallTest
-    public void testGetActualMaximum0() throws Exception {
+    @Test
+    public void testGetActualMaximum0() {
         Time t = new Time(Time.TIMEZONE_UTC);
-        int r = t.getActualMaximum(Time.SECOND);
+        t.getActualMaximum(Time.SECOND);
         // System.out.println("r=" + r);
     }
 
-    @SmallTest
-    public void testClear0() throws Exception {
+    @Test
+    public void testClear0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.clear(Time.TIMEZONE_UTC);
     }
 
-    @SmallTest
-    public void testCompare0() throws Exception {
+    @Test
+    public void testCompare0() {
         Time a = new Time(Time.TIMEZONE_UTC);
         Time b = new Time("America/Los_Angeles");
         int r = Time.compare(a, b);
         // System.out.println("r=" + r);
     }
 
-    @SmallTest
-    public void testFormat0() throws Exception {
+    @Test
+    public void testFormat0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         String r = t.format("%Y%m%dT%H%M%S");
         // System.out.println("r='" + r + "'");
     }
 
-    @SmallTest
-    public void testToString0() throws Exception {
+    @Test
+    public void testToString0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         String r = t.toString();
         // System.out.println("r='" + r + "'");
     }
 
-    @SmallTest
-    public void testGetCurrentTimezone0() throws Exception {
+    @Test
+    public void testGetCurrentTimezone0() {
         String r = Time.getCurrentTimezone();
         // System.out.println("r='" + r + "'");
     }
 
-    @SmallTest
-    public void testSetToNow0() throws Exception {
+    @Test
+    public void testSetToNow0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.setToNow();
         // System.out.println("t=" + t);
     }
 
-    @SmallTest
-    public void testMillis0() throws Exception {
+    @Test
+    public void testMillis0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.set(0, 0, 0, 1, 1, 2006);
         long r = t.toMillis(true /* ignore isDst */);
@@ -339,23 +349,23 @@ public class TimeTest extends TestCase {
         // System.out.println("r=" + r);
     }
 
-    @SmallTest
-    public void testMillis1() throws Exception {
+    @Test
+    public void testMillis1() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.set(1, 0, 0, 1, 0, 1970);
         long r = t.toMillis(true /* ignore isDst */);
         // System.out.println("r=" + r);
     }
 
-    @SmallTest
-    public void testParse0() throws Exception {
+    @Test
+    public void testParse0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.parse("12345678T901234");
         // System.out.println("t=" + t);
     }
 
-    @SmallTest
-    public void testParse33390() throws Exception {
+    @Test
+    public void testParse33390() {
         Time t = new Time(Time.TIMEZONE_UTC);
 
         t.parse3339("1980-05-23");
@@ -436,8 +446,8 @@ public class TimeTest extends TestCase {
         }
     }
 
-    @SmallTest
-    public void testSet0() throws Exception {
+    @Test
+    public void testSet0() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.set(1000L);
         // System.out.println("t.year=" + t.year);
@@ -450,13 +460,13 @@ public class TimeTest extends TestCase {
         // System.out.println("t=" + t);
     }
 
-    @SmallTest
-    public void testSet1() throws Exception {
+    @Test
+    public void testSet1() {
         Time t = new Time(Time.TIMEZONE_UTC);
         t.set(1, 2, 3, 4, 5, 6);
         // System.out.println("t=" + t);
     }
-    
+
     // Timezones that cover the world.  Some GMT offsets occur more than
     // once in case some cities decide to change their GMT offset.
     private static final String[] mTimeZones = {
@@ -519,9 +529,9 @@ public class TimeTest extends TestCase {
         "Pacific/Honolulu",
         "Pacific/Midway",
     };
-    
+
     @Suppress
-    public void disableTestGetJulianDay() throws Exception {
+    public void disableTestGetJulianDay() {
         Time time = new Time();
 
         // For each day of the year, and for each timezone, get the Julian
@@ -561,11 +571,11 @@ public class TimeTest extends TestCase {
             }
         }
     }
-    
+
     @Suppress
-    public void disableTestSetJulianDay() throws Exception {
+    public void disableTestSetJulianDay() {
         Time time = new Time();
-        
+
         // For each day of the year in 2008, and for each timezone,
         // test that we can set the Julian day correctly.
         for (int monthDay = 1; monthDay <= 366; monthDay++) {

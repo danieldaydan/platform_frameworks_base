@@ -15,7 +15,6 @@
  */
 package android.service.notification;
 
-import android.os.Bundle;
 import android.os.Parcel;
 import android.os.Parcelable;
 
@@ -23,25 +22,18 @@ import android.os.Parcelable;
  * @hide
  */
 public class NotificationRankingUpdate implements Parcelable {
-    // TODO: Support incremental updates.
-    private final String[] mKeys;
-    private final String[] mInterceptedKeys;
-    private final int mFirstAmbientIndex;
-    private final Bundle mVisibilityOverrides;
+    private final NotificationListenerService.RankingMap mRankingMap;
 
-    public NotificationRankingUpdate(String[] keys, String[] interceptedKeys,
-            Bundle visibilityOverrides, int firstAmbientIndex) {
-        mKeys = keys;
-        mFirstAmbientIndex = firstAmbientIndex;
-        mInterceptedKeys = interceptedKeys;
-        mVisibilityOverrides = visibilityOverrides;
+    public NotificationRankingUpdate(NotificationListenerService.Ranking[] rankings) {
+        mRankingMap = new NotificationListenerService.RankingMap(rankings);
     }
 
     public NotificationRankingUpdate(Parcel in) {
-        mKeys = in.readStringArray();
-        mFirstAmbientIndex = in.readInt();
-        mInterceptedKeys = in.readStringArray();
-        mVisibilityOverrides = in.readBundle();
+        mRankingMap = in.readParcelable(getClass().getClassLoader());
+    }
+
+    public NotificationListenerService.RankingMap getRankingMap() {
+        return mRankingMap;
     }
 
     @Override
@@ -50,14 +42,20 @@ public class NotificationRankingUpdate implements Parcelable {
     }
 
     @Override
-    public void writeToParcel(Parcel out, int flags) {
-        out.writeStringArray(mKeys);
-        out.writeInt(mFirstAmbientIndex);
-        out.writeStringArray(mInterceptedKeys);
-        out.writeBundle(mVisibilityOverrides);
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+
+        NotificationRankingUpdate other = (NotificationRankingUpdate) o;
+        return mRankingMap.equals(other.mRankingMap);
     }
 
-    public static final Parcelable.Creator<NotificationRankingUpdate> CREATOR
+    @Override
+    public void writeToParcel(Parcel out, int flags) {
+        out.writeParcelable(mRankingMap, flags);
+    }
+
+    public static final @android.annotation.NonNull Parcelable.Creator<NotificationRankingUpdate> CREATOR
             = new Parcelable.Creator<NotificationRankingUpdate>() {
         public NotificationRankingUpdate createFromParcel(Parcel parcel) {
             return new NotificationRankingUpdate(parcel);
@@ -67,20 +65,4 @@ public class NotificationRankingUpdate implements Parcelable {
             return new NotificationRankingUpdate[size];
         }
     };
-
-    public String[] getOrderedKeys() {
-        return mKeys;
-    }
-
-    public int getFirstAmbientIndex() {
-        return mFirstAmbientIndex;
-    }
-
-    public String[] getInterceptedKeys() {
-        return mInterceptedKeys;
-    }
-
-    public Bundle getVisibilityOverrides() {
-        return mVisibilityOverrides;
-    }
 }

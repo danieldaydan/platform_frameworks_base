@@ -19,7 +19,6 @@ package com.android.systemui.statusbar.policy;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.Bundle;
@@ -29,6 +28,7 @@ import android.view.View;
 
 import com.android.internal.widget.LockPatternUtils;
 import com.android.keyguard.KeyguardUpdateMonitor;
+import com.android.systemui.ActivityIntentHelper;
 import com.android.systemui.statusbar.phone.KeyguardPreviewContainer;
 
 import java.util.List;
@@ -41,13 +41,16 @@ public class PreviewInflater {
     private static final String TAG = "PreviewInflater";
 
     private static final String META_DATA_KEYGUARD_LAYOUT = "com.android.keyguard.layout";
+    private final ActivityIntentHelper mActivityIntentHelper;
 
     private Context mContext;
     private LockPatternUtils mLockPatternUtils;
 
-    public PreviewInflater(Context context, LockPatternUtils lockPatternUtils) {
+    public PreviewInflater(Context context, LockPatternUtils lockPatternUtils,
+            ActivityIntentHelper activityIntentHelper) {
         mContext = context;
         mLockPatternUtils = lockPatternUtils;
+        mActivityIntentHelper = activityIntentHelper;
     }
 
     public View inflatePreview(Intent intent) {
@@ -119,15 +122,18 @@ public class PreviewInflater {
 
     private WidgetInfo getWidgetInfo(Intent intent) {
         PackageManager packageManager = mContext.getPackageManager();
+        int flags = PackageManager.MATCH_DEFAULT_ONLY
+                | PackageManager.MATCH_DIRECT_BOOT_AWARE
+                | PackageManager.MATCH_DIRECT_BOOT_UNAWARE;
         final List<ResolveInfo> appList = packageManager.queryIntentActivitiesAsUser(
-                intent, PackageManager.MATCH_DEFAULT_ONLY, KeyguardUpdateMonitor.getCurrentUser());
+                intent, flags, KeyguardUpdateMonitor.getCurrentUser());
         if (appList.size() == 0) {
             return null;
         }
         ResolveInfo resolved = packageManager.resolveActivityAsUser(intent,
-                PackageManager.MATCH_DEFAULT_ONLY | PackageManager.GET_META_DATA,
+                flags | PackageManager.GET_META_DATA,
                 KeyguardUpdateMonitor.getCurrentUser());
-        if (wouldLaunchResolverActivity(resolved, appList)) {
+        if (mActivityIntentHelper.wouldLaunchResolverActivity(resolved, appList)) {
             return null;
         }
         if (resolved == null || resolved.activityInfo == null) {
@@ -135,46 +141,6 @@ public class PreviewInflater {
         }
         return getWidgetInfoFromMetaData(resolved.activityInfo.packageName,
                 resolved.activityInfo.metaData);
-    }
-
-    public static boolean wouldLaunchResolverActivity(Context ctx, Intent intent,
-            int currentUserId) {
-        return getTargetActivityInfo(ctx, intent, currentUserId) == null;
-    }
-
-    /**
-     * @return the target activity info of the intent it resolves to a specific package or
-     *         {@code null} if it resolved to the resolver activity
-     */
-    public static ActivityInfo getTargetActivityInfo(Context ctx, Intent intent,
-            int currentUserId) {
-        PackageManager packageManager = ctx.getPackageManager();
-        final List<ResolveInfo> appList = packageManager.queryIntentActivitiesAsUser(
-                intent, PackageManager.MATCH_DEFAULT_ONLY, currentUserId);
-        if (appList.size() == 0) {
-            return null;
-        }
-        ResolveInfo resolved = packageManager.resolveActivityAsUser(intent,
-                PackageManager.MATCH_DEFAULT_ONLY | PackageManager.GET_META_DATA, currentUserId);
-        if (resolved == null || wouldLaunchResolverActivity(resolved, appList)) {
-            return null;
-        } else {
-            return resolved.activityInfo;
-        }
-    }
-
-    private static boolean wouldLaunchResolverActivity(
-            ResolveInfo resolved, List<ResolveInfo> appList) {
-        // If the list contains the above resolved activity, then it can't be
-        // ResolverActivity itself.
-        for (int i = 0; i < appList.size(); i++) {
-            ResolveInfo tmp = appList.get(i);
-            if (tmp.activityInfo.name.equals(resolved.activityInfo.name)
-                    && tmp.activityInfo.packageName.equals(resolved.activityInfo.packageName)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private static class WidgetInfo {

@@ -19,10 +19,7 @@ namespace android {
 namespace uirenderer {
 namespace renderthread {
 
-TimeLord::TimeLord()
-        : mFrameIntervalNanos(milliseconds_to_nanoseconds(16))
-        , mFrameTimeNanos(0) {
-}
+TimeLord::TimeLord() : mFrameIntervalNanos(milliseconds_to_nanoseconds(16)), mFrameTimeNanos(0) {}
 
 bool TimeLord::vsyncReceived(nsecs_t vsync) {
     if (vsync > mFrameTimeNanos) {
@@ -34,17 +31,13 @@ bool TimeLord::vsyncReceived(nsecs_t vsync) {
 
 nsecs_t TimeLord::computeFrameTimeNanos() {
     // Logic copied from Choreographer.java
-    nsecs_t now = systemTime(CLOCK_MONOTONIC);
+    nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
     nsecs_t jitterNanos = now - mFrameTimeNanos;
     if (jitterNanos >= mFrameIntervalNanos) {
         nsecs_t lastFrameOffset = jitterNanos % mFrameIntervalNanos;
         mFrameTimeNanos = now - lastFrameOffset;
     }
     return mFrameTimeNanos;
-}
-
-nsecs_t TimeLord::computeFrameTimeMs() {
-    return nanoseconds_to_milliseconds(computeFrameTimeNanos());
 }
 
 } /* namespace renderthread */

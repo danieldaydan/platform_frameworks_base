@@ -16,6 +16,8 @@
 
 package com.android.server.policy;
 
+import android.graphics.ColorFilter;
+import android.graphics.ColorMatrixColorFilter;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.PaintDrawable;
@@ -37,25 +39,18 @@ import android.content.Context;
 /**
  * Various utilities shared amongst the Launcher's classes.
  */
-final class IconUtilities {
-    private static final String TAG = "IconUtilities";
-
-    private static final int sColors[] = { 0xffff0000, 0xff00ff00, 0xff0000ff };
+public final class IconUtilities {
 
     private int mIconWidth = -1;
     private int mIconHeight = -1;
     private int mIconTextureWidth = -1;
     private int mIconTextureHeight = -1;
 
-    private final Paint mPaint = new Paint();
-    private final Paint mBlurPaint = new Paint();
-    private final Paint mGlowColorPressedPaint = new Paint();
-    private final Paint mGlowColorFocusedPaint = new Paint();
     private final Rect mOldBounds = new Rect();
     private final Canvas mCanvas = new Canvas();
     private final DisplayMetrics mDisplayMetrics;
 
-    private int mColorIndex = 0;
+    private ColorFilter mDisabledColorFilter;
 
     public IconUtilities(Context context) {
         final Resources resources = context.getResources();
@@ -65,44 +60,15 @@ final class IconUtilities {
 
         mIconWidth = mIconHeight = (int) resources.getDimension(android.R.dimen.app_icon_size);
         mIconTextureWidth = mIconTextureHeight = mIconWidth + (int)(blurPx*2);
-
-        mBlurPaint.setMaskFilter(new BlurMaskFilter(blurPx, BlurMaskFilter.Blur.NORMAL));
-
-        TypedValue value = new TypedValue();
-        mGlowColorPressedPaint.setColor(context.getTheme().resolveAttribute(
-                android.R.attr.colorPressedHighlight, value, true) ? value.data : 0xffffc300);
-        mGlowColorPressedPaint.setMaskFilter(TableMaskFilter.CreateClipTable(0, 30));
-        mGlowColorFocusedPaint.setColor(context.getTheme().resolveAttribute(
-                android.R.attr.colorFocusedHighlight, value, true) ? value.data : 0xffff8e00);
-        mGlowColorFocusedPaint.setMaskFilter(TableMaskFilter.CreateClipTable(0, 30));
-
-        ColorMatrix cm = new ColorMatrix();
-        cm.setSaturation(0.2f);
-
         mCanvas.setDrawFilter(new PaintFlagsDrawFilter(Paint.DITHER_FLAG,
                 Paint.FILTER_BITMAP_FLAG));
-    }
-
-    public Drawable createIconDrawable(Drawable src) {
-        Bitmap scaled = createIconBitmap(src);
-
-        StateListDrawable result = new StateListDrawable();
-
-        result.addState(new int[] { android.R.attr.state_focused },
-                new BitmapDrawable(createSelectedBitmap(scaled, false)));
-        result.addState(new int[] { android.R.attr.state_pressed },
-                new BitmapDrawable(createSelectedBitmap(scaled, true)));
-        result.addState(new int[0], new BitmapDrawable(scaled));
-
-        result.setBounds(0, 0, mIconTextureWidth, mIconTextureHeight);
-        return result;
     }
 
     /**
      * Returns a bitmap suitable for the all apps view.  The bitmap will be a power
      * of two sized ARGB_8888 bitmap that can be used as a gl texture.
      */
-    private Bitmap createIconBitmap(Drawable icon) {
+    public Bitmap createIconBitmap(Drawable icon) {
         int width = mIconWidth;
         int height = mIconHeight;
 
@@ -150,15 +116,6 @@ final class IconUtilities {
         final int left = (textureWidth-width) / 2;
         final int top = (textureHeight-height) / 2;
 
-        if (false) {
-            // draw a big box for the icon for debugging
-            canvas.drawColor(sColors[mColorIndex]);
-            if (++mColorIndex >= sColors.length) mColorIndex = 0;
-            Paint debugPaint = new Paint();
-            debugPaint.setColor(0xffcccc00);
-            canvas.drawRect(left, top, left+width, top+height, debugPaint);
-        }
-
         mOldBounds.set(icon.getBounds());
         icon.setBounds(left, top, left+width, top+height);
         icon.draw(canvas);
@@ -167,24 +124,28 @@ final class IconUtilities {
         return bitmap;
     }
 
-    private Bitmap createSelectedBitmap(Bitmap src, boolean pressed) {
-        final Bitmap result = Bitmap.createBitmap(mIconTextureWidth, mIconTextureHeight,
-                Bitmap.Config.ARGB_8888);
-        final Canvas dest = new Canvas(result);
+    public ColorFilter getDisabledColorFilter() {
+        if (mDisabledColorFilter != null) {
+            return mDisabledColorFilter;
+        }
+        ColorMatrix brightnessMatrix = new ColorMatrix();
+        float brightnessF = 0.5f;
+        int brightnessI = (int) (255 * brightnessF);
+        // Brightness: C-new = C-old*(1-amount) + amount
+        float scale = 1f - brightnessF;
+        float[] mat = brightnessMatrix.getArray();
+        mat[0] = scale;
+        mat[6] = scale;
+        mat[12] = scale;
+        mat[4] = brightnessI;
+        mat[9] = brightnessI;
+        mat[14] = brightnessI;
 
-        dest.drawColor(0, PorterDuff.Mode.CLEAR);
+        ColorMatrix filterMatrix = new ColorMatrix();
+        filterMatrix.setSaturation(0);
+        filterMatrix.preConcat(brightnessMatrix);
 
-        int[] xy = new int[2];
-        Bitmap mask = src.extractAlpha(mBlurPaint, xy);
-
-        dest.drawBitmap(mask, xy[0], xy[1],
-                pressed ? mGlowColorPressedPaint : mGlowColorFocusedPaint);
-
-        mask.recycle();
-
-        dest.drawBitmap(src, 0, 0, mPaint);
-        dest.setBitmap(null);
-
-        return result;
+        mDisabledColorFilter = new ColorMatrixColorFilter(filterMatrix);
+        return mDisabledColorFilter;
     }
 }

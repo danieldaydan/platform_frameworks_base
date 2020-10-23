@@ -16,66 +16,100 @@
 
 package com.android.systemui.statusbar.phone;
 
-import android.content.Context;
+import android.content.res.Resources;
+import android.hardware.display.AmbientDisplayConfiguration;
+import android.os.PowerManager;
 import android.os.SystemProperties;
-import android.text.TextUtils;
-import android.util.Log;
+import android.os.UserHandle;
+import android.provider.Settings;
 import android.util.MathUtils;
 
 import com.android.systemui.R;
+import com.android.systemui.dagger.qualifiers.Main;
+import com.android.systemui.doze.AlwaysOnDisplayPolicy;
+import com.android.systemui.doze.DozeScreenState;
+import com.android.systemui.tuner.TunerService;
 
 import java.io.PrintWriter;
-import java.util.Arrays;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-public class DozeParameters {
-    private static final String TAG = "DozeParameters";
-    private static final boolean DEBUG = Log.isLoggable(TAG, Log.DEBUG);
+import javax.inject.Inject;
+import javax.inject.Singleton;
 
+/**
+ * Retrieve doze information
+ */
+@Singleton
+public class DozeParameters implements TunerService.Tunable,
+        com.android.systemui.plugins.statusbar.DozeParameters {
     private static final int MAX_DURATION = 60 * 1000;
+    public static final boolean FORCE_NO_BLANKING =
+            SystemProperties.getBoolean("debug.force_no_blanking", false);
+    public static final boolean FORCE_BLANKING =
+            SystemProperties.getBoolean("debug.force_blanking", false);
 
-    private final Context mContext;
+    private final AmbientDisplayConfiguration mAmbientDisplayConfiguration;
+    private final PowerManager mPowerManager;
 
-    private static PulseSchedule sPulseSchedule;
+    private final AlwaysOnDisplayPolicy mAlwaysOnPolicy;
+    private final Resources mResources;
 
-    public DozeParameters(Context context) {
-        mContext = context;
+    private boolean mDozeAlwaysOn;
+    private boolean mControlScreenOffAnimation;
+
+    @Inject
+    protected DozeParameters(
+            @Main Resources resources,
+            AmbientDisplayConfiguration ambientDisplayConfiguration,
+            AlwaysOnDisplayPolicy alwaysOnDisplayPolicy,
+            PowerManager powerManager,
+            TunerService tunerService) {
+        mResources = resources;
+        mAmbientDisplayConfiguration = ambientDisplayConfiguration;
+        mAlwaysOnPolicy = alwaysOnDisplayPolicy;
+
+        mControlScreenOffAnimation = !getDisplayNeedsBlanking();
+        mPowerManager = powerManager;
+        mPowerManager.setDozeAfterScreenOff(!mControlScreenOffAnimation);
+
+        tunerService.addTunable(
+                this,
+                Settings.Secure.DOZE_ALWAYS_ON,
+                Settings.Secure.ACCESSIBILITY_DISPLAY_INVERSION_ENABLED);
     }
 
     public void dump(PrintWriter pw) {
         pw.println("  DozeParameters:");
         pw.print("    getDisplayStateSupported(): "); pw.println(getDisplayStateSupported());
-        pw.print("    getPulseDuration(pickup=false): "); pw.println(getPulseDuration(false));
-        pw.print("    getPulseDuration(pickup=true): "); pw.println(getPulseDuration(true));
-        pw.print("    getPulseInDuration(pickup=false): "); pw.println(getPulseInDuration(false));
-        pw.print("    getPulseInDuration(pickup=true): "); pw.println(getPulseInDuration(true));
+        pw.print("    getPulseDuration(): "); pw.println(getPulseDuration());
+        pw.print("    getPulseInDuration(): "); pw.println(getPulseInDuration());
         pw.print("    getPulseInVisibleDuration(): "); pw.println(getPulseVisibleDuration());
         pw.print("    getPulseOutDuration(): "); pw.println(getPulseOutDuration());
         pw.print("    getPulseOnSigMotion(): "); pw.println(getPulseOnSigMotion());
         pw.print("    getVibrateOnSigMotion(): "); pw.println(getVibrateOnSigMotion());
-        pw.print("    getPulseOnPickup(): "); pw.println(getPulseOnPickup());
         pw.print("    getVibrateOnPickup(): "); pw.println(getVibrateOnPickup());
         pw.print("    getProxCheckBeforePulse(): "); pw.println(getProxCheckBeforePulse());
-        pw.print("    getPulseOnNotifications(): "); pw.println(getPulseOnNotifications());
-        pw.print("    getPulseSchedule(): "); pw.println(getPulseSchedule());
-        pw.print("    getPulseScheduleResets(): "); pw.println(getPulseScheduleResets());
         pw.print("    getPickupVibrationThreshold(): "); pw.println(getPickupVibrationThreshold());
-        pw.print("    getPickupPerformsProxCheck(): "); pw.println(getPickupPerformsProxCheck());
     }
 
     public boolean getDisplayStateSupported() {
         return getBoolean("doze.display.supported", R.bool.doze_display_state_supported);
     }
 
-    public int getPulseDuration(boolean pickup) {
-        return getPulseInDuration(pickup) + getPulseVisibleDuration() + getPulseOutDuration();
+    public boolean getDozeSuspendDisplayStateSupported() {
+        return mResources.getBoolean(R.bool.doze_suspend_display_state_supported);
     }
 
-    public int getPulseInDuration(boolean pickup) {
-        return pickup
-                ? getInt("doze.pulse.duration.in.pickup", R.integer.doze_pulse_duration_in_pickup)
-                : getInt("doze.pulse.duration.in", R.integer.doze_pulse_duration_in);
+    public int getPulseDuration() {
+        return getPulseInDuration() + getPulseVisibleDuration() + getPulseOutDuration();
+    }
+
+    public float getScreenBrightnessDoze() {
+        return mResources.getInteger(
+                com.android.internal.R.integer.config_screenBrightnessDoze) / 255f;
+    }
+
+    public int getPulseInDuration() {
+        return getInt("doze.pulse.duration.in", R.integer.doze_pulse_duration_in);
     }
 
     public int getPulseVisibleDuration() {
@@ -94,10 +128,6 @@ public class DozeParameters {
         return SystemProperties.getBoolean("doze.vibrate.sigmotion", false);
     }
 
-    public boolean getPulseOnPickup() {
-        return getBoolean("doze.pulse.pickup", R.bool.doze_pulse_on_pick_up);
-    }
-
     public boolean getVibrateOnPickup() {
         return SystemProperties.getBoolean("doze.vibrate.pickup", false);
     }
@@ -106,80 +136,83 @@ public class DozeParameters {
         return getBoolean("doze.pulse.proxcheck", R.bool.doze_proximity_check_before_pulse);
     }
 
-    public boolean getPickupPerformsProxCheck() {
-        return getBoolean("doze.pickup.proxcheck", R.bool.doze_pickup_performs_proximity_check);
-    }
-
-    public boolean getPulseOnNotifications() {
-        return getBoolean("doze.pulse.notifications", R.bool.doze_pulse_on_notifications);
-    }
-
-    public PulseSchedule getPulseSchedule() {
-        final String spec = getString("doze.pulse.schedule", R.string.doze_pulse_schedule);
-        if (sPulseSchedule == null || !sPulseSchedule.mSpec.equals(spec)) {
-            sPulseSchedule = PulseSchedule.parse(spec);
-        }
-        return sPulseSchedule;
-    }
-
-    public int getPulseScheduleResets() {
-        return getInt("doze.pulse.schedule.resets", R.integer.doze_pulse_schedule_resets);
-    }
-
     public int getPickupVibrationThreshold() {
         return getInt("doze.pickup.vibration.threshold", R.integer.doze_pickup_vibration_threshold);
     }
 
+    /**
+     * For how long a wallpaper can be visible in AoD before it fades aways.
+     * @return duration in millis.
+     */
+    public long getWallpaperAodDuration() {
+        if (shouldControlScreenOff()) {
+            return DozeScreenState.ENTER_DOZE_HIDE_WALLPAPER_DELAY;
+        }
+        return mAlwaysOnPolicy.wallpaperVisibilityDuration;
+    }
+
+    /**
+     * How long it takes for the wallpaper fade away (Animation duration.)
+     * @return duration in millis.
+     */
+    public long getWallpaperFadeOutDuration() {
+        return mAlwaysOnPolicy.wallpaperFadeOutDuration;
+    }
+
+    /**
+     * Checks if always on is available and enabled for the current user.
+     * @return {@code true} if enabled and available.
+     */
+    public boolean getAlwaysOn() {
+        return mDozeAlwaysOn;
+    }
+
+    /**
+     * Some screens need to be completely black before changing the display power mode,
+     * unexpected behavior might happen if this parameter isn't respected.
+     *
+     * @return {@code true} if screen needs to be completely black before a power transition.
+     */
+    public boolean getDisplayNeedsBlanking() {
+        return FORCE_BLANKING || !FORCE_NO_BLANKING && mResources.getBoolean(
+                com.android.internal.R.bool.config_displayBlanksAfterDoze);
+    }
+
+    public boolean shouldControlScreenOff() {
+        return mControlScreenOffAnimation;
+    }
+
+    public void setControlScreenOffAnimation(boolean controlScreenOffAnimation) {
+        if (mControlScreenOffAnimation == controlScreenOffAnimation) {
+            return;
+        }
+        mControlScreenOffAnimation = controlScreenOffAnimation;
+        mPowerManager.setDozeAfterScreenOff(!controlScreenOffAnimation);
+    }
+
     private boolean getBoolean(String propName, int resId) {
-        return SystemProperties.getBoolean(propName, mContext.getResources().getBoolean(resId));
+        return SystemProperties.getBoolean(propName, mResources.getBoolean(resId));
     }
 
     private int getInt(String propName, int resId) {
-        int value = SystemProperties.getInt(propName, mContext.getResources().getInteger(resId));
+        int value = SystemProperties.getInt(propName, mResources.getInteger(resId));
         return MathUtils.constrain(value, 0, MAX_DURATION);
     }
 
-    private String getString(String propName, int resId) {
-        return SystemProperties.get(propName, mContext.getString(resId));
+    public int getPulseVisibleDurationExtended() {
+        return 2 * getPulseVisibleDuration();
     }
 
-    public static class PulseSchedule {
-        private static final Pattern PATTERN = Pattern.compile("(\\d+?)s", 0);
+    public boolean doubleTapReportsTouchCoordinates() {
+        return mResources.getBoolean(R.bool.doze_double_tap_reports_touch_coordinates);
+    }
 
-        private String mSpec;
-        private int[] mSchedule;
+    @Override
+    public void onTuningChanged(String key, String newValue) {
+        mDozeAlwaysOn = mAmbientDisplayConfiguration.alwaysOnEnabled(UserHandle.USER_CURRENT);
+    }
 
-        public static PulseSchedule parse(String spec) {
-            if (TextUtils.isEmpty(spec)) return null;
-            try {
-                final PulseSchedule rt = new PulseSchedule();
-                rt.mSpec = spec;
-                final String[] tokens = spec.split(",");
-                rt.mSchedule = new int[tokens.length];
-                for (int i = 0; i < tokens.length; i++) {
-                    final Matcher m = PATTERN.matcher(tokens[i]);
-                    if (!m.matches()) throw new IllegalArgumentException("Bad token: " + tokens[i]);
-                    rt.mSchedule[i] = Integer.parseInt(m.group(1));
-                }
-                if (DEBUG) Log.d(TAG, "Parsed spec [" + spec + "] as: " + rt);
-                return rt;
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Error parsing spec: " + spec, e);
-                return null;
-            }
-        }
-
-        @Override
-        public String toString() {
-            return Arrays.toString(mSchedule);
-        }
-
-        public long getNextTime(long now, long notificationTime) {
-            for (int i = 0; i < mSchedule.length; i++) {
-                final long time = notificationTime + mSchedule[i] * 1000;
-                if (time > now) return time;
-            }
-            return 0;
-        }
+    public AlwaysOnDisplayPolicy getPolicy() {
+        return mAlwaysOnPolicy;
     }
 }

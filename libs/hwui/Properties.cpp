@@ -13,27 +13,44 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "Properties.h"
 
+#include "Properties.h"
 #include "Debug.h"
+#ifdef __ANDROID__
+#include "HWUIProperties.sysprop.h"
+#endif
+#include "SkTraceEventCommon.h"
 
 #include <algorithm>
-#include <cutils/log.h>
+#include <cstdlib>
+#include <optional>
+
+#include <android-base/properties.h>
+#include <cutils/compiler.h>
+#include <log/log.h>
 
 namespace android {
 namespace uirenderer {
 
-bool Properties::drawDeferDisabled = false;
-bool Properties::drawReorderDisabled = false;
+#ifndef __ANDROID__ // Layoutlib does not compile HWUIProperties.sysprop as it depends on cutils properties
+std::optional<bool> use_vulkan() {
+    return base::GetBoolProperty("ro.hwui.use_vulkan", false);
+}
+
+std::optional<std::int32_t> render_ahead() {
+    return base::GetIntProperty("ro.hwui.render_ahead", 0);
+}
+#endif
+
 bool Properties::debugLayersUpdates = false;
 bool Properties::debugOverdraw = false;
 bool Properties::showDirtyRegions = false;
 bool Properties::skipEmptyFrames = true;
-bool Properties::swapBuffersWithDamage = true;
+bool Properties::useBufferAge = true;
+bool Properties::enablePartialUpdates = true;
 
 DebugLevel Properties::debugLevel = kDebugDisabled;
 OverdrawColorSet Properties::overdrawColorSet = OverdrawColorSet::Default;
-StencilClipDebug Properties::debugStencilClip = StencilClipDebug::Hide;
 
 float Properties::overrideLightRadius = -1.0f;
 float Properties::overrideLightPosY = -1.0f;
@@ -44,71 +61,75 @@ int Properties::overrideSpotShadowStrength = -1;
 
 ProfileType Properties::sProfileType = ProfileType::None;
 bool Properties::sDisableProfileBars = false;
+RenderPipelineType Properties::sRenderPipelineType = RenderPipelineType::NotInitialized;
+bool Properties::enableHighContrastText = false;
+
+bool Properties::waitForGpuCompletion = false;
+bool Properties::forceDrawFrame = false;
+
+bool Properties::filterOutTestOverhead = false;
+bool Properties::disableVsync = false;
+bool Properties::skpCaptureEnabled = false;
+bool Properties::enableRTAnimations = true;
+
+bool Properties::runningInEmulator = false;
+bool Properties::debuggingEnabled = false;
+bool Properties::isolatedProcess = false;
+
+int Properties::contextPriority = 0;
+int Properties::defaultRenderAhead = -1;
 
 bool Properties::load() {
-    char property[PROPERTY_VALUE_MAX];
     bool prevDebugLayersUpdates = debugLayersUpdates;
     bool prevDebugOverdraw = debugOverdraw;
-    StencilClipDebug prevDebugStencilClip = debugStencilClip;
-
 
     debugOverdraw = false;
-    if (property_get(PROPERTY_DEBUG_OVERDRAW, property, nullptr) > 0) {
-        INIT_LOGD("  Overdraw debug enabled: %s", property);
-        if (!strcmp(property, "show")) {
+    std::string debugOverdrawProperty = base::GetProperty(PROPERTY_DEBUG_OVERDRAW, "");
+    if (debugOverdrawProperty != "") {
+        INIT_LOGD("  Overdraw debug enabled: %s", debugOverdrawProperty);
+        if (debugOverdrawProperty == "show") {
             debugOverdraw = true;
             overdrawColorSet = OverdrawColorSet::Default;
-        } else if (!strcmp(property, "show_deuteranomaly")) {
+        } else if (debugOverdrawProperty == "show_deuteranomaly") {
             debugOverdraw = true;
             overdrawColorSet = OverdrawColorSet::Deuteranomaly;
         }
     }
 
-    // See Properties.h for valid values
-    if (property_get(PROPERTY_DEBUG_STENCIL_CLIP, property, nullptr) > 0) {
-        INIT_LOGD("  Stencil clip debug enabled: %s", property);
-        if (!strcmp(property, "hide")) {
-            debugStencilClip = StencilClipDebug::Hide;
-        } else if (!strcmp(property, "highlight")) {
-            debugStencilClip = StencilClipDebug::ShowHighlight;
-        } else if (!strcmp(property, "region")) {
-            debugStencilClip = StencilClipDebug::ShowRegion;
-        }
-    } else {
-        debugStencilClip = StencilClipDebug::Hide;
-    }
-
     sProfileType = ProfileType::None;
-    if (property_get(PROPERTY_PROFILE, property, "") > 0) {
-        if (!strcmp(property, PROPERTY_PROFILE_VISUALIZE_BARS)) {
+    std::string profileProperty = base::GetProperty(PROPERTY_PROFILE, "");
+    if (profileProperty != "") {
+        if (profileProperty == PROPERTY_PROFILE_VISUALIZE_BARS) {
             sProfileType = ProfileType::Bars;
-        } else if (!strcmp(property, "true")) {
+        } else if (profileProperty == "true") {
             sProfileType = ProfileType::Console;
         }
     }
 
-    debugLayersUpdates = property_get_bool(PROPERTY_DEBUG_LAYERS_UPDATES, false);
+    debugLayersUpdates = base::GetBoolProperty(PROPERTY_DEBUG_LAYERS_UPDATES, false);
     INIT_LOGD("  Layers updates debug enabled: %d", debugLayersUpdates);
 
-    drawDeferDisabled = property_get_bool(PROPERTY_DISABLE_DRAW_DEFER, false);
-    INIT_LOGD("  Draw defer %s", drawDeferDisabled ? "disabled" : "enabled");
+    showDirtyRegions = base::GetBoolProperty(PROPERTY_DEBUG_SHOW_DIRTY_REGIONS, false);
 
-    drawReorderDisabled = property_get_bool(PROPERTY_DISABLE_DRAW_REORDER, false);
-    INIT_LOGD("  Draw reorder %s", drawReorderDisabled ? "disabled" : "enabled");
+    debugLevel = (DebugLevel)base::GetIntProperty(PROPERTY_DEBUG, (int)kDebugDisabled);
 
-    showDirtyRegions = property_get_bool(PROPERTY_DEBUG_SHOW_DIRTY_REGIONS, false);
+    skipEmptyFrames = base::GetBoolProperty(PROPERTY_SKIP_EMPTY_DAMAGE, true);
+    useBufferAge = base::GetBoolProperty(PROPERTY_USE_BUFFER_AGE, true);
+    enablePartialUpdates = base::GetBoolProperty(PROPERTY_ENABLE_PARTIAL_UPDATES, true);
 
-    debugLevel = kDebugDisabled;
-    if (property_get(PROPERTY_DEBUG, property, nullptr) > 0) {
-        debugLevel = (DebugLevel) atoi(property);
-    }
+    filterOutTestOverhead = base::GetBoolProperty(PROPERTY_FILTER_TEST_OVERHEAD, false);
 
-    skipEmptyFrames = property_get_bool(PROPERTY_SKIP_EMPTY_DAMAGE, true);
-    swapBuffersWithDamage = property_get_bool(PROPERTY_SWAP_WITH_DAMAGE, true);
+    skpCaptureEnabled = debuggingEnabled && base::GetBoolProperty(PROPERTY_CAPTURE_SKP_ENABLED, false);
 
-    return (prevDebugLayersUpdates != debugLayersUpdates)
-            || (prevDebugOverdraw != debugOverdraw)
-            || (prevDebugStencilClip != debugStencilClip);
+    SkAndroidFrameworkTraceUtil::setEnableTracing(
+            base::GetBoolProperty(PROPERTY_SKIA_ATRACE_ENABLED, false));
+
+    runningInEmulator = base::GetBoolProperty(PROPERTY_QEMU_KERNEL, false);
+
+    defaultRenderAhead = std::max(-1, std::min(2, base::GetIntProperty(PROPERTY_RENDERAHEAD,
+            render_ahead().value_or(0))));
+
+    return (prevDebugLayersUpdates != debugLayersUpdates) || (prevDebugOverdraw != debugOverdraw);
 }
 
 void Properties::overrideProperty(const char* name, const char* value) {
@@ -150,5 +171,35 @@ ProfileType Properties::getProfileType() {
     return sProfileType;
 }
 
-}; // namespace uirenderer
-}; // namespace android
+RenderPipelineType Properties::peekRenderPipelineType() {
+    // If sRenderPipelineType has been locked, just return the locked type immediately.
+    if (sRenderPipelineType != RenderPipelineType::NotInitialized) {
+        return sRenderPipelineType;
+    }
+    bool useVulkan = use_vulkan().value_or(false);
+    std::string rendererProperty = base::GetProperty(PROPERTY_RENDERER, useVulkan ? "skiavk" : "skiagl");
+    if (rendererProperty == "skiavk") {
+        return RenderPipelineType::SkiaVulkan;
+    }
+    return RenderPipelineType::SkiaGL;
+}
+
+RenderPipelineType Properties::getRenderPipelineType() {
+    sRenderPipelineType = peekRenderPipelineType();
+    return sRenderPipelineType;
+}
+
+void Properties::overrideRenderPipelineType(RenderPipelineType type) {
+    // If we're doing actual rendering then we can't change the renderer after it's been set.
+    // Unit tests can freely change this as often as it wants, though, as there's no actual
+    // GL rendering happening
+    if (sRenderPipelineType != RenderPipelineType::NotInitialized) {
+        LOG_ALWAYS_FATAL_IF(sRenderPipelineType != type,
+                "Trying to change pipeline but it's already set");
+        return;
+    }
+    sRenderPipelineType = type;
+}
+
+}  // namespace uirenderer
+}  // namespace android

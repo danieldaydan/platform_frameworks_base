@@ -27,8 +27,9 @@ import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.TextView;
 
-import com.google.android.collect.Lists;
 import com.android.frameworks.coretests.R;
+
+import com.google.android.collect.Lists;
 
 import java.util.List;
 
@@ -54,7 +55,7 @@ public class ListWithFooterViewAndNewLabels extends ListActivity {
         setListAdapter(mMyAdapter);
 
         // not in list
-        Button topButton = (Button) findViewById(R.id.button);
+        Button topButton = findViewById(R.id.button);
         topButton.setText("click to add new item");
         topButton.setOnClickListener(new View.OnClickListener() {
 

@@ -17,12 +17,18 @@
 
 package com.android.internal.app;
 
+import com.android.internal.view.menu.MenuBuilder;
+import com.android.internal.view.menu.MenuPresenter;
+import com.android.internal.widget.DecorToolbar;
+import com.android.internal.widget.ToolbarWidgetWrapper;
+
 import android.annotation.Nullable;
 import android.app.ActionBar;
 import android.content.Context;
 import android.content.res.Configuration;
 import android.graphics.drawable.Drawable;
 import android.view.ActionMode;
+import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.Menu;
@@ -32,10 +38,6 @@ import android.view.Window;
 import android.view.WindowCallbackWrapper;
 import android.widget.SpinnerAdapter;
 import android.widget.Toolbar;
-import com.android.internal.view.menu.MenuBuilder;
-import com.android.internal.view.menu.MenuPresenter;
-import com.android.internal.widget.DecorToolbar;
-import com.android.internal.widget.ToolbarWidgetWrapper;
 
 import java.util.ArrayList;
 
@@ -417,6 +419,11 @@ public class ToolbarActionBar extends ActionBar {
     }
 
     @Override
+    public boolean closeOptionsMenu() {
+        return mDecorToolbar.hideOverflowMenu();
+    }
+
+    @Override
     public boolean invalidateOptionsMenu() {
         mDecorToolbar.getViewGroup().removeCallbacks(mMenuInvalidator);
         mDecorToolbar.getViewGroup().postOnAnimation(mMenuInvalidator);
@@ -467,12 +474,18 @@ public class ToolbarActionBar extends ActionBar {
     public boolean onKeyShortcut(int keyCode, KeyEvent event) {
         Menu menu = mDecorToolbar.getMenu();
         if (menu != null) {
-            menu.performShortcut(keyCode, event, 0);
+            final KeyCharacterMap kmap = KeyCharacterMap.load(
+                    event != null ? event.getDeviceId() : KeyCharacterMap.VIRTUAL_KEYBOARD);
+            menu.setQwertyMode(kmap.getKeyboardType() != KeyCharacterMap.NUMERIC);
+            return menu.performShortcut(keyCode, event, 0);
         }
-        // This action bar always returns true for handling keyboard shortcuts.
-        // This will block the window from preparing a temporary panel to handle
-        // keyboard shortcuts.
-        return true;
+        return false;
+    }
+
+    @Override
+    public void onDestroy() {
+        // Remove any invalidation callbacks
+        mDecorToolbar.getViewGroup().removeCallbacks(mMenuInvalidator);
     }
 
     public void addOnMenuVisibilityListener(OnMenuVisibilityListener listener) {
@@ -508,6 +521,17 @@ public class ToolbarActionBar extends ActionBar {
                 mToolbarMenuPrepared = true;
             }
             return result;
+        }
+
+        @Override
+        public View onCreatePanelView(int featureId) {
+            if (featureId == Window.FEATURE_OPTIONS_PANEL) {
+                // This gets called by PhoneWindow.preparePanel. Since this already manages
+                // its own panel, we return a placeholder view here to prevent PhoneWindow from
+                // preparing a default one.
+                return new View(mDecorToolbar.getContext());
+            }
+            return super.onCreatePanelView(featureId);
         }
     }
 

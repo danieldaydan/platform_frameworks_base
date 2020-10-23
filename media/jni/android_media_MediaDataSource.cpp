@@ -23,7 +23,7 @@
 #include "android_runtime/AndroidRuntime.h"
 #include "android_runtime/Log.h"
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 
 #include <binder/MemoryDealer.h>
 #include <media/stagefright/foundation/ADebug.h>
@@ -105,7 +105,8 @@ ssize_t JMediaDataSource::readAt(off64_t offset, size_t size) {
     }
 
     ALOGV("readAt %lld / %zu => %d.", (long long)offset, size, numread);
-    env->GetByteArrayRegion(mByteArrayObj, 0, numread, (jbyte*)mMemory->pointer());
+    env->GetByteArrayRegion(mByteArrayObj, 0, numread,
+        (jbyte*)mMemory->unsecurePointer());
     return numread;
 }
 
@@ -149,6 +150,14 @@ void JMediaDataSource::close() {
     env->CallVoidMethod(mMediaDataSourceObj, mCloseMethod);
     // The closed state is effectively the same as an error state.
     mJavaObjStatus = UNKNOWN_ERROR;
+}
+
+uint32_t JMediaDataSource::getFlags() {
+    return 0;
+}
+
+String8 JMediaDataSource::toString() {
+    return String8::format("JMediaDataSource(pid %d, uid %d)", getpid(), getuid());
 }
 
 }  // namespace android

@@ -17,6 +17,8 @@
 package android.content;
 
 import android.accounts.Account;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Parcel;
 import android.os.Parcelable;
@@ -29,10 +31,13 @@ import android.os.Parcelable;
 public class SyncRequest implements Parcelable {
     private static final String TAG = "SyncRequest";
     /** Account to pass to the sync adapter. Can be null. */
+    @UnsupportedAppUsage
     private final Account mAccountToSync;
     /** Authority string that corresponds to a ContentProvider. */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private final String mAuthority;
     /** Bundle containing user info as well as sync settings. */
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private final Bundle mExtras;
     /** Don't allow this sync request on metered networks. */
     private final boolean mDisallowMetered;
@@ -44,8 +49,10 @@ public class SyncRequest implements Parcelable {
     /**
      * Specifies a point in the future at which the sync must have been scheduled to run.
      */
+    @UnsupportedAppUsage
     private final long mSyncRunTimeSecs;
     /** Periodic versus one-off. */
+    @UnsupportedAppUsage
     private final boolean mIsPeriodic;
     /** Service versus provider. */
     private final boolean mIsAuthority;
@@ -115,7 +122,7 @@ public class SyncRequest implements Parcelable {
         return mSyncRunTimeSecs;
     }
 
-    public static final Creator<SyncRequest> CREATOR = new Creator<SyncRequest>() {
+    public static final @android.annotation.NonNull Creator<SyncRequest> CREATOR = new Creator<SyncRequest>() {
 
         @Override
         public SyncRequest createFromParcel(Parcel in) {
@@ -147,7 +154,7 @@ public class SyncRequest implements Parcelable {
     }
 
     private SyncRequest(Parcel in) {
-        mExtras = in.readBundle();
+        mExtras = Bundle.setDefusable(in.readBundle(), true);
         mSyncFlexTimeSecs = in.readLong();
         mSyncRunTimeSecs = in.readLong();
         mIsPeriodic = (in.readInt() != 0);
@@ -175,7 +182,7 @@ public class SyncRequest implements Parcelable {
     }
 
     /**
-     * Builder class for a @link SyncRequest. As you build your SyncRequest this class will also
+     * Builder class for a {@link SyncRequest}. As you build your SyncRequest this class will also
      * perform validation.
      */
     public static class Builder {
@@ -246,6 +253,10 @@ public class SyncRequest implements Parcelable {
          * this sync is bound to a provider), otherwise null.
          */
         private String mAuthority;
+        /**
+         * Whether the sync requires the phone to be plugged in.
+         */
+        private boolean mRequiresCharging;
 
         public Builder() {
         }
@@ -303,10 +314,11 @@ public class SyncRequest implements Parcelable {
          * be thrown.
          *
          * @param pollFrequency the amount of time in seconds that you wish
-         *            to elapse between periodic syncs.
+         *            to elapse between periodic syncs. A minimum period of 1 hour is enforced.
          * @param beforeSeconds the amount of flex time in seconds before
          *            {@code pollFrequency} that you permit for the sync to take
-         *            place. Must be less than {@code pollFrequency}.
+         *            place. Must be less than {@code pollFrequency} and greater than
+         *            MAX(5% of {@code pollFrequency}, 5 minutes)
          */
         public Builder syncPeriodic(long pollFrequency, long beforeSeconds) {
             if (mSyncType != SYNC_TYPE_UNKNOWN) {
@@ -335,9 +347,18 @@ public class SyncRequest implements Parcelable {
         public Builder setDisallowMetered(boolean disallow) {
             if (mIgnoreSettings && disallow) {
                 throw new IllegalArgumentException("setDisallowMetered(true) after having"
-                        + "specified that settings are ignored.");
+                        + " specified that settings are ignored.");
             }
             mDisallowMetered = disallow;
+            return this;
+        }
+
+        /**
+         * Specify whether the sync requires the phone to be plugged in.
+         * @param requiresCharging true if sync requires the phone to be plugged in. Default false.
+         */
+        public Builder setRequiresCharging(boolean requiresCharging) {
+            mRequiresCharging = requiresCharging;
             return this;
         }
 
@@ -498,6 +519,9 @@ public class SyncRequest implements Parcelable {
             }
             if (mDisallowMetered) {
                 mSyncConfigExtras.putBoolean(ContentResolver.SYNC_EXTRAS_DISALLOW_METERED, true);
+            }
+            if (mRequiresCharging) {
+                mSyncConfigExtras.putBoolean(ContentResolver.SYNC_EXTRAS_REQUIRE_CHARGING, true);
             }
             if (mIgnoreSettings) {
                 mSyncConfigExtras.putBoolean(ContentResolver.SYNC_EXTRAS_IGNORE_SETTINGS, true);

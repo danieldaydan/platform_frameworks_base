@@ -16,113 +16,102 @@
 
 package com.android.systemui.statusbar.policy;
 
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.os.BatteryManager;
-import android.os.PowerManager;
-import android.util.Log;
+import android.annotation.Nullable;
+
+import com.android.systemui.DemoMode;
+import com.android.systemui.Dumpable;
+import com.android.systemui.statusbar.policy.BatteryController.BatteryStateChangeCallback;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
-import java.util.ArrayList;
 
-public class BatteryController extends BroadcastReceiver {
-    private static final String TAG = "BatteryController";
-    private static final boolean DEBUG = Log.isLoggable(TAG, Log.DEBUG);
+public interface BatteryController extends DemoMode, Dumpable,
+        CallbackController<BatteryStateChangeCallback> {
+    /**
+     * Prints the current state of the {@link BatteryController} to the given {@link PrintWriter}.
+     */
+    void dump(FileDescriptor fd, PrintWriter pw, String[] args);
 
-    private final ArrayList<BatteryStateChangeCallback> mChangeCallbacks = new ArrayList<>();
-    private final PowerManager mPowerManager;
+    /**
+     * Sets if the current device is in power save mode.
+     */
+    void setPowerSaveMode(boolean powerSave);
 
-    private int mLevel;
-    private boolean mPluggedIn;
-    private boolean mCharging;
-    private boolean mCharged;
-    private boolean mPowerSave;
+    /**
+     * Returns {@code true} if the device is currently plugged in.
+     */
+    boolean isPluggedIn();
 
-    public BatteryController(Context context) {
-        mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+    /**
+     * Returns {@code true} if the device is currently in power save mode.
+     */
+    boolean isPowerSave();
 
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(Intent.ACTION_BATTERY_CHANGED);
-        filter.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
-        filter.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGING);
-        context.registerReceiver(this, filter);
+    /**
+     * Returns {@code true} if AOD was disabled by power saving policies.
+     */
+    boolean isAodPowerSave();
 
-        updatePowerSave();
-    }
+    /**
+     * Initializes the class.
+     */
+    default void init() { }
 
-    public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
-        pw.println("BatteryController state:");
-        pw.print("  mLevel="); pw.println(mLevel);
-        pw.print("  mPluggedIn="); pw.println(mPluggedIn);
-        pw.print("  mCharging="); pw.println(mCharging);
-        pw.print("  mCharged="); pw.println(mCharged);
-        pw.print("  mPowerSave="); pw.println(mPowerSave);
-    }
+    /**
+     * Returns {@code true} if the device is currently in wireless charging mode.
+     */
+    default boolean isWirelessCharging() { return false; }
 
-    public void addStateChangedCallback(BatteryStateChangeCallback cb) {
-        mChangeCallbacks.add(cb);
-        cb.onBatteryLevelChanged(mLevel, mPluggedIn, mCharging);
-    }
+    /**
+     * Returns {@code true} if reverse is supported.
+     */
+    default boolean isReverseSupported() { return false; }
 
-    public void removeStateChangedCallback(BatteryStateChangeCallback cb) {
-        mChangeCallbacks.remove(cb);
-    }
+    /**
+     * Returns {@code true} if reverse is on.
+     */
+    default boolean isReverseOn() { return false; }
 
-    public void onReceive(Context context, Intent intent) {
-        final String action = intent.getAction();
-        if (action.equals(Intent.ACTION_BATTERY_CHANGED)) {
-            mLevel = (int)(100f
-                    * intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 0)
-                    / intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100));
-            mPluggedIn = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+    /**
+     * Set reverse state.
+     * @param isReverse true if turn on reverse, false otherwise
+     */
+    default void setReverseState(boolean isReverse) {}
 
-            final int status = intent.getIntExtra(BatteryManager.EXTRA_STATUS,
-                    BatteryManager.BATTERY_STATUS_UNKNOWN);
-            mCharged = status == BatteryManager.BATTERY_STATUS_FULL;
-            mCharging = mCharged || status == BatteryManager.BATTERY_STATUS_CHARGING;
+    /**
+     * A listener that will be notified whenever a change in battery level or power save mode has
+     * occurred.
+     */
+    interface BatteryStateChangeCallback {
 
-            fireBatteryLevelChanged();
-        } else if (action.equals(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)) {
-            updatePowerSave();
-        } else if (action.equals(PowerManager.ACTION_POWER_SAVE_MODE_CHANGING)) {
-            setPowerSave(intent.getBooleanExtra(PowerManager.EXTRA_POWER_SAVE_MODE, false));
+        default void onBatteryLevelChanged(int level, boolean pluggedIn, boolean charging) {
+        }
+
+        default void onPowerSaveChanged(boolean isPowerSave) {
+        }
+
+        default void onReverseChanged(boolean isReverse, int level, String name) {
         }
     }
 
-    public boolean isPowerSave() {
-        return mPowerSave;
-    }
+    /**
+     * If available, get the estimated battery time remaining as a string.
+     *
+     * @param completion A lambda that will be called with the result of fetching the estimate. The
+     * first time this method is called may need to be dispatched to a background thread. The
+     * completion is called on the main thread
+     */
+    default void getEstimatedTimeRemainingString(EstimateFetchCompletion completion) {}
 
-    private void updatePowerSave() {
-        setPowerSave(mPowerManager.isPowerSaveMode());
-    }
+    /**
+     * Callback called when the estimated time remaining text is fetched.
+     */
+    public interface EstimateFetchCompletion {
 
-    private void setPowerSave(boolean powerSave) {
-        if (powerSave == mPowerSave) return;
-        mPowerSave = powerSave;
-        if (DEBUG) Log.d(TAG, "Power save is " + (mPowerSave ? "on" : "off"));
-        firePowerSaveChanged();
-    }
-
-    private void fireBatteryLevelChanged() {
-        final int N = mChangeCallbacks.size();
-        for (int i = 0; i < N; i++) {
-            mChangeCallbacks.get(i).onBatteryLevelChanged(mLevel, mPluggedIn, mCharging);
-        }
-    }
-
-    private void firePowerSaveChanged() {
-        final int N = mChangeCallbacks.size();
-        for (int i = 0; i < N; i++) {
-            mChangeCallbacks.get(i).onPowerSaveChanged();
-        }
-    }
-
-    public interface BatteryStateChangeCallback {
-        void onBatteryLevelChanged(int level, boolean pluggedIn, boolean charging);
-        void onPowerSaveChanged();
+        /**
+         * The callback
+         * @param estimate the estimate
+         */
+        void onBatteryRemainingEstimateRetrieved(@Nullable String estimate);
     }
 }

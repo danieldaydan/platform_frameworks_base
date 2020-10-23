@@ -16,29 +16,32 @@
 
 package android.app.admin;
 
-import org.xmlpull.v1.XmlPullParser;
-import org.xmlpull.v1.XmlPullParserException;
-import org.xmlpull.v1.XmlSerializer;
-
+import android.annotation.NonNull;
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
-import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
+import android.content.res.Resources.NotFoundException;
 import android.content.res.TypedArray;
 import android.content.res.XmlResourceParser;
-import android.content.res.Resources.NotFoundException;
 import android.graphics.drawable.Drawable;
+import android.os.Build;
 import android.os.Parcel;
 import android.os.Parcelable;
+import android.os.PersistableBundle;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.util.Printer;
 import android.util.SparseArray;
 import android.util.Xml;
+
+import org.xmlpull.v1.XmlPullParser;
+import org.xmlpull.v1.XmlPullParserException;
+import org.xmlpull.v1.XmlSerializer;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -50,6 +53,14 @@ import java.util.HashMap;
  */
 public final class DeviceAdminInfo implements Parcelable {
     static final String TAG = "DeviceAdminInfo";
+
+    /**
+     * A type of policy that this device admin can use: profile owner on an organization-owned
+     * device.
+     *
+     * @hide
+     */
+    public static final int USES_POLICY_ORGANIZATION_OWNED_PROFILE_OWNER = -3;
 
     /**
      * A type of policy that this device admin can use: device owner meta-policy
@@ -72,8 +83,10 @@ public final class DeviceAdminInfo implements Parcelable {
      * that the user can select, via {@link DevicePolicyManager#setPasswordQuality}
      * and {@link DevicePolicyManager#setPasswordMinimumLength}.
      *
-     * <p>To control this policy, the device admin must have a "limit-password"
-     * tag in the "uses-policies" section of its meta-data.
+     * <p>To control this policy, the device admin must be a device owner or profile owner,
+     * and must have a "limit-password" tag in the "uses-policies" section of its meta-data.
+     * If used by a device owner, the policy only affects the primary user and its profiles,
+     * but not any secondary users on the device.
      */
     public static final int USES_POLICY_LIMIT_PASSWORD = 0;
 
@@ -133,8 +146,10 @@ public final class DeviceAdminInfo implements Parcelable {
      * A type of policy that this device admin can use: force the user to
      * change their password after an administrator-defined time limit.
      *
-     * <p>To control this policy, the device admin must have an "expire-password"
-     * tag in the "uses-policies" section of its meta-data.
+     * <p>To control this policy, the device admin must be a device owner or profile owner,
+     * and must have an "expire-password" tag in the "uses-policies" section of its meta-data.
+     * If used by a device owner, the policy only affects the primary user and its profiles,
+     * but not any secondary users on the device.
      */
     public static final int USES_POLICY_EXPIRE_PASSWORD = 6;
 
@@ -149,22 +164,26 @@ public final class DeviceAdminInfo implements Parcelable {
     /**
      * A type of policy that this device admin can use: disables use of all device cameras.
      *
-     * <p>To control this policy, the device admin must have a "disable-camera"
-     * tag in the "uses-policies" section of its meta-data.
+     * <p>To control this policy, the device admin must be a device owner or profile owner,
+     * and must have a "disable-camera" tag in the "uses-policies" section of its meta-data.
+     * If used by a device owner, the policy affects all users on the device.
      */
     public static final int USES_POLICY_DISABLE_CAMERA = 8;
 
     /**
      * A type of policy that this device admin can use: disables use of keyguard features.
      *
-     * <p>To control this policy, the device admin must have a "disable-keyguard-features"
-     * tag in the "uses-policies" section of its meta-data.
+     * <p>To control this policy, the device admin must be a device owner or profile owner,
+     * and must have a "disable-keyguard-features" tag in the "uses-policies" section of its
+     * meta-data.  If used by a device owner, the policy only affects the primary user and
+     * its profiles, but not any secondary users on the device.
      */
     public static final int USES_POLICY_DISABLE_KEYGUARD_FEATURES = 9;
 
     /** @hide */
     public static class PolicyInfo {
         public final int ident;
+        @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
         public final String tag;
         public final int label;
         public final int description;
@@ -239,7 +258,7 @@ public final class DeviceAdminInfo implements Parcelable {
     /**
      * The BroadcastReceiver that implements this device admin component.
      */
-    final ResolveInfo mReceiver;
+    final ActivityInfo mActivityInfo;
 
     /**
      * Whether this should be visible to the user.
@@ -252,28 +271,47 @@ public final class DeviceAdminInfo implements Parcelable {
     int mUsesPolicies;
 
     /**
+     * Whether this administrator can be a target in an ownership transfer.
+     *
+     * @see DevicePolicyManager#transferOwnership(ComponentName, ComponentName, PersistableBundle)
+     */
+    boolean mSupportsTransferOwnership;
+
+    /**
      * Constructor.
      *
      * @param context The Context in which we are parsing the device admin.
-     * @param receiver The ResolveInfo returned from the package manager about
+     * @param resolveInfo The ResolveInfo returned from the package manager about
      * this device admin's component.
      */
-    public DeviceAdminInfo(Context context, ResolveInfo receiver)
+    public DeviceAdminInfo(Context context, ResolveInfo resolveInfo)
             throws XmlPullParserException, IOException {
-        mReceiver = receiver;
-        ActivityInfo ai = receiver.activityInfo;
+        this(context, resolveInfo.activityInfo);
+    }
+    /**
+     * Constructor.
+     *
+     * @param context The Context in which we are parsing the device admin.
+     * @param activityInfo The ActivityInfo returned from the package manager about
+     * this device admin's component.
+     *
+     * @hide
+     */
+    public DeviceAdminInfo(Context context, ActivityInfo activityInfo)
+            throws XmlPullParserException, IOException {
+        mActivityInfo = activityInfo;
 
         PackageManager pm = context.getPackageManager();
 
         XmlResourceParser parser = null;
         try {
-            parser = ai.loadXmlMetaData(pm, DeviceAdminReceiver.DEVICE_ADMIN_META_DATA);
+            parser = mActivityInfo.loadXmlMetaData(pm, DeviceAdminReceiver.DEVICE_ADMIN_META_DATA);
             if (parser == null) {
                 throw new XmlPullParserException("No "
                         + DeviceAdminReceiver.DEVICE_ADMIN_META_DATA + " meta-data");
             }
 
-            Resources res = pm.getResourcesForApplication(ai.applicationInfo);
+            Resources res = pm.getResourcesForApplication(mActivityInfo.applicationInfo);
 
             AttributeSet attrs = Xml.asAttributeSet(parser);
 
@@ -319,26 +357,33 @@ public final class DeviceAdminInfo implements Parcelable {
                                     + getComponent() + ": " + policyName);
                         }
                     }
+                } else if (tagName.equals("support-transfer-ownership")) {
+                    if (parser.next() != XmlPullParser.END_TAG) {
+                        throw new XmlPullParserException(
+                                "support-transfer-ownership tag must be empty.");
+                    }
+                    mSupportsTransferOwnership = true;
                 }
             }
         } catch (NameNotFoundException e) {
             throw new XmlPullParserException(
-                    "Unable to create context for: " + ai.packageName);
+                    "Unable to create context for: " + mActivityInfo.packageName);
         } finally {
             if (parser != null) parser.close();
         }
     }
 
     DeviceAdminInfo(Parcel source) {
-        mReceiver = ResolveInfo.CREATOR.createFromParcel(source);
+        mActivityInfo = ActivityInfo.CREATOR.createFromParcel(source);
         mUsesPolicies = source.readInt();
+        mSupportsTransferOwnership = source.readBoolean();
     }
 
     /**
      * Return the .apk package that implements this device admin.
      */
     public String getPackageName() {
-        return mReceiver.activityInfo.packageName;
+        return mActivityInfo.packageName;
     }
 
     /**
@@ -346,7 +391,7 @@ public final class DeviceAdminInfo implements Parcelable {
      * this device admin.
      */
     public String getReceiverName() {
-        return mReceiver.activityInfo.name;
+        return mActivityInfo.name;
     }
 
     /**
@@ -354,15 +399,16 @@ public final class DeviceAdminInfo implements Parcelable {
      * device admin.  Do not modify the returned object.
      */
     public ActivityInfo getActivityInfo() {
-        return mReceiver.activityInfo;
+        return mActivityInfo;
     }
 
     /**
      * Return the component of the receiver that implements this device admin.
      */
+    @NonNull
     public ComponentName getComponent() {
-        return new ComponentName(mReceiver.activityInfo.packageName,
-                mReceiver.activityInfo.name);
+        return new ComponentName(mActivityInfo.packageName,
+                mActivityInfo.name);
     }
 
     /**
@@ -372,7 +418,7 @@ public final class DeviceAdminInfo implements Parcelable {
      * resources.
      */
     public CharSequence loadLabel(PackageManager pm) {
-        return mReceiver.loadLabel(pm);
+        return mActivityInfo.loadLabel(pm);
     }
 
     /**
@@ -382,15 +428,9 @@ public final class DeviceAdminInfo implements Parcelable {
      * resources.
      */
     public CharSequence loadDescription(PackageManager pm) throws NotFoundException {
-        if (mReceiver.activityInfo.descriptionRes != 0) {
-            String packageName = mReceiver.resolvePackageName;
-            ApplicationInfo applicationInfo = null;
-            if (packageName == null) {
-                packageName = mReceiver.activityInfo.packageName;
-                applicationInfo = mReceiver.activityInfo.applicationInfo;
-            }
-            return pm.getText(packageName,
-                    mReceiver.activityInfo.descriptionRes, applicationInfo);
+        if (mActivityInfo.descriptionRes != 0) {
+            return pm.getText(mActivityInfo.packageName,
+                    mActivityInfo.descriptionRes, mActivityInfo.applicationInfo);
         }
         throw new NotFoundException();
     }
@@ -402,7 +442,7 @@ public final class DeviceAdminInfo implements Parcelable {
      * resources.
      */
     public Drawable loadIcon(PackageManager pm) {
-        return mReceiver.loadIcon(pm);
+        return mActivityInfo.loadIcon(pm);
     }
 
     /**
@@ -435,7 +475,15 @@ public final class DeviceAdminInfo implements Parcelable {
         return sRevKnownPolicies.get(policyIdent).tag;
     }
 
+    /**
+     * Return true if this administrator can be a target in an ownership transfer.
+     */
+    public boolean supportsTransferOwnership() {
+        return mSupportsTransferOwnership;
+    }
+
     /** @hide */
+    @UnsupportedAppUsage
     public ArrayList<PolicyInfo> getUsedPolicies() {
         ArrayList<PolicyInfo> res = new ArrayList<PolicyInfo>();
         for (int i=0; i<sPoliciesDisplayOrder.size(); i++) {
@@ -462,12 +510,12 @@ public final class DeviceAdminInfo implements Parcelable {
 
     public void dump(Printer pw, String prefix) {
         pw.println(prefix + "Receiver:");
-        mReceiver.dump(pw, prefix + "  ");
+        mActivityInfo.dump(pw, prefix + "  ");
     }
 
     @Override
     public String toString() {
-        return "DeviceAdminInfo{" + mReceiver.activityInfo.name + "}";
+        return "DeviceAdminInfo{" + mActivityInfo.name + "}";
     }
 
     /**
@@ -477,14 +525,15 @@ public final class DeviceAdminInfo implements Parcelable {
      * @param flags The flags used for parceling.
      */
     public void writeToParcel(Parcel dest, int flags) {
-        mReceiver.writeToParcel(dest, flags);
+        mActivityInfo.writeToParcel(dest, flags);
         dest.writeInt(mUsesPolicies);
+        dest.writeBoolean(mSupportsTransferOwnership);
     }
 
     /**
      * Used to make this class parcelable.
      */
-    public static final Parcelable.Creator<DeviceAdminInfo> CREATOR =
+    public static final @android.annotation.NonNull Parcelable.Creator<DeviceAdminInfo> CREATOR =
             new Parcelable.Creator<DeviceAdminInfo>() {
         public DeviceAdminInfo createFromParcel(Parcel source) {
             return new DeviceAdminInfo(source);

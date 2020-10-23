@@ -16,6 +16,7 @@
 
 package android.hardware.camera2.legacy;
 
+import android.hardware.ICameraService;
 import android.hardware.Camera;
 import android.hardware.Camera.CameraInfo;
 import android.hardware.camera2.CameraAccessException;
@@ -23,12 +24,13 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.ICameraDeviceCallbacks;
 import android.hardware.camera2.ICameraDeviceUser;
-import android.hardware.camera2.utils.LongParcelable;
+import android.hardware.camera2.ICameraOfflineSession;
 import android.hardware.camera2.impl.CameraMetadataNative;
 import android.hardware.camera2.impl.CaptureResultExtras;
+import android.hardware.camera2.impl.PhysicalCaptureResultInfo;
 import android.hardware.camera2.params.OutputConfiguration;
-import android.hardware.camera2.utils.CameraBinderDecorator;
-import android.hardware.camera2.utils.CameraRuntimeException;
+import android.hardware.camera2.params.SessionConfiguration;
+import android.hardware.camera2.utils.SubmitInfo;
 import android.os.ConditionVariable;
 import android.os.IBinder;
 import android.os.Looper;
@@ -36,7 +38,9 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
 import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.util.Log;
+import android.util.Size;
 import android.util.SparseArray;
 import android.view.Surface;
 
@@ -93,7 +97,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
 
     private static int translateErrorsFromCamera1(int errorCode) {
         if (errorCode == -EACCES) {
-            return CameraBinderDecorator.PERMISSION_DENIED;
+            return ICameraService.ERROR_PERMISSION_DENIED;
         }
 
         return errorCode;
@@ -126,7 +130,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
         public CameraLooper(int cameraId) {
             mCameraId = cameraId;
 
-            mThread = new Thread(this);
+            mThread = new Thread(this, "LegacyCameraLooper");
             mThread.start();
         }
 
@@ -173,7 +177,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
          *
          * @return int error code
          *
-         * @throws CameraRuntimeException if the camera open times out with ({@code CAMERA_ERROR})
+         * @throws ServiceSpecificException if the camera open times out with ({@code CAMERA_ERROR})
          */
         public int waitForOpen(int timeoutMs) {
             // Block until the camera is open asynchronously
@@ -186,7 +190,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
                     Log.e(TAG, "connectBinderShim - Failed to release camera after timeout ", e);
                 }
 
-                throw new CameraRuntimeException(CameraAccessException.CAMERA_ERROR);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION);
             }
 
             return mInitErrors;
@@ -205,6 +209,8 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
         private static final int CAPTURE_STARTED = 2;
         private static final int RESULT_RECEIVED = 3;
         private static final int PREPARED = 4;
+        private static final int REPEATING_REQUEST_ERROR = 5;
+        private static final int REQUEST_QUEUE_EMPTY = 6;
 
         private final HandlerThread mHandlerThread;
         private Handler mHandler;
@@ -247,7 +253,8 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
 
         @Override
         public void onResultReceived(final CameraMetadataNative result,
-                final CaptureResultExtras resultExtras) {
+                final CaptureResultExtras resultExtras,
+                PhysicalCaptureResultInfo physicalResults[]) {
             Object[] resultArray = new Object[] { result, resultExtras };
             Message msg = getHandler().obtainMessage(RESULT_RECEIVED,
                     /*obj*/ resultArray);
@@ -258,6 +265,21 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
         public void onPrepared(int streamId) {
             Message msg = getHandler().obtainMessage(PREPARED,
                     /*arg1*/ streamId, /*arg2*/ 0);
+            getHandler().sendMessage(msg);
+        }
+
+        @Override
+        public void onRepeatingRequestError(long lastFrameNumber, int repeatingRequestId) {
+            Object[] objArray = new Object[] { lastFrameNumber, repeatingRequestId };
+            Message msg = getHandler().obtainMessage(REPEATING_REQUEST_ERROR,
+                    /*obj*/ objArray);
+            getHandler().sendMessage(msg);
+        }
+
+        @Override
+        public void onRequestQueueEmpty() {
+            Message msg = getHandler().obtainMessage(REQUEST_QUEUE_EMPTY,
+                    /* arg1 */ 0, /* arg2 */ 0);
             getHandler().sendMessage(msg);
         }
 
@@ -303,12 +325,24 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
                             Object[] resultArray = (Object[]) msg.obj;
                             CameraMetadataNative result = (CameraMetadataNative) resultArray[0];
                             CaptureResultExtras resultExtras = (CaptureResultExtras) resultArray[1];
-                            mCallbacks.onResultReceived(result, resultExtras);
+                            mCallbacks.onResultReceived(result, resultExtras,
+                                    new PhysicalCaptureResultInfo[0]);
                             break;
                         }
                         case PREPARED: {
                             int streamId = msg.arg1;
                             mCallbacks.onPrepared(streamId);
+                            break;
+                        }
+                        case REPEATING_REQUEST_ERROR: {
+                            Object[] objArray = (Object[]) msg.obj;
+                            long lastFrameNumber = (Long) objArray[0];
+                            int repeatingRequestId = (Integer) objArray[1];
+                            mCallbacks.onRepeatingRequestError(lastFrameNumber, repeatingRequestId);
+                            break;
+                        }
+                        case REQUEST_QUEUE_EMPTY: {
+                            mCallbacks.onRequestQueueEmpty();
                             break;
                         }
                         default:
@@ -324,7 +358,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
     }
 
     public static CameraDeviceUserShim connectBinderShim(ICameraDeviceCallbacks callbacks,
-                                                         int cameraId) {
+                                                         int cameraId, Size displaySize) {
         if (DEBUG) {
             Log.d(TAG, "Opening shim Camera device");
         }
@@ -344,7 +378,7 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
         Camera legacyCamera = init.getCamera();
 
         // Check errors old HAL initialization
-        CameraBinderDecorator.throwOnError(initErrors);
+        LegacyExceptionUtils.throwOnServiceError(initErrors);
 
         // Disable shutter sounds (this will work unconditionally) for api2 clients
         legacyCamera.disableShutterSound();
@@ -356,12 +390,13 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
         try {
             legacyParameters = legacyCamera.getParameters();
         } catch (RuntimeException e) {
-            throw new CameraRuntimeException(CameraAccessException.CAMERA_ERROR,
-                    "Unable to get initial parameters", e);
+            throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION,
+                    "Unable to get initial parameters: " + e.getMessage());
         }
 
         CameraCharacteristics characteristics =
-                LegacyMetadataMapper.createCharacteristics(legacyParameters, info);
+                LegacyMetadataMapper.createCharacteristics(legacyParameters, info, cameraId,
+                        displaySize);
         LegacyCameraDevice device = new LegacyCameraDevice(
                 cameraId, legacyCamera, characteristics, threadCallbacks);
         return new CameraDeviceUserShim(cameraId, device, characteristics, init, threadCallbacks);
@@ -386,137 +421,190 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
     }
 
     @Override
-    public int submitRequest(CaptureRequest request, boolean streaming,
-                             /*out*/LongParcelable lastFrameNumber) {
+    public SubmitInfo submitRequest(CaptureRequest request, boolean streaming) {
         if (DEBUG) {
             Log.d(TAG, "submitRequest called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot submit request, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot submit request, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot submit request, configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot submit request, configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
         }
-        return mLegacyDevice.submitRequest(request, streaming, lastFrameNumber);
+        return mLegacyDevice.submitRequest(request, streaming);
     }
 
     @Override
-    public int submitRequestList(List<CaptureRequest> request, boolean streaming,
-                                 /*out*/LongParcelable lastFrameNumber) {
+    public SubmitInfo submitRequestList(CaptureRequest[] request, boolean streaming) {
         if (DEBUG) {
             Log.d(TAG, "submitRequestList called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot submit request list, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot submit request list, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot submit request, configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot submit request, configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
         }
-        return mLegacyDevice.submitRequestList(request, streaming, lastFrameNumber);
+        return mLegacyDevice.submitRequestList(request, streaming);
     }
 
     @Override
-    public int cancelRequest(int requestId, /*out*/LongParcelable lastFrameNumber) {
+    public long cancelRequest(int requestId) {
         if (DEBUG) {
             Log.d(TAG, "cancelRequest called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot cancel request, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot cancel request, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot cancel request, configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot cancel request, configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
         }
-        long lastFrame = mLegacyDevice.cancelRequest(requestId);
-        lastFrameNumber.setNumber(lastFrame);
-        return CameraBinderDecorator.NO_ERROR;
+        return mLegacyDevice.cancelRequest(requestId);
     }
 
     @Override
-    public int beginConfigure() {
+    public boolean isSessionConfigurationSupported(SessionConfiguration sessionConfig) {
+        if (sessionConfig.getSessionType() != SessionConfiguration.SESSION_REGULAR) {
+            Log.e(TAG, "Session type: " + sessionConfig.getSessionType() + " is different from " +
+                    " regular. Legacy devices support only regular session types!");
+            return false;
+        }
+
+        if (sessionConfig.getInputConfiguration() != null) {
+            Log.e(TAG, "Input configuration present, legacy devices do not support this feature!");
+            return false;
+        }
+
+        List<OutputConfiguration> outputConfigs = sessionConfig.getOutputConfigurations();
+        if (outputConfigs.isEmpty()) {
+            Log.e(TAG, "Empty output configuration list!");
+            return false;
+        }
+
+        SparseArray<Surface> surfaces = new SparseArray<Surface>(outputConfigs.size());
+        int idx = 0;
+        for (OutputConfiguration outputConfig : outputConfigs) {
+            List<Surface> surfaceList = outputConfig.getSurfaces();
+            if (surfaceList.isEmpty() || (surfaceList.size() > 1)) {
+                Log.e(TAG, "Legacy devices do not support deferred or shared surfaces!");
+                return false;
+            }
+
+            surfaces.put(idx++, outputConfig.getSurface());
+        }
+
+        int ret = mLegacyDevice.configureOutputs(surfaces, /*validateSurfacesOnly*/true);
+
+        return ret == LegacyExceptionUtils.NO_ERROR;
+    }
+
+    @Override
+    public void beginConfigure() {
         if (DEBUG) {
             Log.d(TAG, "beginConfigure called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot begin configure, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot begin configure, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot begin configure, configuration change already in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot begin configure, configuration change already in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
             mConfiguring = true;
         }
-        return CameraBinderDecorator.NO_ERROR;
     }
 
     @Override
-    public int endConfigure(boolean isConstrainedHighSpeed) {
+    public int[] endConfigure(int operatingMode, CameraMetadataNative sessionParams) {
         if (DEBUG) {
             Log.d(TAG, "endConfigure called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot end configure, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot end configure, device has been closed.";
+            Log.e(TAG, err);
+            synchronized(mConfigureLock) {
+                mConfiguring = false;
+            }
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
-        ArrayList<Surface> surfaces = null;
+        if (operatingMode != ICameraDeviceUser.NORMAL_MODE) {
+            String err = "LEGACY devices do not support this operating mode";
+            Log.e(TAG, err);
+            synchronized(mConfigureLock) {
+                mConfiguring = false;
+            }
+            throw new ServiceSpecificException(ICameraService.ERROR_ILLEGAL_ARGUMENT, err);
+        }
+
+        SparseArray<Surface> surfaces = null;
         synchronized(mConfigureLock) {
             if (!mConfiguring) {
-                Log.e(TAG, "Cannot end configure, no configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot end configure, no configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
-            int numSurfaces = mSurfaces.size();
-            if (numSurfaces > 0) {
-                surfaces = new ArrayList<>();
-                for (int i = 0; i < numSurfaces; ++i) {
-                    surfaces.add(mSurfaces.valueAt(i));
-                }
+            if (mSurfaces != null) {
+                surfaces = mSurfaces.clone();
             }
             mConfiguring = false;
         }
-        return mLegacyDevice.configureOutputs(surfaces);
+        mLegacyDevice.configureOutputs(surfaces);
+
+        return new int[0]; // Offline mode is not supported
     }
 
     @Override
-    public int deleteStream(int streamId) {
+    public void deleteStream(int streamId) {
         if (DEBUG) {
             Log.d(TAG, "deleteStream called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot delete stream, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot delete stream, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (!mConfiguring) {
-                Log.e(TAG, "Cannot delete stream, beginConfigure hasn't been called yet.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot delete stream, no configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
             int index = mSurfaces.indexOfKey(streamId);
             if (index < 0) {
-                Log.e(TAG, "Cannot delete stream, stream id " + streamId + " doesn't exist.");
-                return CameraBinderDecorator.BAD_VALUE;
+                String err = "Cannot delete stream, stream id " + streamId + " doesn't exist.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_ILLEGAL_ARGUMENT, err);
             }
             mSurfaces.removeAt(index);
         }
-        return CameraBinderDecorator.NO_ERROR;
     }
 
     @Override
@@ -525,18 +613,21 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
             Log.d(TAG, "createStream called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot create stream, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot create stream, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (!mConfiguring) {
-                Log.e(TAG, "Cannot create stream, beginConfigure hasn't been called yet.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot create stream, beginConfigure hasn't been called yet.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
             if (outputConfiguration.getRotation() != OutputConfiguration.ROTATION_0) {
-                Log.e(TAG, "Cannot create stream, stream rotation is not supported.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot create stream, stream rotation is not supported.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_ILLEGAL_ARGUMENT, err);
             }
             int id = ++mSurfaceIdCounter;
             mSurfaces.put(id, outputConfiguration.getSurface());
@@ -545,25 +636,35 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
     }
 
     @Override
+    public void finalizeOutputConfigurations(int steamId, OutputConfiguration config) {
+        String err = "Finalizing output configuration is not supported on legacy devices";
+        Log.e(TAG, err);
+        throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
+    }
+
+    @Override
     public int createInputStream(int width, int height, int format) {
-        Log.e(TAG, "creating input stream is not supported on legacy devices");
-        return CameraBinderDecorator.INVALID_OPERATION;
+        String err = "Creating input stream is not supported on legacy devices";
+        Log.e(TAG, err);
+        throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
     }
 
     @Override
-    public int getInputSurface(/*out*/ Surface surface) {
-        Log.e(TAG, "getting input surface is not supported on legacy devices");
-        return CameraBinderDecorator.INVALID_OPERATION;
+    public Surface getInputSurface() {
+        String err = "Getting input surface is not supported on legacy devices";
+        Log.e(TAG, err);
+        throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
     }
 
     @Override
-    public int createDefaultRequest(int templateId, /*out*/CameraMetadataNative request) {
+    public CameraMetadataNative createDefaultRequest(int templateId) {
         if (DEBUG) {
             Log.d(TAG, "createDefaultRequest called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot create default request, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot create default request, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         CameraMetadataNative template;
@@ -571,99 +672,129 @@ public class CameraDeviceUserShim implements ICameraDeviceUser {
             template =
                     LegacyMetadataMapper.createRequestTemplate(mCameraCharacteristics, templateId);
         } catch (IllegalArgumentException e) {
-            Log.e(TAG, "createDefaultRequest - invalid templateId specified");
-            return CameraBinderDecorator.BAD_VALUE;
+            String err = "createDefaultRequest - invalid templateId specified";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_ILLEGAL_ARGUMENT, err);
         }
 
-        request.swap(template);
-        return CameraBinderDecorator.NO_ERROR;
+        return template;
     }
 
     @Override
-    public int getCameraInfo(/*out*/CameraMetadataNative info) {
+    public CameraMetadataNative getCameraInfo() {
         if (DEBUG) {
             Log.d(TAG, "getCameraInfo called.");
         }
         // TODO: implement getCameraInfo.
         Log.e(TAG, "getCameraInfo unimplemented.");
-        return CameraBinderDecorator.NO_ERROR;
+        return null;
     }
 
     @Override
-    public int waitUntilIdle() throws RemoteException {
+    public void updateOutputConfiguration(int streamId, OutputConfiguration config) {
+        // TODO: b/63912484 implement updateOutputConfiguration.
+    }
+
+    @Override
+    public void waitUntilIdle() throws RemoteException {
         if (DEBUG) {
             Log.d(TAG, "waitUntilIdle called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot wait until idle, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot wait until idle, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot wait until idle, configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot wait until idle, configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
         }
         mLegacyDevice.waitUntilIdle();
-        return CameraBinderDecorator.NO_ERROR;
     }
 
     @Override
-    public int flush(/*out*/LongParcelable lastFrameNumber) {
+    public long flush() {
         if (DEBUG) {
             Log.d(TAG, "flush called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot flush, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot flush, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         synchronized(mConfigureLock) {
             if (mConfiguring) {
-                Log.e(TAG, "Cannot flush, configuration change in progress.");
-                return CameraBinderDecorator.INVALID_OPERATION;
+                String err = "Cannot flush, configuration change in progress.";
+                Log.e(TAG, err);
+                throw new ServiceSpecificException(ICameraService.ERROR_INVALID_OPERATION, err);
             }
         }
-        long lastFrame = mLegacyDevice.flush();
-        if (lastFrameNumber != null) {
-            lastFrameNumber.setNumber(lastFrame);
-        }
-        return CameraBinderDecorator.NO_ERROR;
+        return mLegacyDevice.flush();
     }
 
-    public int prepare(int streamId) {
+    public void prepare(int streamId) {
         if (DEBUG) {
             Log.d(TAG, "prepare called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot prepare stream, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot prepare stream, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         // LEGACY doesn't support actual prepare, just signal success right away
         mCameraCallbacks.onPrepared(streamId);
-
-        return CameraBinderDecorator.NO_ERROR;
     }
 
-    public int prepare2(int maxCount, int streamId) {
+    public void prepare2(int maxCount, int streamId) {
         // We don't support this in LEGACY mode.
-        return prepare(streamId);
+        prepare(streamId);
     }
 
-    public int tearDown(int streamId) {
+    public void tearDown(int streamId) {
         if (DEBUG) {
             Log.d(TAG, "tearDown called.");
         }
         if (mLegacyDevice.isClosed()) {
-            Log.e(TAG, "Cannot tear down stream, device has been closed.");
-            return -ENODEV;
+            String err = "Cannot tear down stream, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
         }
 
         // LEGACY doesn't support actual teardown, so just a no-op
+    }
 
-        return CameraBinderDecorator.NO_ERROR;
+    @Override
+    public void setCameraAudioRestriction(int mode) {
+        if (mLegacyDevice.isClosed()) {
+            String err = "Cannot set camera audio restriction, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
+        }
+
+        mLegacyDevice.setAudioRestriction(mode);
+    }
+
+    @Override
+    public int getGlobalAudioRestriction() {
+        if (mLegacyDevice.isClosed()) {
+            String err = "Cannot set camera audio restriction, device has been closed.";
+            Log.e(TAG, err);
+            throw new ServiceSpecificException(ICameraService.ERROR_DISCONNECTED, err);
+        }
+
+        return mLegacyDevice.getAudioRestriction();
+    }
+
+    @Override
+    public ICameraOfflineSession switchToOffline(ICameraDeviceCallbacks cbs,
+            int[] offlineOutputIds) {
+        throw new UnsupportedOperationException("Legacy device does not support offline mode");
     }
 
     @Override

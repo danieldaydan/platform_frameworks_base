@@ -17,7 +17,7 @@
 package com.android.server.pm;
 
 import android.content.pm.PackageManager;
-import android.content.pm.PackageParser;
+import android.content.pm.parsing.component.ParsedIntentInfo;
 import android.util.ArraySet;
 import android.util.Slog;
 
@@ -35,7 +35,7 @@ public class IntentFilterVerificationState {
 
     private int mState;
 
-    private ArrayList<PackageParser.ActivityIntentInfo> mFilters = new ArrayList<>();
+    private ArrayList<ParsedIntentInfo> mFilters = new ArrayList<>();
     private ArraySet<String> mHosts = new ArraySet<>();
     private int mUserId;
 
@@ -66,7 +66,7 @@ public class IntentFilterVerificationState {
         setState(STATE_VERIFICATION_PENDING);
     }
 
-    public ArrayList<PackageParser.ActivityIntentInfo> getFilters() {
+    public ArrayList<ParsedIntentInfo> getFilters() {
         return mFilters;
     }
 
@@ -96,7 +96,12 @@ public class IntentFilterVerificationState {
             if (i > 0) {
                 sb.append(" ");
             }
-            sb.append(mHosts.valueAt(i));
+            String host = mHosts.valueAt(i);
+            // "*.example.tld" is validated via https://example.tld
+            if (host.startsWith("*.")) {
+                host = host.substring(2);
+            }
+            sb.append(host);
         }
         return sb.toString();
     }
@@ -118,7 +123,7 @@ public class IntentFilterVerificationState {
         return false;
     }
 
-    public void addFilter(PackageParser.ActivityIntentInfo filter) {
+    public void addFilter(ParsedIntentInfo filter) {
         mFilters.add(filter);
         mHosts.addAll(filter.getHostsList());
     }

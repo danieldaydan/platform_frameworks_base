@@ -18,6 +18,7 @@ package android.app;
 
 import android.accessibilityservice.IAccessibilityServiceClient;
 import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.view.InputEvent;
 import android.view.WindowContentFrameStats;
 import android.view.WindowAnimationFrameStats;
@@ -33,19 +34,22 @@ import android.os.ParcelFileDescriptor;
  * {@hide}
  */
 interface IUiAutomationConnection {
-    void connect(IAccessibilityServiceClient client);
+    void connect(IAccessibilityServiceClient client, int flags);
     void disconnect();
     boolean injectInputEvent(in InputEvent event, boolean sync);
+    void syncInputTransactions();
     boolean setRotation(int rotation);
-    Bitmap takeScreenshot(int width, int height);
+    Bitmap takeScreenshot(in Rect crop, int rotation);
     boolean clearWindowContentFrameStats(int windowId);
     WindowContentFrameStats getWindowContentFrameStats(int windowId);
     void clearWindowAnimationFrameStats();
     WindowAnimationFrameStats getWindowAnimationFrameStats();
-    void executeShellCommand(String command, in ParcelFileDescriptor fd);
+    void executeShellCommand(String command, in ParcelFileDescriptor sink,
+            in ParcelFileDescriptor source);
     void grantRuntimePermission(String packageName, String permission, int userId);
     void revokeRuntimePermission(String packageName, String permission, int userId);
-
+    void adoptShellPermissionIdentity(int uid, in String[] permissions);
+    void dropShellPermissionIdentity();
     // Called from the system process.
     oneway void shutdown();
 }

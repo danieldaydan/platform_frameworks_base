@@ -16,21 +16,33 @@
 
 package android.net.wifi;
 
-import android.net.wifi.BatchedScanResult;
-import android.net.wifi.BatchedScanSettings;
-import android.net.wifi.WifiConfiguration;
-import android.net.wifi.WifiInfo;
-import android.net.wifi.ScanSettings;
-import android.net.wifi.WifiChannel;
-import android.net.wifi.ScanResult;
-import android.net.wifi.WifiConnectionStatistics;
-import android.net.wifi.WifiActivityEnergyInfo;
-import android.net.Network;
+import android.content.pm.ParceledListSlice;
+
+import android.net.wifi.hotspot2.OsuProvider;
+import android.net.wifi.hotspot2.PasspointConfiguration;
+import android.net.wifi.hotspot2.IProvisioningCallback;
 
 import android.net.DhcpInfo;
-
+import android.net.Network;
+import android.net.wifi.IActionListener;
+import android.net.wifi.IDppCallback;
+import android.net.wifi.ILocalOnlyHotspotCallback;
+import android.net.wifi.INetworkRequestMatchCallback;
+import android.net.wifi.IOnWifiActivityEnergyInfoListener;
+import android.net.wifi.IOnWifiUsabilityStatsListener;
+import android.net.wifi.IScanResultsCallback;
+import android.net.wifi.ISoftApCallback;
+import android.net.wifi.ISuggestionConnectionStatusListener;
+import android.net.wifi.ITrafficStateCallback;
+import android.net.wifi.IWifiConnectedNetworkScorer;
+import android.net.wifi.ScanResult;
+import android.net.wifi.SoftApConfiguration;
+import android.net.wifi.WifiConfiguration;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiNetworkSuggestion;
 
 import android.os.Messenger;
+import android.os.ResultReceiver;
 import android.os.WorkSource;
 
 /**
@@ -40,59 +52,79 @@ import android.os.WorkSource;
  */
 interface IWifiManager
 {
-    int getSupportedFeatures();
+    long getSupportedFeatures();
 
-    WifiActivityEnergyInfo reportActivityInfo();
+    oneway void getWifiActivityEnergyInfoAsync(in IOnWifiActivityEnergyInfoListener listener);
 
-    List<WifiConfiguration> getConfiguredNetworks();
+    ParceledListSlice getConfiguredNetworks(String packageName, String featureId);
 
-    List<WifiConfiguration> getPrivilegedConfiguredNetworks();
+    ParceledListSlice getPrivilegedConfiguredNetworks(String packageName, String featureId);
 
-    WifiConfiguration getMatchingWifiConfig(in ScanResult scanResult);
+    Map getAllMatchingFqdnsForScanResults(in List<ScanResult> scanResult);
 
-    int addOrUpdateNetwork(in WifiConfiguration config);
+    Map getMatchingOsuProviders(in List<ScanResult> scanResult);
 
-    boolean removeNetwork(int netId);
+    Map getMatchingPasspointConfigsForOsuProviders(in List<OsuProvider> osuProviders);
 
-    boolean enableNetwork(int netId, boolean disableOthers);
+    int addOrUpdateNetwork(in WifiConfiguration config, String packageName);
 
-    boolean disableNetwork(int netId);
+    boolean addOrUpdatePasspointConfiguration(in PasspointConfiguration config, String packageName);
 
-    boolean pingSupplicant();
+    boolean removePasspointConfiguration(in String fqdn, String packageName);
 
-    List<WifiChannel> getChannelList();
+    List<PasspointConfiguration> getPasspointConfigurations(in String packageName);
 
-    void startScan(in ScanSettings requested, in WorkSource ws);
+    List<WifiConfiguration> getWifiConfigsForPasspointProfiles(in List<String> fqdnList);
 
-    void startLocationRestrictedScan(in WorkSource ws);
+    void queryPasspointIcon(long bssid, String fileName);
 
-    List<ScanResult> getScanResults(String callingPackage);
+    int matchProviderWithCurrentNetwork(String fqdn);
 
-    void disconnect();
+    void deauthenticateNetwork(long holdoff, boolean ess);
 
-    void reconnect();
+    boolean removeNetwork(int netId, String packageName);
 
-    void reassociate();
+    boolean enableNetwork(int netId, boolean disableOthers, String packageName);
 
-    WifiInfo getConnectionInfo();
+    boolean disableNetwork(int netId, String packageName);
 
-    boolean setWifiEnabled(boolean enable);
+    void allowAutojoinGlobal(boolean choice);
+
+    void allowAutojoin(int netId, boolean choice);
+
+    void allowAutojoinPasspoint(String fqdn, boolean enableAutoJoin);
+
+    void setMacRandomizationSettingPasspointEnabled(String fqdn, boolean enable);
+
+    void setPasspointMeteredOverride(String fqdn, int meteredOverride);
+
+    boolean startScan(String packageName, String featureId);
+
+    List<ScanResult> getScanResults(String callingPackage, String callingFeatureId);
+
+    boolean disconnect(String packageName);
+
+    boolean reconnect(String packageName);
+
+    boolean reassociate(String packageName);
+
+    WifiInfo getConnectionInfo(String callingPackage, String callingFeatureId);
+
+    boolean setWifiEnabled(String packageName, boolean enable);
 
     int getWifiEnabledState();
 
-    void setCountryCode(String country, boolean persist);
-
     String getCountryCode();
 
-    void setFrequencyBand(int band, boolean persist);
+    boolean is5GHzBandSupported();
 
-    int getFrequencyBand();
+    boolean is6GHzBandSupported();
 
-    boolean isDualBandSupported();
-
-    boolean saveConfiguration();
+    boolean isWifiStandardSupported(int standard);
 
     DhcpInfo getDhcpInfo();
+
+    void setScanAlwaysAvailable(boolean isAvailable);
 
     boolean isScanAlwaysAvailable();
 
@@ -108,68 +140,139 @@ interface IWifiManager
 
     void acquireMulticastLock(IBinder binder, String tag);
 
-    void releaseMulticastLock();
+    void releaseMulticastLock(String tag);
 
-    void setWifiApEnabled(in WifiConfiguration wifiConfig, boolean enable);
+    void updateInterfaceIpState(String ifaceName, int mode);
 
+    boolean startSoftAp(in WifiConfiguration wifiConfig);
+
+    boolean startTetheredHotspot(in SoftApConfiguration softApConfig);
+
+    boolean stopSoftAp();
+
+    int startLocalOnlyHotspot(in ILocalOnlyHotspotCallback callback, String packageName,
+                              String featureId, in SoftApConfiguration customConfig);
+
+    void stopLocalOnlyHotspot();
+
+    void startWatchLocalOnlyHotspot(in ILocalOnlyHotspotCallback callback);
+
+    void stopWatchLocalOnlyHotspot();
+
+    @UnsupportedAppUsage
     int getWifiApEnabledState();
 
+    @UnsupportedAppUsage
     WifiConfiguration getWifiApConfiguration();
 
-    WifiConfiguration buildWifiConfig(String uriString, String mimeType, in byte[] data);
+    SoftApConfiguration getSoftApConfiguration();
 
-    void setWifiApConfiguration(in WifiConfiguration wifiConfig);
+    boolean setWifiApConfiguration(in WifiConfiguration wifiConfig, String packageName);
 
-    void startWifi();
+    boolean setSoftApConfiguration(in SoftApConfiguration softApConfig, String packageName);
 
-    void stopWifi();
-
-    void addToBlacklist(String bssid);
-
-    void clearBlacklist();
-
-    Messenger getWifiServiceMessenger();
-
-    String getConfigFile();
+    void notifyUserOfApBandConversion(String packageName);
 
     void enableTdls(String remoteIPAddress, boolean enable);
 
     void enableTdlsWithMacAddress(String remoteMacAddress, boolean enable);
 
-    boolean requestBatchedScan(in BatchedScanSettings requested, IBinder binder, in WorkSource ws);
-
-    void stopBatchedScan(in BatchedScanSettings requested);
-
-    List<BatchedScanResult> getBatchedScanResults(String callingPackage);
-
-    boolean isBatchedScanSupported();
-
-    void pollBatchedScan();
-
-    String getWpsNfcConfigurationToken(int netId);
+    String getCurrentNetworkWpsNfcConfigurationToken();
 
     void enableVerboseLogging(int verbose);
 
     int getVerboseLoggingLevel();
 
-    void enableAggressiveHandover(int enabled);
-    int getAggressiveHandover();
+    void disableEphemeralNetwork(String SSID, String packageName);
 
-    void setAllowScansWithTraffic(int enabled);
-    int getAllowScansWithTraffic();
+    void factoryReset(String packageName);
 
-    void setHalBasedAutojoinOffload(int enabled);
-    int getHalBasedAutojoinOffload();
-
-    boolean enableAutoJoinWhenAssociated(boolean enabled);
-    boolean getEnableAutoJoinWhenAssociated();
-
-    WifiConnectionStatistics getConnectionStatistics();
-
-    void disableEphemeralNetwork(String SSID);
-
-    void factoryReset();
-
+    @UnsupportedAppUsage
     Network getCurrentNetwork();
-}
 
+    byte[] retrieveBackupData();
+
+    void restoreBackupData(in byte[] data);
+
+    byte[] retrieveSoftApBackupData();
+
+    SoftApConfiguration restoreSoftApBackupData(in byte[] data);
+
+    void restoreSupplicantBackupData(in byte[] supplicantData, in byte[] ipConfigData);
+
+    void startSubscriptionProvisioning(in OsuProvider provider, in IProvisioningCallback callback);
+
+    void registerSoftApCallback(in IBinder binder, in ISoftApCallback callback, int callbackIdentifier);
+
+    void unregisterSoftApCallback(int callbackIdentifier);
+
+    void addOnWifiUsabilityStatsListener(in IBinder binder, in IOnWifiUsabilityStatsListener listener, int listenerIdentifier);
+
+    void removeOnWifiUsabilityStatsListener(int listenerIdentifier);
+
+    void registerTrafficStateCallback(in IBinder binder, in ITrafficStateCallback callback, int callbackIdentifier);
+
+    void unregisterTrafficStateCallback(int callbackIdentifier);
+
+    void registerNetworkRequestMatchCallback(in IBinder binder, in INetworkRequestMatchCallback callback, int callbackIdentifier);
+
+    void unregisterNetworkRequestMatchCallback(int callbackIdentifier);
+
+    int addNetworkSuggestions(in List<WifiNetworkSuggestion> networkSuggestions, in String packageName,
+        in String featureId);
+
+    int removeNetworkSuggestions(in List<WifiNetworkSuggestion> networkSuggestions, in String packageName);
+
+    List<WifiNetworkSuggestion> getNetworkSuggestions(in String packageName);
+
+    String[] getFactoryMacAddresses();
+
+    void setDeviceMobilityState(int state);
+
+    void startDppAsConfiguratorInitiator(in IBinder binder, in String enrolleeUri,
+        int selectedNetworkId, int netRole, in IDppCallback callback);
+
+    void startDppAsEnrolleeInitiator(in IBinder binder, in String configuratorUri,
+        in IDppCallback callback);
+
+    void stopDppSession();
+
+    void updateWifiUsabilityScore(int seqNum, int score, int predictionHorizonSec);
+
+    oneway void connect(in WifiConfiguration config, int netId, in IBinder binder, in IActionListener listener, int callbackIdentifier);
+
+    oneway void save(in WifiConfiguration config, in IBinder binder, in IActionListener listener, int callbackIdentifier);
+
+    oneway void forget(int netId, in IBinder binder, in IActionListener listener, int callbackIdentifier);
+
+    void registerScanResultsCallback(in IScanResultsCallback callback);
+
+    void unregisterScanResultsCallback(in IScanResultsCallback callback);
+
+    void registerSuggestionConnectionStatusListener(in IBinder binder, in ISuggestionConnectionStatusListener listener, int listenerIdentifier, String packageName, String featureId);
+
+    void unregisterSuggestionConnectionStatusListener(int listenerIdentifier, String packageName);
+
+    int calculateSignalLevel(int rssi);
+
+    List<WifiConfiguration> getWifiConfigForMatchedNetworkSuggestionsSharedWithUser(in List<ScanResult> scanResults);
+
+    boolean setWifiConnectedNetworkScorer(in IBinder binder, in IWifiConnectedNetworkScorer scorer);
+
+    void clearWifiConnectedNetworkScorer();
+
+    /**
+     * Return the Map of {@link WifiNetworkSuggestion} and the list of <ScanResult>
+     */
+    Map getMatchingScanResults(in List<WifiNetworkSuggestion> networkSuggestions, in List<ScanResult> scanResults, String callingPackage, String callingFeatureId);
+
+    void setScanThrottleEnabled(boolean enable);
+
+    boolean isScanThrottleEnabled();
+
+    Map getAllMatchingPasspointProfilesForScanResults(in List<ScanResult> scanResult);
+
+    void setAutoWakeupEnabled(boolean enable);
+
+    boolean isAutoWakeupEnabled();
+}

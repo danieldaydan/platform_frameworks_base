@@ -16,14 +16,17 @@
 
 package com.android.printspooler.ui;
 
+import android.annotation.NonNull;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.drawable.BitmapDrawable;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.print.PageRange;
-import android.print.PrintAttributes.MediaSize;
 import android.print.PrintAttributes.Margins;
+import android.print.PrintAttributes.MediaSize;
 import android.print.PrintDocumentInfo;
 import android.support.v7.widget.RecyclerView.Adapter;
 import android.support.v7.widget.RecyclerView.ViewHolder;
@@ -31,11 +34,12 @@ import android.util.Log;
 import android.util.SparseArray;
 import android.view.LayoutInflater;
 import android.view.View;
+import android.view.View.MeasureSpec;
 import android.view.View.OnClickListener;
 import android.view.ViewGroup;
 import android.view.ViewGroup.LayoutParams;
-import android.view.View.MeasureSpec;
 import android.widget.TextView;
+
 import com.android.printspooler.R;
 import com.android.printspooler.model.OpenDocumentCallback;
 import com.android.printspooler.model.PageContentRepository;
@@ -43,6 +47,7 @@ import com.android.printspooler.model.PageContentRepository.PageContentProvider;
 import com.android.printspooler.util.PageRangeUtils;
 import com.android.printspooler.widget.PageContentView;
 import com.android.printspooler.widget.PreviewPageFrame;
+
 import dalvik.system.CloseGuard;
 
 import java.util.ArrayList;
@@ -52,7 +57,7 @@ import java.util.List;
 /**
  * This class represents the adapter for the pages in the print preview list.
  */
-public final class PageAdapter extends Adapter {
+public final class PageAdapter extends Adapter<ViewHolder> {
     private static final String LOG_TAG = "PageAdapter";
 
     private static final int MAX_PREVIEW_PAGES_BATCH = 50;
@@ -91,6 +96,7 @@ public final class PageAdapter extends Adapter {
     private PageRange[] mSelectedPages;
 
     private BitmapDrawable mEmptyState;
+    private BitmapDrawable mErrorState;
 
     private int mDocumentPageCount = PrintDocumentInfo.PAGE_COUNT_UNKNOWN;
     private int mSelectedPageCount;
@@ -203,6 +209,7 @@ public final class PageAdapter extends Adapter {
             int documentPageCount, MediaSize mediaSize, Margins minMargins) {
         boolean documentChanged = false;
         boolean updatePreviewAreaAndPageSize = false;
+        boolean clearSelectedPages = false;
 
         // If the app does not tell how many pages are in the document we cannot
         // optimize and ask for all pages whose count we get from the renderer.
@@ -222,28 +229,39 @@ public final class PageAdapter extends Adapter {
             }
         }
 
-        if (!Arrays.equals(mSelectedPages, selectedPages)) {
-            mSelectedPages = selectedPages;
-            mSelectedPageCount = PageRangeUtils.getNormalizedPageCount(
-                    mSelectedPages, documentPageCount);
-            setConfirmedPages(mSelectedPages, documentPageCount);
-            updatePreviewAreaAndPageSize = true;
-            documentChanged = true;
-        }
-
         if (mDocumentPageCount != documentPageCount) {
             mDocumentPageCount = documentPageCount;
             documentChanged = true;
+            clearSelectedPages = true;
         }
 
         if (mMediaSize == null || !mMediaSize.equals(mediaSize)) {
             mMediaSize = mediaSize;
             updatePreviewAreaAndPageSize = true;
             documentChanged = true;
+
+            clearSelectedPages = true;
         }
 
         if (mMinMargins == null || !mMinMargins.equals(minMargins)) {
             mMinMargins = minMargins;
+            updatePreviewAreaAndPageSize = true;
+            documentChanged = true;
+
+            clearSelectedPages = true;
+        }
+
+        if (clearSelectedPages) {
+            mSelectedPages = PageRange.ALL_PAGES_ARRAY;
+            mSelectedPageCount = documentPageCount;
+            setConfirmedPages(mSelectedPages, documentPageCount);
+            updatePreviewAreaAndPageSize = true;
+            documentChanged = true;
+        } else if (!Arrays.equals(mSelectedPages, selectedPages)) {
+            mSelectedPages = selectedPages;
+            mSelectedPageCount = PageRangeUtils.getNormalizedPageCount(
+                    mSelectedPages, documentPageCount);
+            setConfirmedPages(mSelectedPages, documentPageCount);
             updatePreviewAreaAndPageSize = true;
             documentChanged = true;
         }
@@ -282,7 +300,14 @@ public final class PageAdapter extends Adapter {
 
     @Override
     public ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-        View page = mLayoutInflater.inflate(R.layout.preview_page, parent, false);
+        View page;
+
+        if (viewType == 0) {
+            page = mLayoutInflater.inflate(R.layout.preview_page_selected, parent, false);
+        } else {
+            page = mLayoutInflater.inflate(R.layout.preview_page, parent, false);
+        }
+
         return new MyViewHolder(page);
     }
 
@@ -327,12 +352,12 @@ public final class PageAdapter extends Adapter {
         } else {
             onSelectedPageNotInFile(pageInDocument);
         }
-        content.init(provider, mEmptyState, mMediaSize, mMinMargins);
+        content.init(provider, mEmptyState, mErrorState, mMediaSize, mMinMargins);
 
         if (mConfirmedPagesInDocument.indexOfKey(pageInDocument) >= 0) {
-            page.setSelected(true, false);
+            page.setSelected(true);
         } else {
-            page.setSelected(false, false);
+            page.setSelected(false);
         }
 
         page.setContentDescription(mContext.getString(R.string.page_description_template,
@@ -347,6 +372,15 @@ public final class PageAdapter extends Adapter {
     @Override
     public int getItemCount() {
         return mSelectedPageCount;
+    }
+
+    @Override
+    public int getItemViewType(int position) {
+        if (mConfirmedPagesInDocument.indexOfKey(computePageIndexInDocument(position)) >= 0) {
+            return 0;
+        } else {
+            return 1;
+        }
     }
 
     @Override
@@ -409,7 +443,7 @@ public final class PageAdapter extends Adapter {
                 - horizontalPaddingAndMargins) / columnCount) + 0.5f);
 
         // Compute max page height.
-        final int pageContentDesiredHeight = (int) (((float) pageContentDesiredWidth
+        final int pageContentDesiredHeight = (int) ((pageContentDesiredWidth
                 / pageAspectRatio) + 0.5f);
 
         // If the page does not fit entirely in a vertical direction,
@@ -446,19 +480,41 @@ public final class PageAdapter extends Adapter {
         // Now update the empty state drawable, as it depends on the page
         // size and is reused for all views for better performance.
         LayoutInflater inflater = LayoutInflater.from(mContext);
-        View content = inflater.inflate(R.layout.preview_page_loading, null, false);
-        content.measure(MeasureSpec.makeMeasureSpec(mPageContentWidth, MeasureSpec.EXACTLY),
+        View loadingContent = inflater.inflate(R.layout.preview_page_loading, null, false);
+        loadingContent.measure(MeasureSpec.makeMeasureSpec(mPageContentWidth, MeasureSpec.EXACTLY),
                 MeasureSpec.makeMeasureSpec(mPageContentHeight, MeasureSpec.EXACTLY));
-        content.layout(0, 0, content.getMeasuredWidth(), content.getMeasuredHeight());
+        loadingContent.layout(0, 0, loadingContent.getMeasuredWidth(),
+                loadingContent.getMeasuredHeight());
 
-        Bitmap bitmap = Bitmap.createBitmap(mPageContentWidth, mPageContentHeight,
+        // To create a bitmap, height & width should be larger than 0
+        if (mPageContentHeight <= 0 || mPageContentWidth <= 0) {
+            Log.w(LOG_TAG, "Unable to create bitmap, height or width smaller than 0!");
+            return;
+        }
+
+        Bitmap loadingBitmap = Bitmap.createBitmap(mPageContentWidth, mPageContentHeight,
                 Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(bitmap);
-        content.draw(canvas);
+        loadingContent.draw(new Canvas(loadingBitmap));
 
         // Do not recycle the old bitmap if such as it may be set as an empty
         // state to any of the page views. Just let the GC take care of it.
-        mEmptyState = new BitmapDrawable(mContext.getResources(), bitmap);
+        mEmptyState = new BitmapDrawable(mContext.getResources(), loadingBitmap);
+
+        // Now update the empty state drawable, as it depends on the page
+        // size and is reused for all views for better performance.
+        View errorContent = inflater.inflate(R.layout.preview_page_error, null, false);
+        errorContent.measure(MeasureSpec.makeMeasureSpec(mPageContentWidth, MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(mPageContentHeight, MeasureSpec.EXACTLY));
+        errorContent.layout(0, 0, errorContent.getMeasuredWidth(),
+                errorContent.getMeasuredHeight());
+
+        Bitmap errorBitmap = Bitmap.createBitmap(mPageContentWidth, mPageContentHeight,
+                Bitmap.Config.ARGB_8888);
+        errorContent.draw(new Canvas(errorBitmap));
+
+        // Do not recycle the old bitmap if such as it may be set as an error
+        // state to any of the page views. Just let the GC take care of it.
+        mErrorState = new BitmapDrawable(mContext.getResources(), errorBitmap);
     }
 
     private PageRange[] computeSelectedPages() {
@@ -505,8 +561,11 @@ public final class PageAdapter extends Adapter {
     @Override
     protected void finalize() throws Throwable {
         try {
-            if (mState != STATE_DESTROYED) {
+            if (mCloseGuard != null) {
                 mCloseGuard.warnIfOpen();
+            }
+
+            if (mState != STATE_DESTROYED) {
                 destroy(null);
             }
         } finally {
@@ -570,7 +629,14 @@ public final class PageAdapter extends Adapter {
             if (DEBUG) {
                 Log.i(LOG_TAG, "Requesting pages: " + Arrays.toString(mRequestedPages));
             }
-            mCallbacks.onRequestContentUpdate();
+
+            // This call might come from a recylerview that is currently updating. Hence delay to
+            // after the update
+            (new Handler(Looper.getMainLooper())).post(new Runnable() {
+                @Override public void run() {
+                    mCallbacks.onRequestContentUpdate();
+                }
+            });
         }
     }
 
@@ -733,21 +799,23 @@ public final class PageAdapter extends Adapter {
     private void recyclePageView(PageContentView page, int pageIndexInAdapter) {
         PageContentProvider provider = page.getPageContentProvider();
         if (provider != null) {
-            page.init(null, mEmptyState, mMediaSize, mMinMargins);
+            page.init(null, mEmptyState, mErrorState, mMediaSize, mMinMargins);
             mPageContentRepository.releasePageContentProvider(provider);
         }
         mBoundPagesInAdapter.remove(pageIndexInAdapter);
         page.setTag(null);
     }
 
-    public void startPreloadContent(PageRange pageRangeInAdapter) {
-        final int startPageInDocument = computePageIndexInDocument(pageRangeInAdapter.getStart());
-        final int startPageInFile = computePageIndexInFile(startPageInDocument);
-        final int endPageInDocument = computePageIndexInDocument(pageRangeInAdapter.getEnd());
-        final int endPageInFile = computePageIndexInFile(endPageInDocument);
-        if (startPageInDocument != INVALID_PAGE_INDEX && endPageInDocument != INVALID_PAGE_INDEX) {
-            mPageContentRepository.startPreload(startPageInFile, endPageInFile);
+    void startPreloadContent(@NonNull PageRange visiblePagesInAdapter) {
+        int startVisibleDocument = computePageIndexInDocument(visiblePagesInAdapter.getStart());
+        int endVisibleDocument = computePageIndexInDocument(visiblePagesInAdapter.getEnd());
+        if (startVisibleDocument == INVALID_PAGE_INDEX
+                || endVisibleDocument == INVALID_PAGE_INDEX) {
+            return;
         }
+
+        mPageContentRepository.startPreload(new PageRange(startVisibleDocument, endVisibleDocument),
+                mSelectedPages, mWrittenPages);
     }
 
     public void stopPreloadContent() {
@@ -783,14 +851,14 @@ public final class PageAdapter extends Adapter {
             final int pageInDocument = computePageIndexInDocument(pageInAdapter);
             if (mConfirmedPagesInDocument.indexOfKey(pageInDocument) < 0) {
                 mConfirmedPagesInDocument.put(pageInDocument, null);
-                page.setSelected(true, true);
             } else {
                 if (mConfirmedPagesInDocument.size() <= 1) {
                     return;
                 }
                 mConfirmedPagesInDocument.remove(pageInDocument);
-                page.setSelected(false, true);
             }
+
+            notifyItemChanged(pageInAdapter);
         }
     }
 }

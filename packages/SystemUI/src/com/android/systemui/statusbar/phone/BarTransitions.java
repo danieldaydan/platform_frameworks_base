@@ -16,67 +16,103 @@
 
 package com.android.systemui.statusbar.phone;
 
-import android.animation.TimeInterpolator;
-import android.app.ActivityManager;
+import android.annotation.IntDef;
 import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
+import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuff.Mode;
+import android.graphics.PorterDuffColorFilter;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.View;
-import android.view.animation.LinearInterpolator;
 
+import com.android.settingslib.Utils;
+import com.android.systemui.Interpolators;
 import com.android.systemui.R;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 
 public class BarTransitions {
     private static final boolean DEBUG = false;
     private static final boolean DEBUG_COLORS = false;
 
-    public static final boolean HIGH_END = ActivityManager.isHighEndGfx();
-
-    public static final int MODE_OPAQUE = 0;
+    public static final int MODE_TRANSPARENT = 0;
     public static final int MODE_SEMI_TRANSPARENT = 1;
     public static final int MODE_TRANSLUCENT = 2;
     public static final int MODE_LIGHTS_OUT = 3;
-    public static final int MODE_TRANSPARENT = 4;
+    public static final int MODE_OPAQUE = 4;
     public static final int MODE_WARNING = 5;
     public static final int MODE_LIGHTS_OUT_TRANSPARENT = 6;
 
+    @IntDef(flag = true, prefix = { "MODE_" }, value = {
+            MODE_OPAQUE,
+            MODE_SEMI_TRANSPARENT,
+            MODE_TRANSLUCENT,
+            MODE_LIGHTS_OUT,
+            MODE_TRANSPARENT,
+            MODE_WARNING,
+            MODE_LIGHTS_OUT_TRANSPARENT
+    })
+    @Retention(RetentionPolicy.SOURCE)
+    public @interface TransitionMode {}
+
     public static final int LIGHTS_IN_DURATION = 250;
-    public static final int LIGHTS_OUT_DURATION = 750;
+    public static final int LIGHTS_OUT_DURATION = 1500;
     public static final int BACKGROUND_DURATION = 200;
 
     private final String mTag;
     private final View mView;
-    private final BarBackgroundDrawable mBarBackground;
+    protected final BarBackgroundDrawable mBarBackground;
 
-    private int mMode;
+    private @TransitionMode int mMode;
+    private boolean mAlwaysOpaque = false;
 
     public BarTransitions(View view, int gradientResourceId) {
         mTag = "BarTransitions." + view.getClass().getSimpleName();
         mView = view;
         mBarBackground = new BarBackgroundDrawable(mView.getContext(), gradientResourceId);
-        if (HIGH_END) {
-            mView.setBackground(mBarBackground);
-        }
+        mView.setBackground(mBarBackground);
+    }
+
+    public void destroy() {
+        // To be overridden
     }
 
     public int getMode() {
         return mMode;
     }
 
+    public void setAutoDim(boolean autoDim) {
+        // Default is don't care.
+    }
+
+    /**
+     * @param alwaysOpaque if {@code true}, the bar's background will always be opaque, regardless
+     *         of what mode it is currently set to.
+     */
+    public void setAlwaysOpaque(boolean alwaysOpaque) {
+        mAlwaysOpaque = alwaysOpaque;
+    }
+
+    public boolean isAlwaysOpaque() {
+        // Low-end devices do not support translucent modes, fallback to opaque
+        return mAlwaysOpaque;
+    }
+
     public void transitionTo(int mode, boolean animate) {
-        // low-end devices do not support translucent modes, fallback to opaque
-        if (!HIGH_END && (mode == MODE_SEMI_TRANSPARENT || mode == MODE_TRANSLUCENT
+        if (isAlwaysOpaque() && (mode == MODE_SEMI_TRANSPARENT || mode == MODE_TRANSLUCENT
                 || mode == MODE_TRANSPARENT)) {
             mode = MODE_OPAQUE;
         }
-        if (!HIGH_END && (mode == MODE_LIGHTS_OUT_TRANSPARENT)) {
+        if (isAlwaysOpaque() && (mode == MODE_LIGHTS_OUT_TRANSPARENT)) {
             mode = MODE_LIGHTS_OUT;
         }
         if (mMode == mode) return;
@@ -88,9 +124,7 @@ public class BarTransitions {
     }
 
     protected void onTransition(int oldMode, int newMode, boolean animate) {
-        if (HIGH_END) {
-            applyModeBackground(oldMode, newMode, animate);
-        }
+        applyModeBackground(oldMode, newMode, animate);
     }
 
     protected void applyModeBackground(int oldMode, int newMode, boolean animate) {
@@ -118,13 +152,12 @@ public class BarTransitions {
         return mode == MODE_LIGHTS_OUT || mode == MODE_LIGHTS_OUT_TRANSPARENT;
     }
 
-    private static class BarBackgroundDrawable extends Drawable {
+    protected static class BarBackgroundDrawable extends Drawable {
         private final int mOpaque;
         private final int mSemiTransparent;
         private final int mTransparent;
         private final int mWarning;
         private final Drawable mGradient;
-        private final TimeInterpolator mInterpolator;
 
         private int mMode = -1;
         private boolean mAnimating;
@@ -133,9 +166,13 @@ public class BarTransitions {
 
         private int mGradientAlpha;
         private int mColor;
+        private PorterDuffColorFilter mTintFilter;
+        private Paint mPaint = new Paint();
 
         private int mGradientAlphaStart;
         private int mColorStart;
+        private Rect mFrame;
+
 
         public BarBackgroundDrawable(Context context, int gradientResourceId) {
             final Resources res = context.getResources();
@@ -146,12 +183,16 @@ public class BarTransitions {
                 mWarning = 0xffff0000;
             } else {
                 mOpaque = context.getColor(R.color.system_bar_background_opaque);
-                mSemiTransparent = context.getColor(R.color.system_bar_background_semi_transparent);
+                mSemiTransparent = context.getColor(
+                        com.android.internal.R.color.system_bar_background_semi_transparent);
                 mTransparent = context.getColor(R.color.system_bar_background_transparent);
-                mWarning = context.getColor(com.android.internal.R.color.battery_saver_mode_color);
+                mWarning = Utils.getColorAttrDefaultColor(context, android.R.attr.colorError);
             }
             mGradient = context.getDrawable(gradientResourceId);
-            mInterpolator = new LinearInterpolator();
+        }
+
+        public void setFrame(Rect frame) {
+            mFrame = frame;
         }
 
         @Override
@@ -162,6 +203,25 @@ public class BarTransitions {
         @Override
         public void setColorFilter(ColorFilter colorFilter) {
             // noop
+        }
+
+        @Override
+        public void setTint(int color) {
+            PorterDuff.Mode targetMode = mTintFilter == null ? Mode.SRC_IN :
+                mTintFilter.getMode();
+            if (mTintFilter == null || mTintFilter.getColor() != color) {
+                mTintFilter = new PorterDuffColorFilter(color, targetMode);
+            }
+            invalidateSelf();
+        }
+
+        @Override
+        public void setTintMode(Mode tintMode) {
+            int targetColor = mTintFilter == null ? 0 : mTintFilter.getColor();
+            if (mTintFilter == null || mTintFilter.getMode() != tintMode) {
+                mTintFilter = new PorterDuffColorFilter(targetColor, tintMode);
+            }
+            invalidateSelf();
         }
 
         @Override
@@ -210,6 +270,7 @@ public class BarTransitions {
             } else {
                 targetColor = mOpaque;
             }
+
             if (!mAnimating) {
                 mColor = targetColor;
                 mGradientAlpha = targetGradientAlpha;
@@ -221,7 +282,8 @@ public class BarTransitions {
                     mGradientAlpha = targetGradientAlpha;
                 } else {
                     final float t = (now - mStartTime) / (float)(mEndTime - mStartTime);
-                    final float v = Math.max(0, Math.min(mInterpolator.getInterpolation(t), 1));
+                    final float v = Math.max(0, Math.min(
+                            Interpolators.LINEAR.getInterpolation(t), 1));
                     mGradientAlpha = (int)(v * targetGradientAlpha + mGradientAlphaStart * (1 - v));
                     mColor = Color.argb(
                           (int)(v * Color.alpha(targetColor) + Color.alpha(mColorStart) * (1 - v)),
@@ -235,7 +297,15 @@ public class BarTransitions {
                 mGradient.draw(canvas);
             }
             if (Color.alpha(mColor) > 0) {
-                canvas.drawColor(mColor);
+                mPaint.setColor(mColor);
+                if (mTintFilter != null) {
+                    mPaint.setColorFilter(mTintFilter);
+                }
+                if (mFrame != null) {
+                    canvas.drawRect(mFrame, mPaint);
+                } else {
+                    canvas.drawPaint(mPaint);
+                }
             }
             if (mAnimating) {
                 invalidateSelf();  // keep going

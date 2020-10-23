@@ -1,0 +1,10 @@
+java_library_static {
+    name: "updatable-driver-protos",
+    host_supported: true,
+    proto: {
+        type: "lite",
+    },
+    srcs: ["updatable_driver.proto"],
+    jarjar_rules: "jarjar-rules.txt",
+    sdk_version: "30",
+}

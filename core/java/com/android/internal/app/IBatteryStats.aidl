@@ -18,14 +18,21 @@ package com.android.internal.app;
 
 import com.android.internal.os.BatteryStatsImpl;
 
+import android.bluetooth.BluetoothActivityEnergyInfo;
 import android.os.ParcelFileDescriptor;
 import android.os.WorkSource;
+import android.os.connectivity.CellularBatteryStats;
+import android.os.connectivity.WifiActivityEnergyInfo;
+import android.os.connectivity.WifiBatteryStats;
+import android.os.connectivity.GpsBatteryStats;
+import android.os.health.HealthStatsParceler;
 import android.telephony.DataConnectionRealTimeInfo;
+import android.telephony.ModemActivityInfo;
 import android.telephony.SignalStrength;
 
 interface IBatteryStats {
     // These first methods are also called by native code, so must
-    // be kept in sync with frameworks/native/include/binder/IBatteryStats.h
+    // be kept in sync with frameworks/native/libs/binder/include/binder/IBatteryStats.h
     void noteStartSensor(int uid, int sensor);
     void noteStopSensor(int uid, int sensor);
     void noteStartVideo(int uid);
@@ -42,11 +49,13 @@ interface IBatteryStats {
     void noteResetFlashlight();
 
     // Remaining methods are only used in Java.
+    @UnsupportedAppUsage
     byte[] getStatistics();
 
     ParcelFileDescriptor getStatisticsStream();
 
     // Return true if we see the battery as currently charging.
+    @UnsupportedAppUsage
     boolean isCharging();
 
     // Return the computed amount of time remaining on battery, in milliseconds.
@@ -55,6 +64,7 @@ interface IBatteryStats {
 
     // Return the computed amount of time remaining to fully charge, in milliseconds.
     // Returns -1 if nothing could be computed.
+    @UnsupportedAppUsage
     long computeChargeTimeRemaining();
 
     void noteEvent(int code, String name, int uid);
@@ -62,7 +72,7 @@ interface IBatteryStats {
     void noteSyncStart(String name, int uid);
     void noteSyncFinish(String name, int uid);
     void noteJobStart(String name, int uid);
-    void noteJobFinish(String name, int uid);
+    void noteJobFinish(String name, int uid, int stopReason);
 
     void noteStartWakelock(int uid, int pid, String name, String historyName,
             int type, boolean unimportantForLogging);
@@ -75,22 +85,28 @@ interface IBatteryStats {
             String newHistoryName, int newType, boolean newUnimportantForLogging);
     void noteStopWakelockFromSource(in WorkSource ws, int pid, String name, String historyName,
             int type);
+    void noteLongPartialWakelockStart(String name, String historyName, int uid);
+    void noteLongPartialWakelockStartFromSource(String name, String historyName,
+            in WorkSource workSource);
+    void noteLongPartialWakelockFinish(String name, String historyName, int uid);
+    void noteLongPartialWakelockFinishFromSource(String name, String historyName,
+            in WorkSource workSource);
 
     void noteVibratorOn(int uid, long durationMillis);
     void noteVibratorOff(int uid);
-    void noteStartGps(int uid);
-    void noteStopGps(int uid);
+    void noteGpsChanged(in WorkSource oldSource, in WorkSource newSource);
+    void noteGpsSignalQuality(int signalLevel);
     void noteScreenState(int state);
     void noteScreenBrightness(int brightness);
     void noteUserActivity(int uid, int event);
     void noteWakeUp(String reason, int reasonUid);
     void noteInteractive(boolean interactive);
     void noteConnectivityChanged(int type, String extra);
-    void noteMobileRadioPowerState(int powerState, long timestampNs);
+    void noteMobileRadioPowerState(int powerState, long timestampNs, int uid);
     void notePhoneOn();
     void notePhoneOff();
     void notePhoneSignalStrength(in SignalStrength signalStrength);
-    void notePhoneDataConnectionState(int dataType, boolean hasData);
+    void notePhoneDataConnectionState(int dataType, boolean hasData, int serviceType);
     void notePhoneState(int phoneState);
     void noteWifiOn();
     void noteWifiOff();
@@ -112,13 +128,37 @@ interface IBatteryStats {
     void noteWifiScanStoppedFromSource(in WorkSource ws);
     void noteWifiBatchedScanStartedFromSource(in WorkSource ws, int csph);
     void noteWifiBatchedScanStoppedFromSource(in WorkSource ws);
-    void noteWifiMulticastEnabledFromSource(in WorkSource ws);
-    void noteWifiMulticastDisabledFromSource(in WorkSource ws);
-    void noteWifiRadioPowerState(int powerState, long timestampNs);
+    void noteWifiRadioPowerState(int powerState, long timestampNs, int uid);
     void noteNetworkInterfaceType(String iface, int type);
     void noteNetworkStatsEnabled();
-    void noteDeviceIdleMode(boolean enabled, String activeReason, int activeUid);
-    void setBatteryState(int status, int health, int plugType, int level, int temp, int volt);
+    void noteDeviceIdleMode(int mode, String activeReason, int activeUid);
+    void setBatteryState(int status, int health, int plugType, int level, int temp, int volt,
+            int chargeUAh, int chargeFullUAh, long chargeTimeToFullSeconds);
+    @UnsupportedAppUsage
     long getAwakeTimeBattery();
     long getAwakeTimePlugged();
+
+    void noteBleScanStarted(in WorkSource ws, boolean isUnoptimized);
+    void noteBleScanStopped(in WorkSource ws, boolean isUnoptimized);
+    void noteResetBleScan();
+    void noteBleScanResults(in WorkSource ws, int numNewResults);
+
+    /** {@hide} */
+    CellularBatteryStats getCellularBatteryStats();
+
+    /** {@hide} */
+    WifiBatteryStats getWifiBatteryStats();
+
+    /** {@hide} */
+    GpsBatteryStats getGpsBatteryStats();
+
+    HealthStatsParceler takeUidSnapshot(int uid);
+    HealthStatsParceler[] takeUidSnapshots(in int[] uid);
+
+    oneway void noteBluetoothControllerActivity(in BluetoothActivityEnergyInfo info);
+    oneway void noteModemControllerActivity(in ModemActivityInfo info);
+    oneway void noteWifiControllerActivity(in WifiActivityEnergyInfo info);
+
+    /** {@hide} */
+    boolean setChargingStateUpdateDelayMillis(int delay);
 }

@@ -16,6 +16,7 @@
 
 package android.drm;
 
+import android.annotation.NonNull;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -37,14 +38,19 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The main programming interface for the DRM framework. An application must instantiate this class
  * to access DRM agents through the DRM framework.
  *
+ * @deprecated Please use {@link android.media.MediaDrm}
  */
-public class DrmManagerClient {
+@Deprecated
+public class DrmManagerClient implements AutoCloseable {
     /**
      * Indicates that a request was successful or that no error occurred.
      */
@@ -61,6 +67,7 @@ public class DrmManagerClient {
     HandlerThread mEventThread;
     private static final String TAG = "DrmManagerClient";
 
+    private final AtomicBoolean mClosed = new AtomicBoolean();
     private final CloseGuard mCloseGuard = CloseGuard.get();
 
     static {
@@ -117,7 +124,6 @@ public class DrmManagerClient {
 
     private int mUniqueId;
     private long mNativeContext;
-    private volatile boolean mReleased;
     private Context mContext;
     private InfoHandler mInfoHandler;
     private EventHandler mEventHandler;
@@ -264,38 +270,51 @@ public class DrmManagerClient {
             if (mCloseGuard != null) {
                 mCloseGuard.warnIfOpen();
             }
-            release();
+
+            close();
         } finally {
             super.finalize();
         }
     }
 
     /**
-     * Releases resources associated with the current session of DrmManagerClient.
+     * Releases resources associated with the current session of
+     * DrmManagerClient. It is considered good practice to call this method when
+     * the {@link DrmManagerClient} object is no longer needed in your
+     * application. After this method is called, {@link DrmManagerClient} is no
+     * longer usable since it has lost all of its required resource.
      *
-     * It is considered good practice to call this method when the {@link DrmManagerClient} object
-     * is no longer needed in your application. After release() is called,
-     * {@link DrmManagerClient} is no longer usable since it has lost all of its required resource.
+     * This method was added in API 24. In API versions 16 through 23, release()
+     * should be called instead. There is no need to do anything for API
+     * versions prior to 16.
      */
-    public void release() {
-        if (mReleased) return;
-        mReleased = true;
-
-        if (mEventHandler != null) {
-            mEventThread.quit();
-            mEventThread = null;
-        }
-        if (mInfoHandler != null) {
-            mInfoThread.quit();
-            mInfoThread = null;
-        }
-        mEventHandler = null;
-        mInfoHandler = null;
-        mOnEventListener = null;
-        mOnInfoListener = null;
-        mOnErrorListener = null;
-        _release(mUniqueId);
+    @Override
+    public void close() {
         mCloseGuard.close();
+        if (mClosed.compareAndSet(false, true)) {
+            if (mEventHandler != null) {
+                mEventThread.quit();
+                mEventThread = null;
+            }
+            if (mInfoHandler != null) {
+                mInfoThread.quit();
+                mInfoThread = null;
+            }
+            mEventHandler = null;
+            mInfoHandler = null;
+            mOnEventListener = null;
+            mOnInfoListener = null;
+            mOnErrorListener = null;
+            _release(mUniqueId);
+        }
+    }
+
+    /**
+     * @deprecated replaced by {@link #close()}.
+     */
+    @Deprecated
+    public void release() {
+        close();
     }
 
     /**
@@ -353,6 +372,17 @@ public class DrmManagerClient {
 
         String[] drmEngines = new String[descriptions.size()];
         return descriptions.toArray(drmEngines);
+    }
+
+    /**
+     * Retrieves information about all the DRM plug-ins (agents) that are
+     * registered with the DRM framework.
+     *
+     * @return List of all the DRM plug-ins (agents) that are registered with
+     *         the DRM framework.
+     */
+    public @NonNull Collection<DrmSupportInfo> getAvailableDrmSupportInfo() {
+        return Arrays.asList(_getAllSupportInfo(mUniqueId));
     }
 
     /**
@@ -721,7 +751,7 @@ public class DrmManagerClient {
 
     /**
      * Removes all the rights information of every DRM plug-in (agent) associated with
-     * the DRM framework. Will be used during a master reset.
+     * the DRM framework.
      *
      * @return ERROR_NONE for success; ERROR_UNKNOWN for failure.
      */
@@ -817,6 +847,7 @@ public class DrmManagerClient {
      *     content://media/<table_name>/<row_index> (or)
      *     file://sdcard/test.mp4
      *     http://test.com/test.mp4
+     *     https://test.com/test.mp4
      *
      * Here <table_name> shall be "video" or "audio" or "images"
      * <row_index> the index of the content in given table
@@ -829,7 +860,7 @@ public class DrmManagerClient {
                     scheme.equals(ContentResolver.SCHEME_FILE)) {
                 path = uri.getPath();
 
-            } else if (scheme.equals("http")) {
+            } else if (scheme.equals("http") || scheme.equals("https")) {
                 path = uri.toString();
 
             } else if (scheme.equals(ContentResolver.SCHEME_CONTENT)) {

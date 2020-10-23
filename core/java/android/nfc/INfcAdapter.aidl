@@ -28,6 +28,8 @@ import android.nfc.INfcTag;
 import android.nfc.INfcCardEmulation;
 import android.nfc.INfcFCardEmulation;
 import android.nfc.INfcUnlockHandler;
+import android.nfc.ITagRemovedCallback;
+import android.nfc.INfcDta;
 import android.os.Bundle;
 
 /**
@@ -39,7 +41,7 @@ interface INfcAdapter
     INfcCardEmulation getNfcCardEmulationInterface();
     INfcFCardEmulation getNfcFCardEmulationInterface();
     INfcAdapterExtras getNfcAdapterExtrasInterface(in String pkg);
-
+    INfcDta getNfcDtaInterface(in String pkg);
     int getState();
     boolean disable(boolean saveState);
     boolean enable();
@@ -55,6 +57,8 @@ interface INfcAdapter
     oneway void invokeBeam();
     oneway void invokeBeamInternal(in BeamShareData shareData);
 
+    boolean ignore(int nativeHandle, int debounceMs, ITagRemovedCallback callback);
+
     void dispatch(in Tag tag);
 
     void setReaderMode (IBinder b, IAppCallback callback, int flags, in Bundle extras);
@@ -64,4 +68,8 @@ interface INfcAdapter
     void removeNfcUnlockHandler(INfcUnlockHandler unlockHandler);
 
     void verifyNfcPermission();
+    boolean isNfcSecureEnabled();
+    boolean deviceSupportsNfcSecure();
+    boolean setNfcSecure(boolean enable);
+
 }

@@ -16,9 +16,12 @@
 
 package android.content;
 
-import android.text.TextUtils;
-import android.os.Parcelable;
+import android.annotation.Nullable;
+import android.compat.annotation.UnsupportedAppUsage;
+import android.os.Build;
 import android.os.Parcel;
+import android.os.Parcelable;
+import android.text.TextUtils;
 
 /**
  * Value type that represents a SyncAdapterType. This object overrides {@link #equals} and
@@ -28,11 +31,17 @@ public class SyncAdapterType implements Parcelable {
     public final String authority;
     public final String accountType;
     public final boolean isKey;
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private final boolean userVisible;
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private final boolean supportsUploading;
+    @UnsupportedAppUsage
     private final boolean isAlwaysSyncable;
+    @UnsupportedAppUsage
     private final boolean allowParallelSyncs;
+    @UnsupportedAppUsage
     private final String settingsActivity;
+    private final String packageName;
 
     public SyncAdapterType(String authority, String accountType, boolean userVisible,
             boolean supportsUploading) {
@@ -50,6 +59,7 @@ public class SyncAdapterType implements Parcelable {
         this.allowParallelSyncs = false;
         this.settingsActivity = null;
         this.isKey = false;
+        this.packageName = null;
     }
 
     /** @hide */
@@ -57,7 +67,8 @@ public class SyncAdapterType implements Parcelable {
             boolean supportsUploading,
             boolean isAlwaysSyncable,
             boolean allowParallelSyncs,
-            String settingsActivity) {
+            String settingsActivity,
+            String packageName) {
         if (TextUtils.isEmpty(authority)) {
             throw new IllegalArgumentException("the authority must not be empty: " + authority);
         }
@@ -72,8 +83,10 @@ public class SyncAdapterType implements Parcelable {
         this.allowParallelSyncs = allowParallelSyncs;
         this.settingsActivity = settingsActivity;
         this.isKey = false;
+        this.packageName = packageName;
     }
 
+    @UnsupportedAppUsage(maxTargetSdk = Build.VERSION_CODES.P, trackingBug = 115609023)
     private SyncAdapterType(String authority, String accountType) {
         if (TextUtils.isEmpty(authority)) {
             throw new IllegalArgumentException("the authority must not be empty: " + authority);
@@ -89,6 +102,7 @@ public class SyncAdapterType implements Parcelable {
         this.allowParallelSyncs = false;
         this.settingsActivity = null;
         this.isKey = true;
+        this.packageName = null;
     }
 
     public boolean supportsUploading() {
@@ -148,6 +162,16 @@ public class SyncAdapterType implements Parcelable {
         return settingsActivity;
     }
 
+    /**
+     * The package hosting the sync adapter.
+     * @return The package name.
+     *
+     * @hide
+     */
+    public @Nullable String getPackageName() {
+        return packageName;
+    }
+
     public static SyncAdapterType newKey(String authority, String accountType) {
         return new SyncAdapterType(authority, accountType);
     }
@@ -181,6 +205,7 @@ public class SyncAdapterType implements Parcelable {
                     + ", isAlwaysSyncable=" + isAlwaysSyncable
                     + ", allowParallelSyncs=" + allowParallelSyncs
                     + ", settingsActivity=" + settingsActivity
+                    + ", packageName=" + packageName
                     + "}";
         }
     }
@@ -201,6 +226,7 @@ public class SyncAdapterType implements Parcelable {
         dest.writeInt(isAlwaysSyncable ? 1 : 0);
         dest.writeInt(allowParallelSyncs ? 1 : 0);
         dest.writeString(settingsActivity);
+        dest.writeString(packageName);
     }
 
     public SyncAdapterType(Parcel source) {
@@ -211,10 +237,11 @@ public class SyncAdapterType implements Parcelable {
                 source.readInt() != 0,
                 source.readInt() != 0,
                 source.readInt() != 0,
+                source.readString(),
                 source.readString());
     }
 
-    public static final Creator<SyncAdapterType> CREATOR = new Creator<SyncAdapterType>() {
+    public static final @android.annotation.NonNull Creator<SyncAdapterType> CREATOR = new Creator<SyncAdapterType>() {
         public SyncAdapterType createFromParcel(Parcel source) {
             return new SyncAdapterType(source);
         }

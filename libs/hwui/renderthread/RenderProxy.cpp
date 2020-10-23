@@ -18,203 +18,99 @@
 
 #include "DeferredLayerUpdater.h"
 #include "DisplayList.h"
-#include "LayerRenderer.h"
+#include "Properties.h"
+#include "Readback.h"
 #include "Rect.h"
+#include "WebViewFunctorManager.h"
 #include "renderthread/CanvasContext.h"
 #include "renderthread/RenderTask.h"
 #include "renderthread/RenderThread.h"
 #include "utils/Macros.h"
+#include "utils/TimeUtils.h"
+#include "utils/TraceUtils.h"
 
 namespace android {
 namespace uirenderer {
 namespace renderthread {
 
-#define ARGS(method) method ## Args
-
-#define CREATE_BRIDGE0(name) CREATE_BRIDGE(name,,,,,,,,)
-#define CREATE_BRIDGE1(name, a1) CREATE_BRIDGE(name, a1,,,,,,,)
-#define CREATE_BRIDGE2(name, a1, a2) CREATE_BRIDGE(name, a1,a2,,,,,,)
-#define CREATE_BRIDGE3(name, a1, a2, a3) CREATE_BRIDGE(name, a1,a2,a3,,,,,)
-#define CREATE_BRIDGE4(name, a1, a2, a3, a4) CREATE_BRIDGE(name, a1,a2,a3,a4,,,,)
-#define CREATE_BRIDGE5(name, a1, a2, a3, a4, a5) CREATE_BRIDGE(name, a1,a2,a3,a4,a5,,,)
-#define CREATE_BRIDGE6(name, a1, a2, a3, a4, a5, a6) CREATE_BRIDGE(name, a1,a2,a3,a4,a5,a6,,)
-#define CREATE_BRIDGE7(name, a1, a2, a3, a4, a5, a6, a7) CREATE_BRIDGE(name, a1,a2,a3,a4,a5,a6,a7,)
-#define CREATE_BRIDGE(name, a1, a2, a3, a4, a5, a6, a7, a8) \
-    typedef struct { \
-        a1; a2; a3; a4; a5; a6; a7; a8; \
-    } ARGS(name); \
-    static void* Bridge_ ## name(ARGS(name)* args)
-
-#define SETUP_TASK(method) \
-    LOG_ALWAYS_FATAL_IF( METHOD_INVOKE_PAYLOAD_SIZE < sizeof(ARGS(method)), \
-        "METHOD_INVOKE_PAYLOAD_SIZE %zu is smaller than sizeof(" #method "Args) %zu", \
-                METHOD_INVOKE_PAYLOAD_SIZE, sizeof(ARGS(method))); \
-    MethodInvokeRenderTask* task = new MethodInvokeRenderTask((RunnableMethod) Bridge_ ## method); \
-    ARGS(method) *args = (ARGS(method) *) task->payload()
-
-namespace DumpFlags {
-    enum {
-        FrameStats = 1 << 0,
-        Reset      = 1 << 1,
-    };
-};
-
-CREATE_BRIDGE4(createContext, RenderThread* thread, bool translucent,
-        RenderNode* rootRenderNode, IContextFactory* contextFactory) {
-    return new CanvasContext(*args->thread, args->translucent,
-            args->rootRenderNode, args->contextFactory);
-}
-
-RenderProxy::RenderProxy(bool translucent, RenderNode* rootRenderNode, IContextFactory* contextFactory)
-        : mRenderThread(RenderThread::getInstance())
-        , mContext(nullptr) {
-    SETUP_TASK(createContext);
-    args->translucent = translucent;
-    args->rootRenderNode = rootRenderNode;
-    args->thread = &mRenderThread;
-    args->contextFactory = contextFactory;
-    mContext = (CanvasContext*) postAndWait(task);
-    mDrawFrameTask.setContext(&mRenderThread, mContext);
+RenderProxy::RenderProxy(bool translucent, RenderNode* rootRenderNode,
+                         IContextFactory* contextFactory)
+        : mRenderThread(RenderThread::getInstance()), mContext(nullptr) {
+    mContext = mRenderThread.queue().runSync([&]() -> CanvasContext* {
+        return CanvasContext::create(mRenderThread, translucent, rootRenderNode, contextFactory);
+    });
+    mDrawFrameTask.setContext(&mRenderThread, mContext, rootRenderNode);
 }
 
 RenderProxy::~RenderProxy() {
     destroyContext();
 }
 
-CREATE_BRIDGE1(destroyContext, CanvasContext* context) {
-    delete args->context;
-    return nullptr;
-}
-
 void RenderProxy::destroyContext() {
     if (mContext) {
-        SETUP_TASK(destroyContext);
-        args->context = mContext;
-        mContext = nullptr;
-        mDrawFrameTask.setContext(nullptr, nullptr);
+        mDrawFrameTask.setContext(nullptr, nullptr, nullptr);
         // This is also a fence as we need to be certain that there are no
         // outstanding mDrawFrame tasks posted before it is destroyed
-        postAndWait(task);
+        mRenderThread.queue().runSync([this]() { delete mContext; });
+        mContext = nullptr;
     }
-}
-
-CREATE_BRIDGE2(setSwapBehavior, CanvasContext* context, SwapBehavior swapBehavior) {
-    args->context->setSwapBehavior(args->swapBehavior);
-    return nullptr;
 }
 
 void RenderProxy::setSwapBehavior(SwapBehavior swapBehavior) {
-    SETUP_TASK(setSwapBehavior);
-    args->context = mContext;
-    args->swapBehavior = swapBehavior;
-    post(task);
-}
-
-CREATE_BRIDGE1(loadSystemProperties, CanvasContext* context) {
-    bool needsRedraw = false;
-    if (Caches::hasInstance()) {
-        needsRedraw = Properties::load();
-    }
-    if (args->context->profiler().consumeProperties()) {
-        needsRedraw = true;
-    }
-    return (void*) needsRedraw;
+    mRenderThread.queue().post([this, swapBehavior]() { mContext->setSwapBehavior(swapBehavior); });
 }
 
 bool RenderProxy::loadSystemProperties() {
-    SETUP_TASK(loadSystemProperties);
-    args->context = mContext;
-    return (bool) postAndWait(task);
-}
-
-CREATE_BRIDGE2(setName, CanvasContext* context, const char* name) {
-    args->context->setName(std::string(args->name));
-    return nullptr;
+    return mRenderThread.queue().runSync([this]() -> bool {
+        bool needsRedraw = Properties::load();
+        if (mContext->profiler().consumeProperties()) {
+            needsRedraw = true;
+        }
+        return needsRedraw;
+    });
 }
 
 void RenderProxy::setName(const char* name) {
-    SETUP_TASK(setName);
-    args->context = mContext;
-    args->name = name;
-    postAndWait(task); // block since name/value pointers owned by caller
+    // block since name/value pointers owned by caller
+    // TODO: Support move arguments
+    mRenderThread.queue().runSync([this, name]() { mContext->setName(std::string(name)); });
 }
 
-CREATE_BRIDGE2(initialize, CanvasContext* context, ANativeWindow* window) {
-    args->context->initialize(args->window);
-    return nullptr;
+void RenderProxy::setSurface(ANativeWindow* window, bool enableTimeout) {
+    ANativeWindow_acquire(window);
+    mRenderThread.queue().post([this, win = window, enableTimeout]() mutable {
+        mContext->setSurface(win, enableTimeout);
+        ANativeWindow_release(win);
+    });
 }
 
-void RenderProxy::initialize(const sp<ANativeWindow>& window) {
-    SETUP_TASK(initialize);
-    args->context = mContext;
-    args->window = window.get();
-    post(task);
+void RenderProxy::allocateBuffers() {
+    mRenderThread.queue().post([=]() { mContext->allocateBuffers(); });
 }
 
-CREATE_BRIDGE2(updateSurface, CanvasContext* context, ANativeWindow* window) {
-    args->context->updateSurface(args->window);
-    return nullptr;
+bool RenderProxy::pause() {
+    return mRenderThread.queue().runSync([this]() -> bool { return mContext->pauseSurface(); });
 }
 
-void RenderProxy::updateSurface(const sp<ANativeWindow>& window) {
-    SETUP_TASK(updateSurface);
-    args->context = mContext;
-    args->window = window.get();
-    postAndWait(task);
+void RenderProxy::setStopped(bool stopped) {
+    mRenderThread.queue().runSync([this, stopped]() { mContext->setStopped(stopped); });
 }
 
-CREATE_BRIDGE2(pauseSurface, CanvasContext* context, ANativeWindow* window) {
-    return (void*) args->context->pauseSurface(args->window);
+void RenderProxy::setLightAlpha(uint8_t ambientShadowAlpha, uint8_t spotShadowAlpha) {
+    mRenderThread.queue().post(
+            [=]() { mContext->setLightAlpha(ambientShadowAlpha, spotShadowAlpha); });
 }
 
-bool RenderProxy::pauseSurface(const sp<ANativeWindow>& window) {
-    SETUP_TASK(pauseSurface);
-    args->context = mContext;
-    args->window = window.get();
-    return (bool) postAndWait(task);
-}
-
-CREATE_BRIDGE6(setup, CanvasContext* context, int width, int height,
-        float lightRadius, uint8_t ambientShadowAlpha, uint8_t spotShadowAlpha) {
-    args->context->setup(args->width, args->height, args->lightRadius,
-            args->ambientShadowAlpha, args->spotShadowAlpha);
-    return nullptr;
-}
-
-void RenderProxy::setup(int width, int height, float lightRadius,
-        uint8_t ambientShadowAlpha, uint8_t spotShadowAlpha) {
-    SETUP_TASK(setup);
-    args->context = mContext;
-    args->width = width;
-    args->height = height;
-    args->lightRadius = lightRadius;
-    args->ambientShadowAlpha = ambientShadowAlpha;
-    args->spotShadowAlpha = spotShadowAlpha;
-    post(task);
-}
-
-CREATE_BRIDGE2(setLightCenter, CanvasContext* context, Vector3 lightCenter) {
-    args->context->setLightCenter(args->lightCenter);
-    return nullptr;
-}
-
-void RenderProxy::setLightCenter(const Vector3& lightCenter) {
-    SETUP_TASK(setLightCenter);
-    args->context = mContext;
-    args->lightCenter = lightCenter;
-    post(task);
-}
-
-CREATE_BRIDGE2(setOpaque, CanvasContext* context, bool opaque) {
-    args->context->setOpaque(args->opaque);
-    return nullptr;
+void RenderProxy::setLightGeometry(const Vector3& lightCenter, float lightRadius) {
+    mRenderThread.queue().post([=]() { mContext->setLightGeometry(lightCenter, lightRadius); });
 }
 
 void RenderProxy::setOpaque(bool opaque) {
-    SETUP_TASK(setOpaque);
-    args->context = mContext;
-    args->opaque = opaque;
-    post(task);
+    mRenderThread.queue().post([=]() { mContext->setOpaque(opaque); });
+}
+
+void RenderProxy::setWideGamut(bool wideGamut) {
+    mRenderThread.queue().post([=]() { mContext->setWideGamut(wideGamut); });
 }
 
 int64_t* RenderProxy::frameInfo() {
@@ -225,92 +121,49 @@ int RenderProxy::syncAndDrawFrame() {
     return mDrawFrameTask.drawFrame();
 }
 
-CREATE_BRIDGE1(destroy, CanvasContext* context) {
-    args->context->destroy();
-    return nullptr;
-}
-
 void RenderProxy::destroy() {
-    SETUP_TASK(destroy);
-    args->context = mContext;
     // destroyCanvasAndSurface() needs a fence as when it returns the
     // underlying BufferQueue is going to be released from under
     // the render thread.
-    postAndWait(task);
-}
-
-CREATE_BRIDGE2(invokeFunctor, RenderThread* thread, Functor* functor) {
-    CanvasContext::invokeFunctor(*args->thread, args->functor);
-    return nullptr;
+    mRenderThread.queue().runSync([=]() { mContext->destroy(); });
 }
 
 void RenderProxy::invokeFunctor(Functor* functor, bool waitForCompletion) {
     ATRACE_CALL();
     RenderThread& thread = RenderThread::getInstance();
-    SETUP_TASK(invokeFunctor);
-    args->thread = &thread;
-    args->functor = functor;
+    auto invoke = [&thread, functor]() { CanvasContext::invokeFunctor(thread, functor); };
     if (waitForCompletion) {
         // waitForCompletion = true is expected to be fairly rare and only
         // happen in destruction. Thus it should be fine to temporarily
         // create a Mutex
-        staticPostAndWait(task);
+        thread.queue().runSync(std::move(invoke));
     } else {
-        thread.queue(task);
+        thread.queue().post(std::move(invoke));
     }
 }
 
-CREATE_BRIDGE2(runWithGlContext, CanvasContext* context, RenderTask* task) {
-    args->context->runWithGlContext(args->task);
-    return nullptr;
-}
-
-void RenderProxy::runWithGlContext(RenderTask* gltask) {
-    SETUP_TASK(runWithGlContext);
-    args->context = mContext;
-    args->task = gltask;
-    postAndWait(task);
-}
-
-CREATE_BRIDGE2(createTextureLayer, RenderThread* thread, CanvasContext* context) {
-    Layer* layer = args->context->createTextureLayer();
-    if (!layer) return nullptr;
-    return new DeferredLayerUpdater(*args->thread, layer);
+void RenderProxy::destroyFunctor(int functor) {
+    ATRACE_CALL();
+    RenderThread& thread = RenderThread::getInstance();
+    thread.queue().post([=]() { WebViewFunctorManager::instance().destroyFunctor(functor); });
 }
 
 DeferredLayerUpdater* RenderProxy::createTextureLayer() {
-    SETUP_TASK(createTextureLayer);
-    args->context = mContext;
-    args->thread = &mRenderThread;
-    void* retval = postAndWait(task);
-    DeferredLayerUpdater* layer = reinterpret_cast<DeferredLayerUpdater*>(retval);
-    return layer;
-}
-
-CREATE_BRIDGE2(buildLayer, CanvasContext* context, RenderNode* node) {
-    args->context->buildLayer(args->node);
-    return nullptr;
+    return mRenderThread.queue().runSync([this]() -> auto {
+        return mContext->createTextureLayer();
+    });
 }
 
 void RenderProxy::buildLayer(RenderNode* node) {
-    SETUP_TASK(buildLayer);
-    args->context = mContext;
-    args->node = node;
-    postAndWait(task);
-}
-
-CREATE_BRIDGE3(copyLayerInto, CanvasContext* context, DeferredLayerUpdater* layer,
-        SkBitmap* bitmap) {
-    bool success = args->context->copyLayerInto(args->layer, args->bitmap);
-    return (void*) success;
+    mRenderThread.queue().runSync([&]() { mContext->buildLayer(node); });
 }
 
 bool RenderProxy::copyLayerInto(DeferredLayerUpdater* layer, SkBitmap& bitmap) {
-    SETUP_TASK(copyLayerInto);
-    args->context = mContext;
-    args->layer = layer;
-    args->bitmap = &bitmap;
-    return (bool) postAndWait(task);
+    ATRACE_NAME("TextureView#getBitmap");
+    auto& thread = RenderThread::getInstance();
+    return thread.queue().runSync([&]() -> bool {
+        return thread.readback().copyLayerInto(layer, &bitmap) == CopyResult::Success;
+    });
 }
 
 void RenderProxy::pushLayerUpdate(DeferredLayerUpdater* layer) {
@@ -321,208 +174,201 @@ void RenderProxy::cancelLayerUpdate(DeferredLayerUpdater* layer) {
     mDrawFrameTask.removeLayerUpdate(layer);
 }
 
-CREATE_BRIDGE1(detachSurfaceTexture, DeferredLayerUpdater* layer) {
-    args->layer->detachSurfaceTexture();
-    return nullptr;
-}
-
 void RenderProxy::detachSurfaceTexture(DeferredLayerUpdater* layer) {
-    SETUP_TASK(detachSurfaceTexture);
-    args->layer = layer;
-    postAndWait(task);
-}
-
-CREATE_BRIDGE1(destroyHardwareResources, CanvasContext* context) {
-    args->context->destroyHardwareResources();
-    return nullptr;
+    return mRenderThread.queue().runSync([&]() { layer->detachSurfaceTexture(); });
 }
 
 void RenderProxy::destroyHardwareResources() {
-    SETUP_TASK(destroyHardwareResources);
-    args->context = mContext;
-    post(task);
-}
-
-CREATE_BRIDGE2(trimMemory, RenderThread* thread, int level) {
-    CanvasContext::trimMemory(*args->thread, args->level);
-    return nullptr;
+    return mRenderThread.queue().runSync([&]() { mContext->destroyHardwareResources(); });
 }
 
 void RenderProxy::trimMemory(int level) {
     // Avoid creating a RenderThread to do a trimMemory.
     if (RenderThread::hasInstance()) {
         RenderThread& thread = RenderThread::getInstance();
-        SETUP_TASK(trimMemory);
-        args->thread = &thread;
-        args->level = level;
-        thread.queue(task);
+        thread.queue().post([&thread, level]() { CanvasContext::trimMemory(thread, level); });
     }
-}
-
-CREATE_BRIDGE2(overrideProperty, const char* name, const char* value) {
-    Properties::overrideProperty(args->name, args->value);
-    return nullptr;
 }
 
 void RenderProxy::overrideProperty(const char* name, const char* value) {
-    SETUP_TASK(overrideProperty);
-    args->name = name;
-    args->value = value;
-    staticPostAndWait(task); // expensive, but block here since name/value pointers owned by caller
+    // expensive, but block here since name/value pointers owned by caller
+    RenderThread::getInstance().queue().runSync(
+            [&]() { Properties::overrideProperty(name, value); });
 }
-
-CREATE_BRIDGE0(fence) {
-    // Intentionally empty
-    return nullptr;
-}
-
-template <typename T>
-void UNUSED(T t) {}
 
 void RenderProxy::fence() {
-    SETUP_TASK(fence);
-    UNUSED(args);
-    postAndWait(task);
+    mRenderThread.queue().runSync([]() {});
 }
 
-void RenderProxy::staticFence() {
-    SETUP_TASK(fence);
-    UNUSED(args);
-    staticPostAndWait(task);
-}
-
-CREATE_BRIDGE1(stopDrawing, CanvasContext* context) {
-    args->context->stopDrawing();
-    return nullptr;
+int RenderProxy::maxTextureSize() {
+    static int maxTextureSize = RenderThread::getInstance().queue().runSync(
+            []() { return DeviceInfo::get()->maxTextureSize(); });
+    return maxTextureSize;
 }
 
 void RenderProxy::stopDrawing() {
-    SETUP_TASK(stopDrawing);
-    args->context = mContext;
-    postAndWait(task);
-}
-
-CREATE_BRIDGE1(notifyFramePending, CanvasContext* context) {
-    args->context->notifyFramePending();
-    return nullptr;
+    mRenderThread.queue().runSync([this]() { mContext->stopDrawing(); });
 }
 
 void RenderProxy::notifyFramePending() {
-    SETUP_TASK(notifyFramePending);
-    args->context = mContext;
-    mRenderThread.queueAtFront(task);
-}
-
-CREATE_BRIDGE4(dumpProfileInfo, CanvasContext* context, RenderThread* thread,
-        int fd, int dumpFlags) {
-    args->context->profiler().dumpData(args->fd);
-    args->thread->jankTracker().dump(args->fd);
-    if (args->dumpFlags & DumpFlags::FrameStats) {
-        args->context->dumpFrames(args->fd);
-    }
-    if (args->dumpFlags & DumpFlags::Reset) {
-        args->context->resetFrameStats();
-    }
-    return nullptr;
+    mRenderThread.queue().post([this]() { mContext->notifyFramePending(); });
 }
 
 void RenderProxy::dumpProfileInfo(int fd, int dumpFlags) {
-    SETUP_TASK(dumpProfileInfo);
-    args->context = mContext;
-    args->thread = &mRenderThread;
-    args->fd = fd;
-    args->dumpFlags = dumpFlags;
-    postAndWait(task);
-}
-
-CREATE_BRIDGE1(resetProfileInfo, CanvasContext* context) {
-    args->context->resetFrameStats();
-    return nullptr;
+    mRenderThread.queue().runSync([&]() {
+        mContext->profiler().dumpData(fd);
+        if (dumpFlags & DumpFlags::FrameStats) {
+            mContext->dumpFrames(fd);
+        }
+        if (dumpFlags & DumpFlags::JankStats) {
+            mRenderThread.globalProfileData()->dump(fd);
+        }
+        if (dumpFlags & DumpFlags::Reset) {
+            mContext->resetFrameStats();
+        }
+    });
 }
 
 void RenderProxy::resetProfileInfo() {
-    SETUP_TASK(resetProfileInfo);
-    args->context = mContext;
-    postAndWait(task);
+    mRenderThread.queue().runSync([=]() { mContext->resetFrameStats(); });
 }
 
-CREATE_BRIDGE2(dumpGraphicsMemory, int fd, RenderThread* thread) {
-    args->thread->jankTracker().dump(args->fd);
-
-    FILE *file = fdopen(args->fd, "a");
-    if (Caches::hasInstance()) {
-        String8 cachesLog;
-        Caches::getInstance().dumpMemoryUsage(cachesLog);
-        fprintf(file, "\nCaches:\n%s\n", cachesLog.string());
-    } else {
-        fprintf(file, "\nNo caches instance.\n");
-    }
-    fflush(file);
-    return nullptr;
+uint32_t RenderProxy::frameTimePercentile(int percentile) {
+    return mRenderThread.queue().runSync([&]() -> auto {
+        return mRenderThread.globalProfileData()->findPercentile(percentile);
+    });
 }
 
 void RenderProxy::dumpGraphicsMemory(int fd) {
-    if (!RenderThread::hasInstance()) return;
-    SETUP_TASK(dumpGraphicsMemory);
-    args->fd = fd;
-    args->thread = &RenderThread::getInstance();
-    staticPostAndWait(task);
-}
-
-CREATE_BRIDGE4(setTextureAtlas, RenderThread* thread, GraphicBuffer* buffer, int64_t* map, size_t size) {
-    CanvasContext::setTextureAtlas(*args->thread, args->buffer, args->map, args->size);
-    args->buffer->decStrong(nullptr);
-    return nullptr;
-}
-
-void RenderProxy::setTextureAtlas(const sp<GraphicBuffer>& buffer, int64_t* map, size_t size) {
-    SETUP_TASK(setTextureAtlas);
-    args->thread = &mRenderThread;
-    args->buffer = buffer.get();
-    args->buffer->incStrong(nullptr);
-    args->map = map;
-    args->size = size;
-    post(task);
-}
-
-CREATE_BRIDGE2(setProcessStatsBuffer, RenderThread* thread, int fd) {
-    args->thread->jankTracker().switchStorageToAshmem(args->fd);
-    close(args->fd);
-    return nullptr;
+    if (RenderThread::hasInstance()) {
+        auto& thread = RenderThread::getInstance();
+        thread.queue().runSync([&]() { thread.dumpGraphicsMemory(fd); });
+    }
 }
 
 void RenderProxy::setProcessStatsBuffer(int fd) {
-    SETUP_TASK(setProcessStatsBuffer);
-    args->thread = &mRenderThread;
-    args->fd = dup(fd);
-    post(task);
+    auto& rt = RenderThread::getInstance();
+    rt.queue().post([&rt, fd = dup(fd)]() {
+        rt.globalProfileData().switchStorageToAshmem(fd);
+        close(fd);
+    });
 }
 
-void RenderProxy::post(RenderTask* task) {
-    mRenderThread.queue(task);
+void RenderProxy::rotateProcessStatsBuffer() {
+    auto& rt = RenderThread::getInstance();
+    rt.queue().post([&rt]() { rt.globalProfileData().rotateStorage(); });
 }
 
-void* RenderProxy::postAndWait(MethodInvokeRenderTask* task) {
-    void* retval;
-    task->setReturnPtr(&retval);
-    SignalingRenderTask syncTask(task, &mSyncMutex, &mSyncCondition);
-    AutoMutex _lock(mSyncMutex);
-    mRenderThread.queue(&syncTask);
-    mSyncCondition.wait(mSyncMutex);
-    return retval;
+int RenderProxy::getRenderThreadTid() {
+    return mRenderThread.getTid();
 }
 
-void* RenderProxy::staticPostAndWait(MethodInvokeRenderTask* task) {
+void RenderProxy::addRenderNode(RenderNode* node, bool placeFront) {
+    mRenderThread.queue().post([=]() { mContext->addRenderNode(node, placeFront); });
+}
+
+void RenderProxy::removeRenderNode(RenderNode* node) {
+    mRenderThread.queue().post([=]() { mContext->removeRenderNode(node); });
+}
+
+void RenderProxy::drawRenderNode(RenderNode* node) {
+    mRenderThread.queue().runSync([=]() { mContext->prepareAndDraw(node); });
+}
+
+void RenderProxy::setContentDrawBounds(int left, int top, int right, int bottom) {
+    mDrawFrameTask.setContentDrawBounds(left, top, right, bottom);
+}
+
+void RenderProxy::setPictureCapturedCallback(
+        const std::function<void(sk_sp<SkPicture>&&)>& callback) {
+    mRenderThread.queue().post(
+            [this, cb = callback]() { mContext->setPictureCapturedCallback(cb); });
+}
+
+void RenderProxy::setFrameCallback(std::function<void(int64_t)>&& callback) {
+    mDrawFrameTask.setFrameCallback(std::move(callback));
+}
+
+void RenderProxy::setFrameCompleteCallback(std::function<void(int64_t)>&& callback) {
+    mDrawFrameTask.setFrameCompleteCallback(std::move(callback));
+}
+
+void RenderProxy::addFrameMetricsObserver(FrameMetricsObserver* observerPtr) {
+    mRenderThread.queue().post([this, observer = sp{observerPtr}]() {
+        mContext->addFrameMetricsObserver(observer.get());
+    });
+}
+
+void RenderProxy::removeFrameMetricsObserver(FrameMetricsObserver* observerPtr) {
+    mRenderThread.queue().post([this, observer = sp{observerPtr}]() {
+        mContext->removeFrameMetricsObserver(observer.get());
+    });
+}
+
+void RenderProxy::setForceDark(bool enable) {
+    mRenderThread.queue().post([this, enable]() { mContext->setForceDark(enable); });
+}
+
+void RenderProxy::setRenderAheadDepth(int renderAhead) {
+    mRenderThread.queue().post(
+            [context = mContext, renderAhead] { context->setRenderAheadDepth(renderAhead); });
+}
+
+int RenderProxy::copySurfaceInto(ANativeWindow* window, int left, int top, int right, int bottom,
+                                 SkBitmap* bitmap) {
+    auto& thread = RenderThread::getInstance();
+    return static_cast<int>(thread.queue().runSync([&]() -> auto {
+        return thread.readback().copySurfaceInto(window, Rect(left, top, right, bottom), bitmap);
+    }));
+}
+
+void RenderProxy::prepareToDraw(Bitmap& bitmap) {
+    // If we haven't spun up a hardware accelerated window yet, there's no
+    // point in precaching these bitmaps as it can't impact jank.
+    // We also don't know if we even will spin up a hardware-accelerated
+    // window or not.
+    if (!RenderThread::hasInstance()) return;
+    RenderThread* renderThread = &RenderThread::getInstance();
+    bitmap.ref();
+    auto task = [renderThread, &bitmap]() {
+        CanvasContext::prepareToDraw(*renderThread, &bitmap);
+        bitmap.unref();
+    };
+    nsecs_t lastVsync = renderThread->timeLord().latestVsync();
+    nsecs_t estimatedNextVsync = lastVsync + renderThread->timeLord().frameIntervalNanos();
+    nsecs_t timeToNextVsync = estimatedNextVsync - systemTime(SYSTEM_TIME_MONOTONIC);
+    // We expect the UI thread to take 4ms and for RT to be active from VSYNC+4ms to
+    // VSYNC+12ms or so, so aim for the gap during which RT is expected to
+    // be idle
+    // TODO: Make this concept a first-class supported thing? RT could use
+    // knowledge of pending draws to better schedule this task
+    if (timeToNextVsync > -6_ms && timeToNextVsync < 1_ms) {
+        renderThread->queue().postAt(estimatedNextVsync + 8_ms, task);
+    } else {
+        renderThread->queue().post(task);
+    }
+}
+
+int RenderProxy::copyHWBitmapInto(Bitmap* hwBitmap, SkBitmap* bitmap) {
+    ATRACE_NAME("HardwareBitmap readback");
     RenderThread& thread = RenderThread::getInstance();
-    void* retval;
-    task->setReturnPtr(&retval);
-    Mutex mutex;
-    Condition condition;
-    SignalingRenderTask syncTask(task, &mutex, &condition);
-    AutoMutex _lock(mutex);
-    thread.queue(&syncTask);
-    condition.wait(mutex);
-    return retval;
+    if (gettid() == thread.getTid()) {
+        // TODO: fix everything that hits this. We should never be triggering a readback ourselves.
+        return (int)thread.readback().copyHWBitmapInto(hwBitmap, bitmap);
+    } else {
+        return thread.queue().runSync(
+                [&]() -> int { return (int)thread.readback().copyHWBitmapInto(hwBitmap, bitmap); });
+    }
+}
+
+void RenderProxy::disableVsync() {
+    Properties::disableVsync = true;
+}
+
+void RenderProxy::preload() {
+    // Create RenderThread object and start the thread. Then preload Vulkan/EGL driver.
+    auto& thread = RenderThread::getInstance();
+    thread.queue().post([&thread]() { thread.preload(); });
 }
 
 } /* namespace renderthread */

@@ -22,12 +22,12 @@
 
 #include "android_runtime/AndroidRuntime.h"
 #include "jni.h"
-#include "JNIHelp.h"
+#include <nativehelper/JNIHelp.h>
 
-#include <binder/IServiceManager.h>
-#include <media/ICrypto.h>
-#include <media/IMediaPlayerService.h>
+#include <cutils/properties.h>
 #include <media/stagefright/foundation/ADebug.h>
+#include <mediadrm/DrmUtils.h>
+#include <mediadrm/ICrypto.h>
 
 namespace android {
 
@@ -50,6 +50,9 @@ JCrypto::JCrypto(
 }
 
 JCrypto::~JCrypto() {
+    if (mCrypto != NULL) {
+        mCrypto->destroyPlugin();
+    }
     mCrypto.clear();
 
     JNIEnv *env = AndroidRuntime::getJNIEnv();
@@ -60,25 +63,7 @@ JCrypto::~JCrypto() {
 
 // static
 sp<ICrypto> JCrypto::MakeCrypto() {
-    sp<IServiceManager> sm = defaultServiceManager();
-
-    sp<IBinder> binder =
-        sm->getService(String16("media.player"));
-
-    sp<IMediaPlayerService> service =
-        interface_cast<IMediaPlayerService>(binder);
-
-    if (service == NULL) {
-        return NULL;
-    }
-
-    sp<ICrypto> crypto = service->makeCrypto();
-
-    if (crypto == NULL || (crypto->initCheck() != OK && crypto->initCheck() != NO_INIT)) {
-        return NULL;
-    }
-
-    return crypto;
+    return DrmUtils::MakeCrypto();
 }
 
 // static

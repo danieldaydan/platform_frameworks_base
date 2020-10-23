@@ -27,14 +27,17 @@ import android.view.InputChannel;
  * @hide
  */
 oneway interface ITvInputService {
-    void registerCallback(ITvInputServiceCallback callback);
+    void registerCallback(in ITvInputServiceCallback callback);
     void unregisterCallback(in ITvInputServiceCallback callback);
-    void createSession(in InputChannel channel, ITvInputSessionCallback callback,
-            in String inputId);
+    void createSession(in InputChannel channel, in ITvInputSessionCallback callback,
+            in String inputId, in String sessionId);
+    void createRecordingSession(in ITvInputSessionCallback callback, in String inputId,
+            in String sessionId);
 
     // For hardware TvInputService
     void notifyHardwareAdded(in TvInputHardwareInfo hardwareInfo);
     void notifyHardwareRemoved(in TvInputHardwareInfo hardwareInfo);
     void notifyHdmiDeviceAdded(in HdmiDeviceInfo deviceInfo);
     void notifyHdmiDeviceRemoved(in HdmiDeviceInfo deviceInfo);
+    void notifyHdmiDeviceUpdated(in HdmiDeviceInfo deviceInfo);
 }

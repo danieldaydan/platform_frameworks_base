@@ -16,6 +16,7 @@
 
 package android.app;
 
+import android.app.backup.IBackupCallback;
 import android.app.backup.IBackupManager;
 import android.os.ParcelFileDescriptor;
  
@@ -41,17 +42,20 @@ oneway interface IBackupAgent {
      * @param newState Read-write file, empty when onBackup() is called,
      *        where the new state blob is to be recorded.
      *
+     * @param quota Quota reported by the transport for this backup operation (in bytes).
+     *
      * @param token Opaque token identifying this transaction.  This must
      *        be echoed back to the backup service binder once the new
      *        data has been written to the data and newState files.
      *
-     * @param callbackBinder Binder on which to indicate operation completion,
-     *        passed here as a convenience to the agent.
+     * @param callbackBinder Binder on which to indicate operation completion.
+     *
+     * @param transportFlags Flags with additional information about the transport.
      */
     void doBackup(in ParcelFileDescriptor oldState,
             in ParcelFileDescriptor data,
             in ParcelFileDescriptor newState,
-            int token, IBackupManager callbackBinder);
+            long quotaBytes, IBackupCallback callbackBinder, int transportFlags);
 
     /**
      * Restore an entire data snapshot to the application.
@@ -77,8 +81,21 @@ oneway interface IBackupAgent {
      *        passed here as a convenience to the agent.
      */
     void doRestore(in ParcelFileDescriptor data,
-            int appVersionCode, in ParcelFileDescriptor newState,
+            long appVersionCode, in ParcelFileDescriptor newState,
             int token, IBackupManager callbackBinder);
+
+     /**
+     * Restore an entire data snapshot to the application and pass the list of excluded keys to the
+     * backup agent.
+     *
+     * @param excludedKeys List of keys to be excluded from the restore. It will be passed to the
+     *        backup agent to make it aware of what data has been removed (in case it has any
+     *        application-level implications) as well as the data that should be removed by the
+     *        agent itself.
+     */
+    void doRestoreWithExcludedKeys(in ParcelFileDescriptor data,
+            long appVersionCode, in ParcelFileDescriptor newState,
+            int token, IBackupManager callbackBinder, in List<String> excludedKeys);
 
     /**
      * Perform a "full" backup to the given file descriptor.  The output file is presumed
@@ -89,6 +106,8 @@ oneway interface IBackupAgent {
      *        The data must be formatted correctly for the resulting archive to be
      *        legitimate, so that will be tightly controlled by the available API.
      *
+     * @param quota Quota reported by the transport for this backup operation (in bytes).
+     *
      * @param token Opaque token identifying this transaction.  This must
      *        be echoed back to the backup service binder once the agent is
      *        finished restoring the application based on the restore data
@@ -96,13 +115,39 @@ oneway interface IBackupAgent {
      *
      * @param callbackBinder Binder on which to indicate operation completion,
      *        passed here as a convenience to the agent.
+     *
+     * @param transportFlags Flags with additional information about transport.
      */
-    void doFullBackup(in ParcelFileDescriptor data, int token, IBackupManager callbackBinder);
+    void doFullBackup(in ParcelFileDescriptor data, long quotaBytes, int token,
+            IBackupManager callbackBinder, int transportFlags);
 
     /**
      * Estimate how much data a full backup will deliver
      */
-    void doMeasureFullBackup(int token, IBackupManager callbackBinder);
+    void doMeasureFullBackup(long quotaBytes, int token, IBackupManager callbackBinder,
+            int transportFlags);
+
+    /**
+     * Tells the application agent that the backup data size exceeded current transport quota.
+     * Later calls to {@link #onBackup(ParcelFileDescriptor, BackupDataOutput, ParcelFileDescriptor)}
+     * and {@link #onFullBackup(FullBackupDataOutput)} could use this information
+     * to reduce backup size under the limit.
+     * However, the quota can change, so do not assume that the value passed in here is absolute,
+     * similarly all subsequent backups should not be restricted to this size.
+     * This callback will be invoked before data has been put onto the wire in a preflight check,
+     * so it is relatively inexpensive to hit your quota.
+     * Apps that hit quota repeatedly without dealing with it can be subject to having their backup
+     * schedule reduced.
+     * The {@code quotaBytes} is a loose guideline b/c of metadata added by the backupmanager
+     * so apps should be more aggressive in trimming their backup set.
+     *
+     * @param backupDataBytes Expected or already processed amount of data.
+     *                        Could be less than total backup size if backup process was interrupted
+     *                        before finish of processing all backup data.
+     * @param quotaBytes Current amount of backup data that is allowed for the app.
+     * @param callbackBinder Binder on which to indicate operation completion.
+     */
+    void doQuotaExceeded(long backupDataBytes, long quotaBytes, IBackupCallback callbackBinder);
 
     /**
      * Restore a single "file" to the application.  The file was typically obtained from

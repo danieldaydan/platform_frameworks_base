@@ -16,13 +16,18 @@
 
 package com.android.systemui.statusbar.policy;
 
-import android.app.ActivityManager;
+import android.app.StatusBarManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.TypedArray;
+import android.graphics.Rect;
+import android.icu.text.DateTimePatternGenerator;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Parcelable;
+import android.os.SystemClock;
 import android.os.UserHandle;
 import android.text.Spannable;
 import android.text.SpannableStringBuilder;
@@ -30,26 +35,56 @@ import android.text.format.DateFormat;
 import android.text.style.CharacterStyle;
 import android.text.style.RelativeSizeSpan;
 import android.util.AttributeSet;
+import android.view.Display;
+import android.view.View;
 import android.widget.TextView;
 
+import com.android.settingslib.Utils;
 import com.android.systemui.DemoMode;
+import com.android.systemui.Dependency;
+import com.android.systemui.FontSizeUtils;
 import com.android.systemui.R;
+import com.android.systemui.broadcast.BroadcastDispatcher;
+import com.android.systemui.plugins.DarkIconDispatcher;
+import com.android.systemui.plugins.DarkIconDispatcher.DarkReceiver;
+import com.android.systemui.settings.CurrentUserTracker;
+import com.android.systemui.statusbar.CommandQueue;
+import com.android.systemui.statusbar.phone.StatusBarIconController;
+import com.android.systemui.statusbar.policy.ConfigurationController.ConfigurationListener;
+import com.android.systemui.tuner.TunerService;
+import com.android.systemui.tuner.TunerService.Tunable;
 
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Locale;
 import java.util.TimeZone;
 
-import libcore.icu.LocaleData;
-
 /**
  * Digital clock for the status bar.
  */
-public class Clock extends TextView implements DemoMode {
+public class Clock extends TextView implements DemoMode, Tunable, CommandQueue.Callbacks,
+        DarkReceiver, ConfigurationListener {
+
+    public static final String CLOCK_SECONDS = "clock_seconds";
+    private static final String CLOCK_SUPER_PARCELABLE = "clock_super_parcelable";
+    private static final String CURRENT_USER_ID = "current_user_id";
+    private static final String VISIBLE_BY_POLICY = "visible_by_policy";
+    private static final String VISIBLE_BY_USER = "visible_by_user";
+    private static final String SHOW_SECONDS = "show_seconds";
+    private static final String VISIBILITY = "visibility";
+
+    private final CurrentUserTracker mCurrentUserTracker;
+    private final CommandQueue mCommandQueue;
+    private int mCurrentUserId;
+
+    private boolean mClockVisibleByPolicy = true;
+    private boolean mClockVisibleByUser = true;
+
     private boolean mAttached;
     private Calendar mCalendar;
     private String mClockFormatString;
     private SimpleDateFormat mClockFormat;
+    private SimpleDateFormat mContentDescriptionFormat;
     private Locale mLocale;
 
     private static final int AM_PM_STYLE_NORMAL  = 0;
@@ -57,10 +92,22 @@ public class Clock extends TextView implements DemoMode {
     private static final int AM_PM_STYLE_GONE    = 2;
 
     private final int mAmPmStyle;
+    private final boolean mShowDark;
+    private boolean mShowSeconds;
+    private Handler mSecondsHandler;
 
-    public Clock(Context context) {
-        this(context, null);
-    }
+    /**
+     * Whether we should use colors that adapt based on wallpaper/the scrim behind quick settings
+     * for text.
+     */
+    private boolean mUseWallpaperTextColor;
+
+    /**
+     * Color to be set on this {@link TextView}, when wallpaperTextColor is <b>not</b> utilized.
+     */
+    private int mNonAdaptedColor;
+
+    private final BroadcastDispatcher mBroadcastDispatcher;
 
     public Clock(Context context, AttributeSet attrs) {
         this(context, attrs, 0);
@@ -68,14 +115,58 @@ public class Clock extends TextView implements DemoMode {
 
     public Clock(Context context, AttributeSet attrs, int defStyle) {
         super(context, attrs, defStyle);
+        mCommandQueue = Dependency.get(CommandQueue.class);
         TypedArray a = context.getTheme().obtainStyledAttributes(
                 attrs,
                 R.styleable.Clock,
                 0, 0);
         try {
             mAmPmStyle = a.getInt(R.styleable.Clock_amPmStyle, AM_PM_STYLE_GONE);
+            mShowDark = a.getBoolean(R.styleable.Clock_showDark, true);
+            mNonAdaptedColor = getCurrentTextColor();
         } finally {
             a.recycle();
+        }
+        mBroadcastDispatcher = Dependency.get(BroadcastDispatcher.class);
+        mCurrentUserTracker = new CurrentUserTracker(mBroadcastDispatcher) {
+            @Override
+            public void onUserSwitched(int newUserId) {
+                mCurrentUserId = newUserId;
+            }
+        };
+    }
+
+    @Override
+    public Parcelable onSaveInstanceState() {
+        Bundle bundle = new Bundle();
+        bundle.putParcelable(CLOCK_SUPER_PARCELABLE, super.onSaveInstanceState());
+        bundle.putInt(CURRENT_USER_ID, mCurrentUserId);
+        bundle.putBoolean(VISIBLE_BY_POLICY, mClockVisibleByPolicy);
+        bundle.putBoolean(VISIBLE_BY_USER, mClockVisibleByUser);
+        bundle.putBoolean(SHOW_SECONDS, mShowSeconds);
+        bundle.putInt(VISIBILITY, getVisibility());
+
+        return bundle;
+    }
+
+    @Override
+    public void onRestoreInstanceState(Parcelable state) {
+        if (state == null || !(state instanceof Bundle)) {
+            super.onRestoreInstanceState(state);
+            return;
+        }
+
+        Bundle bundle = (Bundle) state;
+        Parcelable superState = bundle.getParcelable(CLOCK_SUPER_PARCELABLE);
+        super.onRestoreInstanceState(superState);
+        if (bundle.containsKey(CURRENT_USER_ID)) {
+            mCurrentUserId = bundle.getInt(CURRENT_USER_ID);
+        }
+        mClockVisibleByPolicy = bundle.getBoolean(VISIBLE_BY_POLICY, true);
+        mClockVisibleByUser = bundle.getBoolean(VISIBLE_BY_USER, true);
+        mShowSeconds = bundle.getBoolean(SHOW_SECONDS, false);
+        if (bundle.containsKey(VISIBILITY)) {
+            super.setVisibility(bundle.getInt(VISIBILITY));
         }
     }
 
@@ -93,70 +184,216 @@ public class Clock extends TextView implements DemoMode {
             filter.addAction(Intent.ACTION_CONFIGURATION_CHANGED);
             filter.addAction(Intent.ACTION_USER_SWITCHED);
 
-            getContext().registerReceiverAsUser(mIntentReceiver, UserHandle.ALL, filter,
-                    null, getHandler());
+            // NOTE: This receiver could run before this method returns, as it's not dispatching
+            // on the main thread and BroadcastDispatcher may not need to register with Context.
+            // The receiver will return immediately if the view does not have a Handler yet.
+            mBroadcastDispatcher.registerReceiverWithHandler(mIntentReceiver, filter,
+                    Dependency.get(Dependency.TIME_TICK_HANDLER), UserHandle.ALL);
+            Dependency.get(TunerService.class).addTunable(this, CLOCK_SECONDS,
+                    StatusBarIconController.ICON_HIDE_LIST);
+            mCommandQueue.addCallback(this);
+            if (mShowDark) {
+                Dependency.get(DarkIconDispatcher.class).addDarkReceiver(this);
+            }
+            mCurrentUserTracker.startTracking();
+            mCurrentUserId = mCurrentUserTracker.getCurrentUserId();
         }
-
-        // NOTE: It's safe to do these after registering the receiver since the receiver always runs
-        // in the main thread, therefore the receiver can't run before this method returns.
 
         // The time zone may have changed while the receiver wasn't registered, so update the Time
         mCalendar = Calendar.getInstance(TimeZone.getDefault());
+        mClockFormatString = "";
 
         // Make sure we update to the current time
         updateClock();
+        updateClockVisibility();
+        updateShowSeconds();
     }
 
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         if (mAttached) {
-            getContext().unregisterReceiver(mIntentReceiver);
+            mBroadcastDispatcher.unregisterReceiver(mIntentReceiver);
             mAttached = false;
+            Dependency.get(TunerService.class).removeTunable(this);
+            mCommandQueue.removeCallback(this);
+            if (mShowDark) {
+                Dependency.get(DarkIconDispatcher.class).removeDarkReceiver(this);
+            }
+            mCurrentUserTracker.stopTracking();
         }
     }
 
     private final BroadcastReceiver mIntentReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
+            // If the handler is null, it means we received a broadcast while the view has not
+            // finished being attached or in the process of being detached.
+            // In that case, do not post anything.
+            Handler handler = getHandler();
+            if (handler == null) return;
+
             String action = intent.getAction();
             if (action.equals(Intent.ACTION_TIMEZONE_CHANGED)) {
-                String tz = intent.getStringExtra("time-zone");
-                mCalendar = Calendar.getInstance(TimeZone.getTimeZone(tz));
-                if (mClockFormat != null) {
-                    mClockFormat.setTimeZone(mCalendar.getTimeZone());
-                }
+                String tz = intent.getStringExtra(Intent.EXTRA_TIMEZONE);
+                handler.post(() -> {
+                    mCalendar = Calendar.getInstance(TimeZone.getTimeZone(tz));
+                    if (mClockFormat != null) {
+                        mClockFormat.setTimeZone(mCalendar.getTimeZone());
+                    }
+                });
             } else if (action.equals(Intent.ACTION_CONFIGURATION_CHANGED)) {
                 final Locale newLocale = getResources().getConfiguration().locale;
-                if (! newLocale.equals(mLocale)) {
-                    mLocale = newLocale;
-                    mClockFormatString = ""; // force refresh
-                }
+                handler.post(() -> {
+                    if (!newLocale.equals(mLocale)) {
+                        mLocale = newLocale;
+                        mClockFormatString = ""; // force refresh
+                    }
+                });
             }
-            updateClock();
+            handler.post(() -> updateClock());
         }
     };
+
+    @Override
+    public void setVisibility(int visibility) {
+        if (visibility == View.VISIBLE && !shouldBeVisible()) {
+            return;
+        }
+
+        super.setVisibility(visibility);
+    }
+
+    public void setClockVisibleByUser(boolean visible) {
+        mClockVisibleByUser = visible;
+        updateClockVisibility();
+    }
+
+    public void setClockVisibilityByPolicy(boolean visible) {
+        mClockVisibleByPolicy = visible;
+        updateClockVisibility();
+    }
+
+    private boolean shouldBeVisible() {
+        return mClockVisibleByPolicy && mClockVisibleByUser;
+    }
+
+    private void updateClockVisibility() {
+        boolean visible = shouldBeVisible();
+        int visibility = visible ? View.VISIBLE : View.GONE;
+        super.setVisibility(visibility);
+    }
 
     final void updateClock() {
         if (mDemoMode) return;
         mCalendar.setTimeInMillis(System.currentTimeMillis());
         setText(getSmallTime());
+        setContentDescription(mContentDescriptionFormat.format(mCalendar.getTime()));
+    }
+
+    @Override
+    public void onTuningChanged(String key, String newValue) {
+        if (CLOCK_SECONDS.equals(key)) {
+            mShowSeconds = TunerService.parseIntegerSwitch(newValue, false);
+            updateShowSeconds();
+        } else if (StatusBarIconController.ICON_HIDE_LIST.equals(key)) {
+            setClockVisibleByUser(!StatusBarIconController.getIconHideList(getContext(), newValue)
+                    .contains("clock"));
+            updateClockVisibility();
+        }
+    }
+
+    @Override
+    public void disable(int displayId, int state1, int state2, boolean animate) {
+        if (displayId != getDisplay().getDisplayId()) {
+            return;
+        }
+        boolean clockVisibleByPolicy = (state1 & StatusBarManager.DISABLE_CLOCK) == 0;
+        if (clockVisibleByPolicy != mClockVisibleByPolicy) {
+            setClockVisibilityByPolicy(clockVisibleByPolicy);
+        }
+    }
+
+    @Override
+    public void onDarkChanged(Rect area, float darkIntensity, int tint) {
+        mNonAdaptedColor = DarkIconDispatcher.getTint(area, this, tint);
+        if (!mUseWallpaperTextColor) {
+            setTextColor(mNonAdaptedColor);
+        }
+    }
+
+    @Override
+    public void onDensityOrFontScaleChanged() {
+        FontSizeUtils.updateFontSize(this, R.dimen.status_bar_clock_size);
+        setPaddingRelative(
+                mContext.getResources().getDimensionPixelSize(
+                        R.dimen.status_bar_clock_starting_padding),
+                0,
+                mContext.getResources().getDimensionPixelSize(
+                        R.dimen.status_bar_clock_end_padding),
+                0);
+    }
+
+    /**
+     * Sets whether the clock uses the wallpaperTextColor. If we're not using it, we'll revert back
+     * to dark-mode-based/tinted colors.
+     *
+     * @param shouldUseWallpaperTextColor whether we should use wallpaperTextColor for text color
+     */
+    public void useWallpaperTextColor(boolean shouldUseWallpaperTextColor) {
+        if (shouldUseWallpaperTextColor == mUseWallpaperTextColor) {
+            return;
+        }
+        mUseWallpaperTextColor = shouldUseWallpaperTextColor;
+
+        if (mUseWallpaperTextColor) {
+            setTextColor(Utils.getColorAttr(mContext, R.attr.wallpaperTextColor));
+        } else {
+            setTextColor(mNonAdaptedColor);
+        }
+    }
+
+    private void updateShowSeconds() {
+        if (mShowSeconds) {
+            // Wait until we have a display to start trying to show seconds.
+            if (mSecondsHandler == null && getDisplay() != null) {
+                mSecondsHandler = new Handler();
+                if (getDisplay().getState() == Display.STATE_ON) {
+                    mSecondsHandler.postAtTime(mSecondTick,
+                            SystemClock.uptimeMillis() / 1000 * 1000 + 1000);
+                }
+                IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_OFF);
+                filter.addAction(Intent.ACTION_SCREEN_ON);
+                mBroadcastDispatcher.registerReceiver(mScreenReceiver, filter);
+            }
+        } else {
+            if (mSecondsHandler != null) {
+                mBroadcastDispatcher.unregisterReceiver(mScreenReceiver);
+                mSecondsHandler.removeCallbacks(mSecondTick);
+                mSecondsHandler = null;
+                updateClock();
+            }
+        }
     }
 
     private final CharSequence getSmallTime() {
         Context context = getContext();
-        boolean is24 = DateFormat.is24HourFormat(context, ActivityManager.getCurrentUser());
-        LocaleData d = LocaleData.get(context.getResources().getConfiguration().locale);
+        boolean is24 = DateFormat.is24HourFormat(context, mCurrentUserId);
+        DateTimePatternGenerator dtpg = DateTimePatternGenerator.getInstance(
+                context.getResources().getConfiguration().locale);
 
         final char MAGIC1 = '\uEF00';
         final char MAGIC2 = '\uEF01';
 
         SimpleDateFormat sdf;
-        String format = is24 ? d.timeFormat_Hm : d.timeFormat_hm;
+        String format = mShowSeconds
+                ? is24 ? dtpg.getBestPattern("Hms") : dtpg.getBestPattern("hms")
+                : is24 ? dtpg.getBestPattern("Hm") : dtpg.getBestPattern("hm");
         if (!format.equals(mClockFormatString)) {
+            mContentDescriptionFormat = new SimpleDateFormat(format);
             /*
              * Search for an unquoted "a" in the format string, so we can
-             * add dummy characters around it to let us find it again after
+             * add marker characters around it to let us find it again after
              * formatting and change its size.
              */
             if (mAmPmStyle != AM_PM_STYLE_NORMAL) {
@@ -232,8 +469,7 @@ public class Clock extends TextView implements DemoMode {
             } else if (hhmm != null && hhmm.length() == 4) {
                 int hh = Integer.parseInt(hhmm.substring(0, 2));
                 int mm = Integer.parseInt(hhmm.substring(2));
-                boolean is24 = DateFormat.is24HourFormat(
-                        getContext(), ActivityManager.getCurrentUser());
+                boolean is24 = DateFormat.is24HourFormat(getContext(), mCurrentUserId);
                 if (is24) {
                     mCalendar.set(Calendar.HOUR_OF_DAY, hh);
                 } else {
@@ -242,7 +478,35 @@ public class Clock extends TextView implements DemoMode {
                 mCalendar.set(Calendar.MINUTE, mm);
             }
             setText(getSmallTime());
+            setContentDescription(mContentDescriptionFormat.format(mCalendar.getTime()));
         }
     }
+
+    private final BroadcastReceiver mScreenReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                if (mSecondsHandler != null) {
+                    mSecondsHandler.removeCallbacks(mSecondTick);
+                }
+            } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                if (mSecondsHandler != null) {
+                    mSecondsHandler.postAtTime(mSecondTick,
+                            SystemClock.uptimeMillis() / 1000 * 1000 + 1000);
+                }
+            }
+        }
+    };
+
+    private final Runnable mSecondTick = new Runnable() {
+        @Override
+        public void run() {
+            if (mCalendar != null) {
+                updateClock();
+            }
+            mSecondsHandler.postAtTime(this, SystemClock.uptimeMillis() / 1000 * 1000 + 1000);
+        }
+    };
 }
 

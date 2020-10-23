@@ -16,25 +16,30 @@
 
 package android.telecom;
 
-import com.android.internal.telecom.IConnectionService;
-import com.android.internal.telecom.IVideoCallback;
-import com.android.internal.telecom.IVideoProvider;
-
+import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.SystemApi;
 import android.hardware.camera2.CameraManager;
 import android.net.Uri;
+import android.os.BadParcelableException;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.RemoteException;
+import android.telecom.Logging.Session;
 import android.view.Surface;
 
+import com.android.internal.telecom.IConnectionService;
+import com.android.internal.telecom.IVideoCallback;
+import com.android.internal.telecom.IVideoProvider;
+
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * A connection provided to a {@link ConnectionService} by another {@code ConnectionService}
@@ -88,6 +93,17 @@ public final class RemoteConnection {
         public void onConnectionCapabilitiesChanged(
                 RemoteConnection connection,
                 int connectionCapabilities) {}
+
+        /**
+         * Indicates that the call properties of this {@code RemoteConnection} have changed.
+         * See {@link #getConnectionProperties()}.
+         *
+         * @param connection The {@code RemoteConnection} invoking this method.
+         * @param connectionProperties The new properties of the {@code RemoteConnection}.
+         */
+        public void onConnectionPropertiesChanged(
+                RemoteConnection connection,
+                int connectionProperties) {}
 
         /**
          * Invoked when the post-dial sequence in the outgoing {@code Connection} has reached a
@@ -209,6 +225,52 @@ public final class RemoteConnection {
          * @param extras The extras containing other information associated with the connection.
          */
         public void onExtrasChanged(RemoteConnection connection, @Nullable Bundle extras) {}
+
+        /**
+         * Handles a connection event propagated to this {@link RemoteConnection}.
+         * <p>
+         * Connection events originate from {@link Connection#sendConnectionEvent(String, Bundle)}.
+         *
+         * @param connection The {@code RemoteConnection} invoking this method.
+         * @param event The connection event.
+         * @param extras Extras associated with the event.
+         */
+        public void onConnectionEvent(RemoteConnection connection, String event, Bundle extras) {}
+
+        /**
+         * Indicates that a RTT session was successfully established on this
+         * {@link RemoteConnection}. See {@link Connection#sendRttInitiationSuccess()}.
+         * @hide
+         * @param connection The {@code RemoteConnection} invoking this method.
+         */
+        public void onRttInitiationSuccess(RemoteConnection connection) {}
+
+        /**
+         * Indicates that a RTT session failed to be established on this
+         * {@link RemoteConnection}. See {@link Connection#sendRttInitiationFailure()}.
+         * @hide
+         * @param connection The {@code RemoteConnection} invoking this method.
+         * @param reason One of the reason codes defined in {@link Connection.RttModifyStatus},
+         *               with the exception of
+         *               {@link Connection.RttModifyStatus#SESSION_MODIFY_REQUEST_SUCCESS}.
+         */
+        public void onRttInitiationFailure(RemoteConnection connection, int reason) {}
+
+        /**
+         * Indicates that an established RTT session was terminated remotely on this
+         * {@link RemoteConnection}. See {@link Connection#sendRttSessionRemotelyTerminated()}
+         * @hide
+         * @param connection The {@code RemoteConnection} invoking this method.
+         */
+        public void onRttSessionRemotelyTerminated(RemoteConnection connection) {}
+
+        /**
+         * Indicates that the remote user on this {@link RemoteConnection} has requested an upgrade
+         * to an RTT session. See {@link Connection#sendRemoteRttRequest()}
+         * @hide
+         * @param connection The {@code RemoteConnection} invoking this method.
+         */
+        public void onRemoteRttRequest(RemoteConnection connection) {}
     }
 
     /**
@@ -386,6 +448,10 @@ public final class RemoteConnection {
 
         private final IVideoProvider mVideoProviderBinder;
 
+        private final String mCallingPackage;
+
+        private final int mTargetSdkVersion;
+
         /**
          * ConcurrentHashMap constructor params: 8 is initial table size, 0.9f is
          * load factor before resizing, 1 means we only expect a single thread to
@@ -394,8 +460,12 @@ public final class RemoteConnection {
         private final Set<Callback> mCallbacks = Collections.newSetFromMap(
                 new ConcurrentHashMap<Callback, Boolean>(8, 0.9f, 1));
 
-        VideoProvider(IVideoProvider videoProviderBinder) {
+        VideoProvider(IVideoProvider videoProviderBinder, String callingPackage,
+                      int targetSdkVersion) {
+
             mVideoProviderBinder = videoProviderBinder;
+            mCallingPackage = callingPackage;
+            mTargetSdkVersion = targetSdkVersion;
             try {
                 mVideoProviderBinder.addVideoCallback(mVideoCallbackServant.getStub().asBinder());
             } catch (RemoteException e) {
@@ -430,7 +500,7 @@ public final class RemoteConnection {
          */
         public void setCamera(String cameraId) {
             try {
-                mVideoProviderBinder.setCamera(cameraId);
+                mVideoProviderBinder.setCamera(cameraId, mCallingPackage, mTargetSdkVersion);
             } catch (RemoteException e) {
             }
         }
@@ -577,6 +647,7 @@ public final class RemoteConnection {
     private boolean mRingbackRequested;
     private boolean mConnected;
     private int mConnectionCapabilities;
+    private int mConnectionProperties;
     private int mVideoState;
     private VideoProvider mVideoProvider;
     private boolean mIsVoipAudioMode;
@@ -587,6 +658,7 @@ public final class RemoteConnection {
     private int mCallerDisplayNamePresentation;
     private RemoteConference mConference;
     private Bundle mExtras;
+    private String mCallingPackageAbbreviation;
 
     /**
      * @hide
@@ -599,13 +671,20 @@ public final class RemoteConnection {
         mConnectionService = connectionService;
         mConnected = true;
         mState = Connection.STATE_INITIALIZING;
+        if (request != null && request.getExtras() != null
+                && request.getExtras().containsKey(
+                        Connection.EXTRA_REMOTE_CONNECTION_ORIGINATING_PACKAGE_NAME)) {
+            String callingPackage = request.getExtras().getString(
+                    Connection.EXTRA_REMOTE_CONNECTION_ORIGINATING_PACKAGE_NAME);
+            mCallingPackageAbbreviation = Log.getPackageAbbreviation(callingPackage);
+        }
     }
 
     /**
      * @hide
      */
     RemoteConnection(String callId, IConnectionService connectionService,
-            ParcelableConnection connection) {
+            ParcelableConnection connection, String callingPackage, int targetSdkVersion) {
         mConnectionId = callId;
         mConnectionService = connectionService;
         mConnected = true;
@@ -613,8 +692,15 @@ public final class RemoteConnection {
         mDisconnectCause = connection.getDisconnectCause();
         mRingbackRequested = connection.isRingbackRequested();
         mConnectionCapabilities = connection.getConnectionCapabilities();
+        mConnectionProperties = connection.getConnectionProperties();
         mVideoState = connection.getVideoState();
-        mVideoProvider = new RemoteConnection.VideoProvider(connection.getVideoProvider());
+        IVideoProvider videoProvider = connection.getVideoProvider();
+        if (videoProvider != null) {
+            mVideoProvider = new RemoteConnection.VideoProvider(videoProvider, callingPackage,
+                    targetSdkVersion);
+        } else {
+            mVideoProvider = null;
+        }
         mIsVoipAudioMode = connection.getIsVoipAudioMode();
         mStatusHints = connection.getStatusHints();
         mAddress = connection.getHandle();
@@ -622,6 +708,15 @@ public final class RemoteConnection {
         mCallerDisplayName = connection.getCallerDisplayName();
         mCallerDisplayNamePresentation = connection.getCallerDisplayNamePresentation();
         mConference = null;
+        putExtras(connection.getExtras());
+
+        // Stash the original connection ID as it exists in the source ConnectionService.
+        // Telecom will use this to avoid adding duplicates later.
+        // See comments on Connection.EXTRA_ORIGINAL_CONNECTION_ID for more information.
+        Bundle newExtras = new Bundle();
+        newExtras.putString(Connection.EXTRA_ORIGINAL_CONNECTION_ID, callId);
+        putExtras(newExtras);
+        mCallingPackageAbbreviation = Log.getPackageAbbreviation(callingPackage);
     }
 
     /**
@@ -705,6 +800,16 @@ public final class RemoteConnection {
      */
     public int getConnectionCapabilities() {
         return mConnectionCapabilities;
+    }
+
+    /**
+     * Obtains the properties of this {@code RemoteConnection}.
+     *
+     * @return A bitmask of the properties of the {@code RemoteConnection}, as defined in the
+     *         {@code PROPERTY_*} constants in class {@link Connection}.
+     */
+    public int getConnectionProperties() {
+        return mConnectionProperties;
     }
 
     /**
@@ -806,11 +911,15 @@ public final class RemoteConnection {
      * Instructs this {@code RemoteConnection} to abort.
      */
     public void abort() {
+        Log.startSession("RC.a", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.abort(mConnectionId);
+                mConnectionService.abort(mConnectionId, Log.getExternalSession(
+                        mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -818,11 +927,15 @@ public final class RemoteConnection {
      * Instructs this {@link Connection#STATE_RINGING} {@code RemoteConnection} to answer.
      */
     public void answer() {
+        Log.startSession("RC.an", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.answer(mConnectionId);
+               mConnectionService.answer(mConnectionId, Log.getExternalSession(
+                       mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -832,11 +945,15 @@ public final class RemoteConnection {
      * @hide
      */
     public void answer(int videoState) {
+        Log.startSession("RC.an2", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.answerVideo(mConnectionId, videoState);
+                mConnectionService.answerVideo(mConnectionId, videoState,
+                        Log.getExternalSession(mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -844,11 +961,15 @@ public final class RemoteConnection {
      * Instructs this {@link Connection#STATE_RINGING} {@code RemoteConnection} to reject.
      */
     public void reject() {
+        Log.startSession("RC.r", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.reject(mConnectionId);
+                mConnectionService.reject(mConnectionId, Log.getExternalSession(
+                        mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -856,11 +977,15 @@ public final class RemoteConnection {
      * Instructs this {@code RemoteConnection} to go on hold.
      */
     public void hold() {
+        Log.startSession("RC.h", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.hold(mConnectionId);
+                mConnectionService.hold(mConnectionId, Log.getExternalSession(
+                        mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -868,11 +993,15 @@ public final class RemoteConnection {
      * Instructs this {@link Connection#STATE_HOLDING} call to release from hold.
      */
     public void unhold() {
+        Log.startSession("RC.u", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.unhold(mConnectionId);
+                mConnectionService.unhold(mConnectionId, Log.getExternalSession(
+                        mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -880,11 +1009,15 @@ public final class RemoteConnection {
      * Instructs this {@code RemoteConnection} to disconnect.
      */
     public void disconnect() {
+        Log.startSession("RC.d", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.disconnect(mConnectionId);
+                mConnectionService.disconnect(mConnectionId, Log.getExternalSession(
+                        mCallingPackageAbbreviation));
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -898,11 +1031,14 @@ public final class RemoteConnection {
      *         value must be one of {@code '0'} through {@code '9'}, {@code '*'} or {@code '#'}.
      */
     public void playDtmfTone(char digit) {
+        Log.startSession("RC.pDT", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.playDtmfTone(mConnectionId, digit);
+                mConnectionService.playDtmfTone(mConnectionId, digit, null /*Session.Info*/);
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -914,11 +1050,14 @@ public final class RemoteConnection {
      * currently playing, this method will do nothing.
      */
     public void stopDtmfTone() {
+        Log.startSession("RC.sDT", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.stopDtmfTone(mConnectionId);
+                mConnectionService.stopDtmfTone(mConnectionId, null /*Session.Info*/);
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -944,9 +1083,48 @@ public final class RemoteConnection {
      * @param proceed Whether or not to continue with the post-dial sequence.
      */
     public void postDialContinue(boolean proceed) {
+        Log.startSession("RC.pDC", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.onPostDialContinue(mConnectionId, proceed);
+                mConnectionService.onPostDialContinue(mConnectionId, proceed,
+                        null /*Session.Info*/);
+            }
+        } catch (RemoteException ignored) {
+            // bliss
+        } finally {
+            Log.endSession();
+        }
+    }
+
+    /**
+     * Instructs this {@link RemoteConnection} to pull itself to the local device.
+     * <p>
+     * See {@link Call#pullExternalCall()} for more information.
+     */
+    public void pullExternalCall() {
+        Log.startSession("RC.pEC", getActiveOwnerInfo());
+        try {
+            if (mConnected) {
+                mConnectionService.pullExternalCall(mConnectionId, null /*Session.Info*/);
+            }
+        } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
+        }
+    }
+
+    /**
+     * Instructs this {@link RemoteConnection} to initiate a conference with a list of
+     * participants.
+     * <p>
+     *
+     * @param participants with which conference call will be formed.
+     */
+    public void addConferenceParticipants(@NonNull List<Uri> participants) {
+        try {
+            if (mConnected) {
+                mConnectionService.addConferenceParticipants(mConnectionId, participants,
+                        null /*Session.Info*/);
             }
         } catch (RemoteException ignored) {
         }
@@ -957,7 +1135,7 @@ public final class RemoteConnection {
      *
      * @param state The audio state of this {@code RemoteConnection}.
      * @hide
-     * @deprecated Use {@link #setCallAudioState(CallAudioState) instead.
+     * @deprecated Use {@link #setCallAudioState(CallAudioState)} instead.
      */
     @SystemApi
     @Deprecated
@@ -971,11 +1149,79 @@ public final class RemoteConnection {
      * @param state The audio state of this {@code RemoteConnection}.
      */
     public void setCallAudioState(CallAudioState state) {
+        Log.startSession("RC.sCAS", getActiveOwnerInfo());
         try {
             if (mConnected) {
-                mConnectionService.onCallAudioStateChanged(mConnectionId, state);
+                mConnectionService.onCallAudioStateChanged(mConnectionId, state,
+                        null /*Session.Info*/);
             }
         } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
+        }
+    }
+
+    /**
+     * Notifies this {@link RemoteConnection} that the user has requested an RTT session.
+     * @param rttTextStream The object that should be used to send text to or receive text from
+     *                      the in-call app.
+     * @hide
+     */
+    public void startRtt(@NonNull Connection.RttTextStream rttTextStream) {
+        Log.startSession("RC.sR", getActiveOwnerInfo());
+        try {
+            if (mConnected) {
+                mConnectionService.startRtt(mConnectionId, rttTextStream.getFdFromInCall(),
+                        rttTextStream.getFdToInCall(), null /*Session.Info*/);
+            }
+        } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
+        }
+    }
+
+    /**
+     * Notifies this {@link RemoteConnection} that it should terminate any existing RTT
+     * session. No response to Telecom is needed for this method.
+     * @hide
+     */
+    public void stopRtt() {
+        Log.startSession("RC.stR", getActiveOwnerInfo());
+        try {
+            if (mConnected) {
+                mConnectionService.stopRtt(mConnectionId, null /*Session.Info*/);
+            }
+        } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
+        }
+    }
+
+    /**
+     * Notifies this {@link RemoteConnection} of a response to a previous remotely-initiated RTT
+     * upgrade request sent via {@link Connection#sendRemoteRttRequest}.
+     * Acceptance of the request is indicated by the supplied {@link RttTextStream} being non-null,
+     * and rejection is indicated by {@code rttTextStream} being {@code null}
+     * @hide
+     * @param rttTextStream The object that should be used to send text to or receive text from
+     *                      the in-call app.
+     */
+    public void sendRttUpgradeResponse(@Nullable Connection.RttTextStream rttTextStream) {
+        Log.startSession("RC.sRUR", getActiveOwnerInfo());
+        try {
+            if (mConnected) {
+                if (rttTextStream == null) {
+                    mConnectionService.respondToRttUpgradeRequest(mConnectionId,
+                            null, null, null /*Session.Info*/);
+                } else {
+                    mConnectionService.respondToRttUpgradeRequest(mConnectionId,
+                            rttTextStream.getFdFromInCall(), rttTextStream.getFdToInCall(),
+                            null /*Session.Info*/);
+                }
+            }
+        } catch (RemoteException ignored) {
+        } finally {
+            Log.endSession();
         }
     }
 
@@ -998,6 +1244,22 @@ public final class RemoteConnection {
      */
     public RemoteConference getConference() {
         return mConference;
+    }
+
+    /**
+     * Get the owner info for the currently active session.  We want to make sure that any owner
+     * info from the original call into the connection manager gets retained so that the full
+     * context of the calls can be traced down to Telephony.
+     * Example: Telecom will provide owner info in it's external session info that indicates
+     * 'cast' as the calling owner.
+     * @return The active owner
+     */
+    private String getActiveOwnerInfo() {
+        Session.Info info = Log.getExternalSession();
+        if (info == null) {
+            return null;
+        }
+        return info.ownerInfo;
     }
 
     /** {@hide} */
@@ -1081,6 +1343,23 @@ public final class RemoteConnection {
                 @Override
                 public void run() {
                     callback.onConnectionCapabilitiesChanged(connection, connectionCapabilities);
+                }
+            });
+        }
+    }
+
+    /**
+     * @hide
+     */
+    void setConnectionProperties(final int connectionProperties) {
+        mConnectionProperties = connectionProperties;
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(new Runnable() {
+                @Override
+                public void run() {
+                    callback.onConnectionPropertiesChanged(connection, connectionProperties);
                 }
             });
         }
@@ -1277,20 +1556,102 @@ public final class RemoteConnection {
     }
 
     /** @hide */
-    void setExtras(final Bundle extras) {
-        mExtras = extras;
+    void putExtras(final Bundle extras) {
+        if (extras == null) {
+            return;
+        }
+        if (mExtras == null) {
+            mExtras = new Bundle();
+        }
+        try {
+            mExtras.putAll(extras);
+        } catch (BadParcelableException bpe) {
+            Log.w(this, "putExtras: could not unmarshal extras; exception = " + bpe);
+        }
+
+        notifyExtrasChanged();
+    }
+
+    /** @hide */
+    void removeExtras(List<String> keys) {
+        if (mExtras == null || keys == null || keys.isEmpty()) {
+            return;
+        }
+        for (String key : keys) {
+            mExtras.remove(key);
+        }
+
+        notifyExtrasChanged();
+    }
+
+    private void notifyExtrasChanged() {
         for (CallbackRecord record : mCallbackRecords) {
             final RemoteConnection connection = this;
             final Callback callback = record.getCallback();
             record.getHandler().post(new Runnable() {
                 @Override
                 public void run() {
-                    callback.onExtrasChanged(connection, extras);
+                    callback.onExtrasChanged(connection, mExtras);
                 }
             });
         }
     }
 
+    /** @hide */
+    void onConnectionEvent(final String event, final Bundle extras) {
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(new Runnable() {
+                @Override
+                public void run() {
+                    callback.onConnectionEvent(connection, event, extras);
+                }
+            });
+        }
+    }
+
+    /** @hide */
+    void onRttInitiationSuccess() {
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(
+                    () -> callback.onRttInitiationSuccess(connection));
+        }
+    }
+
+    /** @hide */
+    void onRttInitiationFailure(int reason) {
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(
+                    () -> callback.onRttInitiationFailure(connection, reason));
+        }
+    }
+
+    /** @hide */
+    void onRttSessionRemotelyTerminated() {
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(
+                    () -> callback.onRttSessionRemotelyTerminated(connection));
+        }
+    }
+
+    /** @hide */
+    void onRemoteRttRequest() {
+        for (CallbackRecord record : mCallbackRecords) {
+            final RemoteConnection connection = this;
+            final Callback callback = record.getCallback();
+            record.getHandler().post(
+                    () -> callback.onRemoteRttRequest(connection));
+        }
+    }
+
+    /**
     /**
      * Create a RemoteConnection represents a failure, and which will be in
      * {@link Connection#STATE_DISCONNECTED}. Attempting to use it for anything will almost

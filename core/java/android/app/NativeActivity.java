@@ -16,6 +16,7 @@
 
 package android.app;
 
+import android.compat.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
@@ -70,6 +71,7 @@ public class NativeActivity extends Activity implements SurfaceHolder.Callback2,
     private NativeContentView mNativeContentView;
     private InputMethodManager mIMM;
 
+    @UnsupportedAppUsage
     private long mNativeHandle;
     
     private InputQueue mCurInputQueue;
@@ -85,6 +87,7 @@ public class NativeActivity extends Activity implements SurfaceHolder.Callback2,
 
     private boolean mDestroyed;
     
+    @UnsupportedAppUsage
     private native long loadNativeCode(String path, String funcname, MessageQueue queue,
             String internalDataPath, String obbPath, String externalDataPath, int sdkVersion,
             AssetManager assetMgr, byte[] savedState, ClassLoader classLoader, String libraryPath);
@@ -124,8 +127,8 @@ public class NativeActivity extends Activity implements SurfaceHolder.Callback2,
         String libname = "main";
         String funcname = "ANativeActivity_onCreate";
         ActivityInfo ai;
-        
-        mIMM = (InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
+
+        mIMM = getSystemService(InputMethodManager.class);
 
         getWindow().takeSurface(this);
         getWindow().takeInputQueue(this);
@@ -312,18 +315,22 @@ public class NativeActivity extends Activity implements SurfaceHolder.Callback2,
         }
     }
 
+    @UnsupportedAppUsage
     void setWindowFlags(int flags, int mask) {
         getWindow().setFlags(flags, mask);
     }
     
+    @UnsupportedAppUsage
     void setWindowFormat(int format) {
         getWindow().setFormat(format);
     }
 
+    @UnsupportedAppUsage
     void showIme(int mode) {
         mIMM.showSoftInput(mNativeContentView, mode);
     }
 
+    @UnsupportedAppUsage
     void hideIme(int mode) {
         mIMM.hideSoftInputFromWindow(mNativeContentView.getWindowToken(), mode);
     }

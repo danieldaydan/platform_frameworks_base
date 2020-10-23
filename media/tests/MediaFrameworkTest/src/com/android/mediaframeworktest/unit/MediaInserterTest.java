@@ -16,6 +16,15 @@
 
 package com.android.mediaframeworktest.unit;
 
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.argThat;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import android.content.ContentProviderClient;
 import android.content.ContentValues;
 import android.content.IContentProvider;
 import android.media.MediaInserter;
@@ -27,14 +36,16 @@ import android.provider.MediaStore.Video;
 import android.test.InstrumentationTestCase;
 import android.test.suitebuilder.annotation.SmallTest;
 
-import org.easymock.EasyMock;
-import org.easymock.IArgumentMatcher;
+import org.mockito.ArgumentMatcher;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
 
 public class MediaInserterTest extends InstrumentationTestCase {
 
+    private static final String TEST_FEATURE_ID = "testFeature";
     private MediaInserter mMediaInserter;
     private static final int TEST_BUFFER_SIZE = 10;
-    private IContentProvider mMockProvider;
+    private @Mock IContentProvider mMockProvider;
     private String mPackageName;
 
     private int mFilesCounter;
@@ -48,41 +59,37 @@ public class MediaInserterTest extends InstrumentationTestCase {
     private static final Uri sImagesUri = Images.Media.getContentUri(sVolumeName);
     private static final Uri sFilesUri = Files.getContentUri(sVolumeName);
 
-    private static class MediaUriMatcher implements IArgumentMatcher {
-        private Uri mUri;
+    private static class MediaUriMatcher implements ArgumentMatcher<Uri> {
+        private final Uri mUri;
 
         private MediaUriMatcher(Uri uri) {
             mUri = uri;
         }
 
         @Override
-        public boolean matches(Object argument) {
-            if (!(argument instanceof Uri)) {
-                return false;
-            }
-
-            Uri actualUri = (Uri) argument;
-            if (actualUri == mUri) return true;
-            return false;
+        public boolean matches(Uri actualUri) {
+            return actualUri == mUri;
         }
 
         @Override
-        public void appendTo(StringBuffer buffer) {
-            buffer.append("expected a TableUri '").append(mUri).append("'");
+        public String toString() {
+            return "expected a TableUri '" + mUri.toString() + "'";
         }
+    }
 
-        private static Uri expectMediaUri(Uri in) {
-            EasyMock.reportMatcher(new MediaUriMatcher(in));
-            return null;
-        }
+    private static Uri eqUri(Uri in) {
+        return argThat(new MediaUriMatcher(in));
     }
 
     @Override
     protected void setUp() throws Exception {
         super.setUp();
-        mMockProvider = EasyMock.createMock(IContentProvider.class);
-        mMediaInserter = new MediaInserter(mMockProvider,
-        mPackageName, TEST_BUFFER_SIZE);
+        MockitoAnnotations.initMocks(this);
+
+        final ContentProviderClient client = new ContentProviderClient(
+                getInstrumentation().getContext().createFeatureContext(TEST_FEATURE_ID)
+                        .getContentResolver(), mMockProvider, true);
+        mMediaInserter = new MediaInserter(client, TEST_BUFFER_SIZE);
         mPackageName = getInstrumentation().getContext().getPackageName();
         mFilesCounter = 0;
         mAudioCounter = 0;
@@ -132,61 +139,52 @@ public class MediaInserterTest extends InstrumentationTestCase {
 
     @SmallTest
     public void testInsertContentsLessThanBufferSize() throws Exception {
-        EasyMock.replay(mMockProvider);
-
         fillBuffer(sFilesUri, TEST_BUFFER_SIZE - 4);
         fillBuffer(sAudioUri, TEST_BUFFER_SIZE - 3);
         fillBuffer(sVideoUri, TEST_BUFFER_SIZE - 2);
         fillBuffer(sImagesUri, TEST_BUFFER_SIZE - 1);
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, never()).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any());
     }
 
     @SmallTest
     public void testInsertContentsEqualToBufferSize() throws Exception {
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-                (Uri) EasyMock.anyObject(), (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(4);
-        EasyMock.replay(mMockProvider);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any())).thenReturn(1);
 
         fillBuffer(sFilesUri, TEST_BUFFER_SIZE);
         fillBuffer(sAudioUri, TEST_BUFFER_SIZE);
         fillBuffer(sVideoUri, TEST_BUFFER_SIZE);
         fillBuffer(sImagesUri, TEST_BUFFER_SIZE);
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, times(4)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any());
     }
 
     @SmallTest
     public void testInsertContentsMoreThanBufferSize() throws Exception {
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-                (Uri) EasyMock.anyObject(), (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(4);
-        EasyMock.replay(mMockProvider);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any())).thenReturn(1);
 
         fillBuffer(sFilesUri, TEST_BUFFER_SIZE + 1);
         fillBuffer(sAudioUri, TEST_BUFFER_SIZE + 2);
         fillBuffer(sVideoUri, TEST_BUFFER_SIZE + 3);
         fillBuffer(sImagesUri, TEST_BUFFER_SIZE + 4);
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, times(4)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any());
     }
 
     @SmallTest
     public void testFlushAllWithEmptyContents() throws Exception {
-        EasyMock.replay(mMockProvider);
-
         mMediaInserter.flushAll();
-
-        EasyMock.verify(mMockProvider);
     }
 
     @SmallTest
     public void testFlushAllWithSomeContents() throws Exception {
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-                (Uri) EasyMock.anyObject(), (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(4);
-        EasyMock.replay(mMockProvider);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any())).thenReturn(1);
 
         fillBuffer(sFilesUri, TEST_BUFFER_SIZE - 4);
         fillBuffer(sAudioUri, TEST_BUFFER_SIZE - 3);
@@ -194,15 +192,14 @@ public class MediaInserterTest extends InstrumentationTestCase {
         fillBuffer(sImagesUri, TEST_BUFFER_SIZE - 1);
         mMediaInserter.flushAll();
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, times(4)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any());
     }
 
     @SmallTest
     public void testInsertContentsAfterFlushAll() throws Exception {
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-                (Uri) EasyMock.anyObject(), (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(8);
-        EasyMock.replay(mMockProvider);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any())).thenReturn(1);
 
         fillBuffer(sFilesUri, TEST_BUFFER_SIZE - 4);
         fillBuffer(sAudioUri, TEST_BUFFER_SIZE - 3);
@@ -215,28 +212,20 @@ public class MediaInserterTest extends InstrumentationTestCase {
         fillBuffer(sVideoUri, TEST_BUFFER_SIZE + 3);
         fillBuffer(sImagesUri, TEST_BUFFER_SIZE + 4);
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, times(8)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), any(),
+                any());
     }
 
     @SmallTest
     public void testInsertContentsWithDifferentSizePerContentType() throws Exception {
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-        MediaUriMatcher.expectMediaUri(sFilesUri),
-                (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(1);
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-        MediaUriMatcher.expectMediaUri(sAudioUri),
-                (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(2);
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-        MediaUriMatcher.expectMediaUri(sVideoUri),
-                (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(3);
-        EasyMock.expect(mMockProvider.bulkInsert(mPackageName,
-        MediaUriMatcher.expectMediaUri(sImagesUri),
-                (ContentValues[]) EasyMock.anyObject())).andReturn(1);
-        EasyMock.expectLastCall().times(4);
-        EasyMock.replay(mMockProvider);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), eqUri(sFilesUri),
+                any())).thenReturn(1);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), eqUri(sAudioUri),
+                any())).thenReturn(1);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), eqUri(sVideoUri),
+                any())).thenReturn(1);
+        when(mMockProvider.bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID), eqUri(sImagesUri),
+                any())).thenReturn(1);
 
         for (int i = 0; i < TEST_BUFFER_SIZE; ++i) {
             fillBuffer(sFilesUri, 1);
@@ -245,6 +234,13 @@ public class MediaInserterTest extends InstrumentationTestCase {
             fillBuffer(sImagesUri, 4);
         }
 
-        EasyMock.verify(mMockProvider);
+        verify(mMockProvider, times(1)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID),
+                eqUri(sFilesUri), any());
+        verify(mMockProvider, times(2)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID),
+                eqUri(sAudioUri), any());
+        verify(mMockProvider, times(3)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID),
+                eqUri(sVideoUri), any());
+        verify(mMockProvider, times(4)).bulkInsert(eq(mPackageName), eq(TEST_FEATURE_ID),
+                eqUri(sImagesUri), any());
     }
 }

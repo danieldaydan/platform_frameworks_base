@@ -16,9 +16,8 @@
 
 package android.os;
 
-import android.os.Build;
-import android.test.suitebuilder.annotation.SmallTest;
-import android.util.Log;
+import androidx.test.filters.SmallTest;
+
 import junit.framework.Assert;
 import junit.framework.TestCase;
 
@@ -61,7 +60,7 @@ public class BuildTest extends TestCase {
         assertNotEmpty("BRAND", Build.BRAND);
         assertNotEmpty("MODEL", Build.MODEL);
         assertNotEmpty("VERSION.INCREMENTAL", Build.VERSION.INCREMENTAL);
-        assertNotEmpty("VERSION.RELEASE", Build.VERSION.RELEASE);
+        assertNotEmpty("VERSION.RELEASE", Build.VERSION.RELEASE_OR_CODENAME);
         assertNotEmpty("TYPE", Build.TYPE);
         Assert.assertNotNull("TAGS", Build.TAGS); // TAGS is allowed to be empty.
         assertNotEmpty("FINGERPRINT", Build.FINGERPRINT);

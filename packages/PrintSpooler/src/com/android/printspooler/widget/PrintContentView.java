@@ -23,6 +23,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.InputMethodManager;
+
 import com.android.printspooler.R;
 
 /**
@@ -136,12 +137,12 @@ public final class PrintContentView extends ViewGroup implements View.OnClickLis
     @Override
     protected void onFinishInflate() {
         mStaticContent = findViewById(R.id.static_content);
-        mSummaryContent = (ViewGroup) findViewById(R.id.summary_content);
+        mSummaryContent = findViewById(R.id.summary_content);
         mDynamicContent = findViewById(R.id.dynamic_content);
         mDraggableContent = findViewById(R.id.draggable_content);
         mPrintButton = findViewById(R.id.print_button);
         mMoreOptionsButton = findViewById(R.id.more_options_button);
-        mOptionsContainer = (ViewGroup) findViewById(R.id.options_container);
+        mOptionsContainer = findViewById(R.id.options_container);
         mEmbeddedContentContainer = findViewById(R.id.embedded_content_container);
         mEmbeddedContentScrim = findViewById(R.id.embedded_content_scrim);
         mExpandCollapseHandle = findViewById(R.id.expand_collapse_handle);
@@ -366,7 +367,8 @@ public final class PrintContentView extends ViewGroup implements View.OnClickLis
             // and is janky. Now it is there but transparent, doing nothing.
             mEmbeddedContentScrim.setOnClickListener(null);
             mEmbeddedContentScrim.setClickable(false);
-            mExpandCollapseIcon.setBackgroundResource(R.drawable.ic_expand_more);
+            mExpandCollapseIcon.setBackgroundResource(
+                    com.android.internal.R.drawable.ic_expand_more);
         } else {
             if (mMoreOptionsButton.getVisibility() != View.GONE) {
                 mMoreOptionsButton.setVisibility(View.VISIBLE);
@@ -415,6 +417,7 @@ public final class PrintContentView extends ViewGroup implements View.OnClickLis
             onDragProgress(progress);
         }
 
+        @Override
         public void onViewReleased(View child, float velocityX, float velocityY) {
             final int childTop = child.getTop();
 
@@ -435,14 +438,17 @@ public final class PrintContentView extends ViewGroup implements View.OnClickLis
             invalidate();
         }
 
+        @Override
         public int getOrderedChildIndex(int index) {
             return getChildCount() - index - 1;
         }
 
+        @Override
         public int getViewVerticalDragRange(View child) {
             return mDraggableContent.getHeight();
         }
 
+        @Override
         public int clampViewPositionVertical(View child, int top, int dy) {
             final int staticOptionBottom = mStaticContent.getBottom();
             return Math.max(Math.min(top, getOpenedOptionsY()), getClosedOptionsY());

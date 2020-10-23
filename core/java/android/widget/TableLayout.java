@@ -16,14 +16,15 @@
 
 package android.widget;
 
-import com.android.internal.R;
-
 import android.content.Context;
 import android.content.res.TypedArray;
 import android.util.AttributeSet;
 import android.util.SparseBooleanArray;
 import android.view.View;
 import android.view.ViewGroup;
+
+import com.android.internal.R;
+
 import java.util.regex.Pattern;
 
 /**
@@ -710,6 +711,7 @@ public class TableLayout extends LinearLayout {
          */
         public LayoutParams(ViewGroup.LayoutParams p) {
             super(p);
+            width = MATCH_PARENT;
         }
 
         /**
@@ -717,6 +719,10 @@ public class TableLayout extends LinearLayout {
          */
         public LayoutParams(MarginLayoutParams source) {
             super(source);
+            width = MATCH_PARENT;
+            if (source instanceof TableLayout.LayoutParams) {
+                weight = ((TableLayout.LayoutParams) source).weight;
+            }
         }
 
         /**
@@ -745,7 +751,7 @@ public class TableLayout extends LinearLayout {
     /**
      * <p>A pass-through listener acts upon the events and dispatches them
      * to another listener. This allows the table layout to set its own internal
-     * hierarchy change listener without preventing the user to setup his.</p>
+     * hierarchy change listener without preventing the user to setup this.</p>
      */
     private class PassThroughHierarchyChangeListener implements
             OnHierarchyChangeListener {

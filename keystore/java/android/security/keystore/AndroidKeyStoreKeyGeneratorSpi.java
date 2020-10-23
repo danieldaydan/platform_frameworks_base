@@ -59,6 +59,12 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
         }
     }
 
+    public static class DESede extends AndroidKeyStoreKeyGeneratorSpi {
+        public DESede() {
+            super(KeymasterDefs.KM_ALGORITHM_3DES, 168);
+        }
+    }
+
     protected static abstract class HmacBase extends AndroidKeyStoreKeyGeneratorSpi {
         protected HmacBase(int keymasterDigest) {
             super(KeymasterDefs.KM_ALGORITHM_HMAC,
@@ -197,8 +203,18 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
                         }
                     }
                 }
-
+                if (mKeymasterAlgorithm == KeymasterDefs.KM_ALGORITHM_3DES) {
+                    if (mKeySizeBits != 168) {
+                        throw new InvalidAlgorithmParameterException(
+                            "3DES key size must be 168 bits.");
+                    }
+                }
                 if (mKeymasterAlgorithm == KeymasterDefs.KM_ALGORITHM_HMAC) {
+                    if (mKeySizeBits < 64 || mKeySizeBits > 512) {
+                        throw new InvalidAlgorithmParameterException(
+                            "HMAC key sizes must be within 64-512 bits, inclusive.");
+                    }
+
                     // JCA HMAC key algorithm implies a digest (e.g., HmacSHA256 key algorithm
                     // implies SHA-256 digest). Because keymaster HMAC key is authorized only for
                     // one digest, we don't let algorithm parameter spec override the digest implied
@@ -231,9 +247,7 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
                 // Check that user authentication related parameters are acceptable. This method
                 // will throw an IllegalStateException if there are issues (e.g., secure lock screen
                 // not set up).
-                KeymasterUtils.addUserAuthArgs(new KeymasterArguments(),
-                        spec.isUserAuthenticationRequired(),
-                        spec.getUserAuthenticationValidityDurationSeconds());
+                KeymasterUtils.addUserAuthArgs(new KeymasterArguments(), spec);
             } catch (IllegalStateException | IllegalArgumentException e) {
                 throw new InvalidAlgorithmParameterException(e);
             }
@@ -269,9 +283,7 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
         args.addEnums(KeymasterDefs.KM_TAG_BLOCK_MODE, mKeymasterBlockModes);
         args.addEnums(KeymasterDefs.KM_TAG_PADDING, mKeymasterPaddings);
         args.addEnums(KeymasterDefs.KM_TAG_DIGEST, mKeymasterDigests);
-        KeymasterUtils.addUserAuthArgs(args,
-                spec.isUserAuthenticationRequired(),
-                spec.getUserAuthenticationValidityDurationSeconds());
+        KeymasterUtils.addUserAuthArgs(args, spec);
         KeymasterUtils.addMinMacLengthAuthorizationIfNecessary(
                 args,
                 mKeymasterAlgorithm,
@@ -293,20 +305,31 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
                 KeyStoreCryptoOperationUtils.getRandomBytesToMixIntoKeystoreRng(
                         mRng, (mKeySizeBits + 7) / 8);
         int flags = 0;
-        String keyAliasInKeystore = Credentials.USER_SECRET_KEY + spec.getKeystoreAlias();
+        if (spec.isStrongBoxBacked()) {
+            flags |= KeyStore.FLAG_STRONGBOX;
+        }
+        if (spec.isCriticalToDeviceEncryption()) {
+            flags |= KeyStore.FLAG_CRITICAL_TO_DEVICE_ENCRYPTION;
+        }
+        String keyAliasInKeystore = Credentials.USER_PRIVATE_KEY + spec.getKeystoreAlias();
         KeyCharacteristics resultingKeyCharacteristics = new KeyCharacteristics();
         boolean success = false;
         try {
-            Credentials.deleteAllTypesForAlias(mKeyStore, spec.getKeystoreAlias());
+            Credentials.deleteAllTypesForAlias(mKeyStore, spec.getKeystoreAlias(), spec.getUid());
             int errorCode = mKeyStore.generateKey(
                     keyAliasInKeystore,
                     args,
                     additionalEntropy,
+                    spec.getUid(),
                     flags,
                     resultingKeyCharacteristics);
             if (errorCode != KeyStore.NO_ERROR) {
-                throw new ProviderException(
-                        "Keystore operation failed", KeyStore.getKeyStoreException(errorCode));
+                if (errorCode == KeyStore.HARDWARE_TYPE_UNAVAILABLE) {
+                    throw new StrongBoxUnavailableException("Failed to generate key");
+                } else {
+                    throw new ProviderException(
+                            "Keystore operation failed", KeyStore.getKeyStoreException(errorCode));
+                }
             }
             @KeyProperties.KeyAlgorithmEnum String keyAlgorithmJCA;
             try {
@@ -315,12 +338,14 @@ public abstract class AndroidKeyStoreKeyGeneratorSpi extends KeyGeneratorSpi {
             } catch (IllegalArgumentException e) {
                 throw new ProviderException("Failed to obtain JCA secret key algorithm name", e);
             }
-            SecretKey result = new AndroidKeyStoreSecretKey(keyAliasInKeystore, keyAlgorithmJCA);
+            SecretKey result = new AndroidKeyStoreSecretKey(
+                    keyAliasInKeystore, spec.getUid(), keyAlgorithmJCA);
             success = true;
             return result;
         } finally {
             if (!success) {
-                Credentials.deleteAllTypesForAlias(mKeyStore, spec.getKeystoreAlias());
+                Credentials.deleteAllTypesForAlias(
+                        mKeyStore, spec.getKeystoreAlias(), spec.getUid());
             }
         }
     }

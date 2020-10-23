@@ -26,64 +26,71 @@ namespace uirenderer {
 
 class Outline {
 public:
-    Outline()
-            : mShouldClip(false)
-            , mType(kOutlineType_None)
-            , mRadius(0)
-            , mAlpha(0.0f) {}
+    enum class Type { None = 0, Empty = 1, Path = 2, RoundRect = 3 };
+
+    Outline() : mShouldClip(false), mType(Type::None), mRadius(0), mAlpha(0.0f) {}
 
     void setRoundRect(int left, int top, int right, int bottom, float radius, float alpha) {
-        mType = kOutlineType_RoundRect;
+        mAlpha = alpha;
+        if (mType == Type::RoundRect && left == mBounds.left && right == mBounds.right &&
+            top == mBounds.top && bottom == mBounds.bottom && radius == mRadius) {
+            // nothing to change, don't do any work
+            return;
+        }
+
+        mType = Type::RoundRect;
         mBounds.set(left, top, right, bottom);
         mRadius = radius;
-        mPath.reset();
-        mPath.addRoundRect(SkRect::MakeLTRB(left, top, right, bottom),
-                radius, radius);
-        mAlpha = alpha;
+
+        // Reuse memory if previous outline was the same shape (rect or round rect).
+        if (mPath.countVerbs() > 10) {
+            mPath.reset();
+        } else {
+            mPath.rewind();
+        }
+
+        // update mPath to reflect new outline
+        if (MathUtils::isPositive(radius)) {
+            mPath.addRoundRect(SkRect::MakeLTRB(left, top, right, bottom), radius, radius);
+        } else {
+            mPath.addRect(left, top, right, bottom);
+        }
     }
 
-    void setConvexPath(const SkPath* outline, float alpha) {
+    void setPath(const SkPath* outline, float alpha) {
         if (!outline) {
             setEmpty();
             return;
         }
-        mType = kOutlineType_ConvexPath;
+        mType = Type::Path;
         mPath = *outline;
         mBounds.set(outline->getBounds());
         mAlpha = alpha;
     }
 
     void setEmpty() {
-        mType = kOutlineType_Empty;
+        mType = Type::Empty;
         mPath.reset();
         mAlpha = 0.0f;
     }
 
     void setNone() {
-        mType = kOutlineType_None;
+        mType = Type::None;
         mPath.reset();
         mAlpha = 0.0f;
     }
 
-    bool isEmpty() const {
-        return mType == kOutlineType_Empty;
-    }
+    bool isEmpty() const { return mType == Type::Empty; }
 
-    float getAlpha() const {
-        return mAlpha;
-    }
+    float getAlpha() const { return mAlpha; }
 
-    void setShouldClip(bool clip) {
-        mShouldClip = clip;
-    }
+    void setShouldClip(bool clip) { mShouldClip = clip; }
 
-    bool getShouldClip() const {
-        return mShouldClip;
-    }
+    bool getShouldClip() const { return mShouldClip; }
 
     bool willClip() const {
         // only round rect outlines can be used for clipping
-        return mShouldClip && (mType == kOutlineType_RoundRect);
+        return mShouldClip && (mType == Type::RoundRect);
     }
 
     bool willRoundRectClip() const {
@@ -92,7 +99,7 @@ public:
     }
 
     bool getAsRoundRect(Rect* outRect, float* outRadius) const {
-        if (mType == kOutlineType_RoundRect) {
+        if (mType == Type::RoundRect) {
             outRect->set(mBounds);
             *outRadius = mRadius;
             return true;
@@ -101,21 +108,20 @@ public:
     }
 
     const SkPath* getPath() const {
-        if (mType == kOutlineType_None || mType == kOutlineType_Empty) return nullptr;
+        if (mType == Type::None || mType == Type::Empty) return nullptr;
 
         return &mPath;
     }
 
-private:
-    enum OutlineType {
-        kOutlineType_None = 0,
-        kOutlineType_Empty = 1,
-        kOutlineType_ConvexPath = 2,
-        kOutlineType_RoundRect = 3
-    };
+    Type getType() const { return mType; }
 
+    const Rect& getBounds() const { return mBounds; }
+
+    float getRadius() const { return mRadius; }
+
+private:
     bool mShouldClip;
-    OutlineType mType;
+    Type mType;
     Rect mBounds;
     float mRadius;
     float mAlpha;

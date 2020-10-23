@@ -21,19 +21,17 @@ import android.view.MotionEvent;
 import android.view.ViewConfiguration;
 
 import com.android.systemui.Gefingerpoken;
-import com.android.systemui.R;
-import com.android.systemui.statusbar.ExpandableNotificationRow;
-import com.android.systemui.statusbar.ExpandableView;
-import com.android.systemui.statusbar.policy.HeadsUpManager;
-import com.android.systemui.statusbar.stack.NotificationStackScrollLayout;
+import com.android.systemui.statusbar.notification.collection.NotificationEntry;
+import com.android.systemui.statusbar.notification.row.ExpandableNotificationRow;
+import com.android.systemui.statusbar.notification.row.ExpandableView;
 
 /**
  * A helper class to handle touches on the heads-up views.
  */
 public class HeadsUpTouchHelper implements Gefingerpoken {
 
-    private HeadsUpManager mHeadsUpManager;
-    private NotificationStackScrollLayout mStackScroller;
+    private HeadsUpManagerPhone mHeadsUpManager;
+    private Callback mCallback;
     private int mTrackingPointer;
     private float mTouchSlop;
     private float mInitialTouchX;
@@ -41,21 +39,18 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
     private boolean mTouchingHeadsUpView;
     private boolean mTrackingHeadsUp;
     private boolean mCollapseSnoozes;
-    private NotificationPanelView mPanel;
+    private NotificationPanelViewController mPanel;
     private ExpandableNotificationRow mPickedChild;
-    private final int mNotificationsTopPadding;
 
-    public HeadsUpTouchHelper(HeadsUpManager headsUpManager,
-            NotificationStackScrollLayout stackScroller,
-            NotificationPanelView notificationPanelView) {
+    public HeadsUpTouchHelper(HeadsUpManagerPhone headsUpManager,
+            Callback callback,
+            NotificationPanelViewController notificationPanelView) {
         mHeadsUpManager = headsUpManager;
-        mStackScroller = stackScroller;
+        mCallback = callback;
         mPanel = notificationPanelView;
-        Context context = stackScroller.getContext();
+        Context context = mCallback.getContext();
         final ViewConfiguration configuration = ViewConfiguration.get(context);
         mTouchSlop = configuration.getScaledTouchSlop();
-        mNotificationsTopPadding = context.getResources()
-                .getDimensionPixelSize(R.dimen.notifications_top_padding);
     }
 
     public boolean isTrackingHeadsUp() {
@@ -79,15 +74,23 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
                 mInitialTouchY = y;
                 mInitialTouchX = x;
                 setTrackingHeadsUp(false);
-                ExpandableView child = mStackScroller.getChildAtRawPosition(x, y);
-                if (child == null && y < mNotificationsTopPadding) {
-                    // We should also allow drags from the margin above the heads up
-                    child = mStackScroller.getChildAtRawPosition(x, y + mNotificationsTopPadding);
-                }
+                ExpandableView child = mCallback.getChildAtRawPosition(x, y);
                 mTouchingHeadsUpView = false;
                 if (child instanceof ExpandableNotificationRow) {
-                    mPickedChild = (ExpandableNotificationRow) child;
-                    mTouchingHeadsUpView = mPickedChild.isHeadsUp() && mPickedChild.isPinned();
+                    ExpandableNotificationRow pickedChild = (ExpandableNotificationRow) child;
+                    mTouchingHeadsUpView = !mCallback.isExpanded()
+                            && pickedChild.isHeadsUp() && pickedChild.isPinned();
+                    if (mTouchingHeadsUpView) {
+                        mPickedChild = pickedChild;
+                    }
+                } else if (child == null && !mCallback.isExpanded()) {
+                    // We might touch above the visible heads up child, but then we still would
+                    // like to capture it.
+                    NotificationEntry topEntry = mHeadsUpManager.getTopEntry();
+                    if (topEntry != null && topEntry.isRowPinned()) {
+                        mPickedChild = topEntry.getRow();
+                        mTouchingHeadsUpView = true;
+                    }
                 }
                 break;
             case MotionEvent.ACTION_POINTER_UP:
@@ -109,13 +112,18 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
                     mCollapseSnoozes = h < 0;
                     mInitialTouchX = x;
                     mInitialTouchY = y;
-                    int expandedHeight = mPickedChild.getActualHeight();
-                    mPanel.setPanelScrimMinFraction((float) expandedHeight
-                            / mPanel.getMaxPanelHeight());
-                    mPanel.startExpandMotion(x, y, true /* startTracking */, expandedHeight
-                            + mNotificationsTopPadding);
-                    mPanel.clearNotificattonEffects();
-                    mHeadsUpManager.unpinAll();
+                    int startHeight = (int) (mPickedChild.getActualHeight()
+                                                + mPickedChild.getTranslationY());
+                    float maxPanelHeight = mPanel.getMaxPanelHeight();
+                    mPanel.setPanelScrimMinFraction(maxPanelHeight > 0f
+                            ? (float) startHeight / maxPanelHeight : 0f);
+                    mPanel.startExpandMotion(x, y, true /* startTracking */, startHeight);
+                    mPanel.startExpandingFromPeek();
+                    // This call needs to be after the expansion start otherwise we will get a
+                    // flicker of one frame as it's not expanded yet.
+                    mHeadsUpManager.unpinAll(true);
+                    mPanel.clearNotificationEffects();
+                    endMotion();
                     return true;
                 }
                 break;
@@ -125,7 +133,7 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
                 if (mPickedChild != null && mTouchingHeadsUpView) {
                     // We may swallow this click if the heads up just came in.
                     if (mHeadsUpManager.shouldSwallowClick(
-                            mPickedChild.getStatusBarNotification().getKey())) {
+                            mPickedChild.getEntry().getSbn().getKey())) {
                         endMotion();
                         return true;
                     }
@@ -139,7 +147,7 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
     private void setTrackingHeadsUp(boolean tracking) {
         mTrackingHeadsUp = tracking;
         mHeadsUpManager.setTrackingHeadsUp(tracking);
-        mPanel.setTrackingHeadsUp(tracking);
+        mPanel.setTrackedHeadsUp(tracking ? mPickedChild : null);
     }
 
     public void notifyFling(boolean collapse) {
@@ -168,5 +176,11 @@ public class HeadsUpTouchHelper implements Gefingerpoken {
         mTrackingPointer = -1;
         mPickedChild = null;
         mTouchingHeadsUpView = false;
+    }
+
+    public interface Callback {
+        ExpandableView getChildAtRawPosition(float touchX, float touchY);
+        boolean isExpanded();
+        Context getContext();
     }
 }
